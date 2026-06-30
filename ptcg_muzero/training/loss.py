@@ -1,0 +1,286 @@
+"""
+ptcg_muzero/training/loss.py
+==============================
+Calcul de la loss MuZero complète, JIT-able et compatible pmap.
+
+La loss totale est :
+    L = w_pol · L_policy
+      + w_val · L_value
+      + w_rew · L_reward    (unrolled K steps)
+      + w_prb · L_probes
+      + reg                  (weight decay via optax)
+
+Pour chaque step de déroulement k ∈ [0, K] :
+  - L_policy  : KL(target_policy ‖ predicted_policy)  via cross-entropie
+  - L_value   : MSE(target_return, predicted_value)
+  - L_reward  : MSE(actual_reward, predicted_reward)   k ≥ 1
+
+Toutes les quantités sont calculées en batch, batchées sur chaque device.
+La moyenne des gradients entre devices est faite dans trainer.py via lax.pmean.
+"""
+from __future__ import annotations
+
+from functools import partial
+from typing import Dict, List, Tuple
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from config import ModelConfig, TrainConfig
+from interpretability.probes import ProbeHeads, probe_loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch structure (tout ce qui arrive du replay buffer, déjà stacké en JAX)
+# ─────────────────────────────────────────────────────────────────────────────
+# Chaque champ a une dimension de batch B en tête.
+# obs_seq : dict   — chaque valeur [B, K+1, ...]  (K = num_unroll_steps)
+# action_seq       : [B, K, A]    float32 multi-hot
+# reward_seq       : [B, K]       float32
+# target_pol       : [B, K+1, A]  float32
+# target_val       : [B, K+1]     float32
+# probe_tgts       : [B, K+1, 5]  int32
+# is_weights       : [B]          float32  (IS correction)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss principale
+# ─────────────────────────────────────────────────────────────────────────────
+def muzero_loss(
+    params: dict,
+    network,          # MuZeroNetwork Flax module (bound)
+    probe_heads,      # ProbeHeads Flax module (bound)
+    batch: dict,
+    cfg_train: TrainConfig,
+    cfg_model: ModelConfig,
+) -> Tuple[jnp.ndarray, dict]:
+    """
+    Calcule la loss MuZero sur un batch.
+
+    Paramètres
+    ----------
+    params      : dict contenant {muzero: ..., probes: ...}
+    network     : MuZeroNetwork (apply via params["muzero"])
+    probe_heads : ProbeHeads    (apply via params["probes"])
+    batch       : dict issu du collate_batch()
+    cfg_train   : TrainConfig
+    cfg_model   : ModelConfig
+
+    Retourne
+    --------
+    total_loss : scalar
+    metrics    : dict de métriques pour le logging
+    """
+    K = cfg_train.num_unroll_steps
+    B = batch["action_seq"].shape[0]
+
+    mz_params  = params["muzero"]
+    prb_params = params["probes"]
+
+    # ── 1. Encode root (step k=0) ─────────────────────────────────────────
+    obs0 = _slice_obs(batch["obs_seq"], 0)   # dict [B, ...]
+    z    = network.apply(mz_params, obs0, method=network.represent)
+    pi_logits, v = network.apply(mz_params, z, method=network.predict)
+
+    total_pol_ex = jnp.zeros((B,), dtype=jnp.float32)
+    total_val_ex = jnp.zeros((B,), dtype=jnp.float32)
+    total_rew_ex = jnp.zeros((B,), dtype=jnp.float32)
+
+    # k=0 : policy + value (no reward at root)
+    pol_loss_0 = _policy_loss_per_example(pi_logits, batch["target_pol"][:, 0, :])
+    val_loss_0 = _value_loss_per_example(v, batch["target_val"][:, 0])
+    total_pol_ex += pol_loss_0
+    total_val_ex += val_loss_0
+
+    probe_logits_0 = probe_heads.apply(prb_params, z)
+    prb_loss_0, per_probe_0 = probe_loss(probe_logits_0, batch["probe_tgts"][:, 0, :])
+
+    # ── 2. Unroll K steps ─────────────────────────────────────────────────
+    z_cur = z
+
+    def unroll_step(z_in, k):
+        action_onehot  = batch["action_seq"][:, k, :]          # [B, A]
+
+        reward_pred, z_next = network.apply(
+            mz_params, z_in, action_onehot,
+            method=network.dynamics,
+        )
+        pi_k, v_k = network.apply(mz_params, z_next, method=network.predict)
+
+        pol_loss_k = _policy_loss_per_example(
+            pi_k, batch["target_pol"][:, k + 1, :]
+        )
+        val_loss_k = _value_loss_per_example(v_k, batch["target_val"][:, k + 1])
+        rew_loss_k = _reward_loss_per_example(reward_pred, batch["reward_seq"][:, k])
+
+        return z_next, (pol_loss_k, val_loss_k, rew_loss_k, pi_k, v_k, z_next)
+
+    # Use lax.scan for unrolling — avoids Python-level loop in JIT
+    _, (pol_losses, val_losses, rew_losses, _, _, zs) = jax.lax.scan(
+        lambda carry, k: unroll_step(carry, k),
+        z_cur,
+        jnp.arange(K),
+    )
+    # pol_losses / val_losses / rew_losses : [K, B]
+
+    total_pol_ex += jnp.mean(pol_losses, axis=0)
+    total_val_ex += jnp.mean(val_losses, axis=0)
+    total_rew_ex  = jnp.mean(rew_losses, axis=0)
+
+    # ── 3. Probe losses (computed on root latent only to save compute) ────
+    total_prb = prb_loss_0
+
+    # ── 4. Aggregate with IS weights ─────────────────────────────────────
+    # (weights already normalised in the buffer)
+    w = batch["is_weights"]   # [B]
+
+    pol_loss = _weighted_mean(total_pol_ex, w)
+    val_loss = _weighted_mean(total_val_ex, w)
+    rew_loss = _weighted_mean(total_rew_ex, w)
+
+    total_loss = (
+        cfg_train.policy_loss_weight * pol_loss
+        + cfg_train.value_loss_weight  * val_loss
+        + cfg_train.reward_loss_weight * rew_loss
+        + cfg_train.probe_loss_weight  * total_prb
+    )
+
+    # TD-error for priority update (absolute value error on value at root)
+    td_error = jnp.abs(v - batch["target_val"][:, 0])
+
+    metrics = {
+        "loss_total":  total_loss,
+        "loss_policy": pol_loss,
+        "loss_value":  val_loss,
+        "loss_reward": rew_loss,
+        "loss_probes": total_prb,
+        "td_error_mean": jnp.mean(td_error),
+        "probe_per_task": per_probe_0,   # [5]
+    }
+    return total_loss, metrics, td_error
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-term losses
+# ─────────────────────────────────────────────────────────────────────────────
+def _policy_loss(
+    logits: jnp.ndarray,       # [B, A]
+    target: jnp.ndarray,       # [B, A]  soft policy (MCTS visit counts)
+) -> jnp.ndarray:
+    """
+    Cross-entropy between MCTS policy (target) and network policy (logits).
+    KL(target ‖ network) ≡ -Σ target · log_softmax(logits)  + const.
+    """
+    return jnp.mean(_policy_loss_per_example(logits, target))
+
+
+def _policy_loss_per_example(
+    logits: jnp.ndarray,
+    target: jnp.ndarray,
+) -> jnp.ndarray:
+    log_pi = jax.nn.log_softmax(logits, axis=-1)
+    target_sum = jnp.sum(target, axis=-1, keepdims=True)
+    target_norm = jnp.where(target_sum > 0, target / target_sum, target)
+    return -jnp.sum(target_norm * log_pi, axis=-1)
+
+
+def _value_loss(
+    pred:   jnp.ndarray,   # [B]  scalar in [-1, 1] (tanh output)
+    target: jnp.ndarray,   # [B]
+) -> jnp.ndarray:
+    return jnp.mean(_value_loss_per_example(pred, target))
+
+
+def _value_loss_per_example(
+    pred:   jnp.ndarray,
+    target: jnp.ndarray,
+) -> jnp.ndarray:
+    return (pred - jnp.clip(target, -1.0, 1.0)) ** 2
+
+
+def _reward_loss(
+    pred:   jnp.ndarray,   # [B]
+    target: jnp.ndarray,   # [B]
+) -> jnp.ndarray:
+    return jnp.mean(_reward_loss_per_example(pred, target))
+
+
+def _reward_loss_per_example(
+    pred:   jnp.ndarray,
+    target: jnp.ndarray,
+) -> jnp.ndarray:
+    return (pred - jnp.clip(target, -1.0, 1.0)) ** 2
+
+
+def _weighted_mean(values: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
+    weights = weights.astype(values.dtype)
+    return jnp.sum(values * weights) / jnp.maximum(jnp.sum(weights), 1e-8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch collation (numpy → JAX)
+# ─────────────────────────────────────────────────────────────────────────────
+def collate_batch(
+    entries,        # List[ReplayEntry]
+    is_weights,     # np.ndarray [B]
+    num_unroll: int,
+    max_actions: int,
+) -> dict:
+    """
+    Transforme une liste de ReplayEntry en un batch JAX prêt pour la loss.
+    Tous les champs sont stackés avec une dimension B en tête.
+    Les obs sont aussi stackées → dict de [B, K+1, ...].
+    """
+    import numpy as np
+
+    B = len(entries)
+    K = num_unroll
+
+    # ── Actions / rewards / targets ──────────────────────────────────────
+    action_seq = np.stack([e.action_seq for e in entries])   # [B, K, A]
+    reward_seq = np.stack([e.reward_seq for e in entries])   # [B, K]
+
+    # target_pol / val : pad or truncate to K+1
+    target_pol = np.zeros((B, K + 1, max_actions), dtype=np.float32)
+    target_val = np.zeros((B, K + 1), dtype=np.float32)
+    probe_tgts = np.full((B, K + 1, 5), -1, dtype=np.int32)
+
+    for i, e in enumerate(entries):
+        n = min(len(e.target_pol), K + 1)
+        target_pol[i, :n] = e.target_pol[:n]
+        n = min(len(e.target_val), K + 1)
+        target_val[i, :n] = e.target_val[:n]
+        n = min(len(e.probe_tgts), K + 1)
+        probe_tgts[i, :n] = e.probe_tgts[:n]
+
+    # ── Observations : stack chaque champ ─────────────────────────────────
+    # Chaque entry.obs_seq est une list de K+1 dicts
+    obs_keys = entries[0].obs_seq[0].keys() if entries[0].obs_seq else []
+    obs_seq_batch = {}
+    for key in obs_keys:
+        # [B, K+1, *obs_shape]
+        stacked = np.stack([
+            np.stack([
+                e.obs_seq[k][key] if k < len(e.obs_seq)
+                else np.zeros_like(e.obs_seq[-1][key])
+                for k in range(K + 1)
+            ])
+            for e in entries
+        ])
+        obs_seq_batch[key] = jnp.array(stacked)
+
+    return {
+        "obs_seq":    obs_seq_batch,
+        "action_seq": jnp.array(action_seq),
+        "reward_seq": jnp.array(reward_seq),
+        "target_pol": jnp.array(target_pol),
+        "target_val": jnp.array(target_val),
+        "probe_tgts": jnp.array(probe_tgts),
+        "is_weights": jnp.array(is_weights),
+    }
+
+
+def _slice_obs(obs_seq_batch: dict, k: int) -> dict:
+    """Extrait le step k d'un obs batché [B, K+1, ...] → [B, ...]."""
+    return {key: val[:, k] for key, val in obs_seq_batch.items()}
