@@ -271,6 +271,7 @@ def run_parallel_self_play(
     import multiprocessing as mp
     from env.wrapper import self_play_worker_fn
     import numpy as np
+    from training.activity import tracker
 
     ctx = mp.get_context("spawn")
     pipes = []
@@ -328,6 +329,9 @@ def run_parallel_self_play(
         batched_encs_list = []
         option_masks_list = []
         
+        # Signaler l'activité au heartbeat (évite faux-positif de freeze pendant JIT/jeu)
+        tracker.update(buffer_size=len(completed_histories))
+
         active_pipes_list = [pipes[i] for i in range(num_workers) if pipe_meta[i].get("game_active")]
         if not active_pipes_list:
             break

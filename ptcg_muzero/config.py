@@ -75,9 +75,9 @@ class TrainConfig:
 
     # ── Replay buffer ─────────────────────────────────────────────────────
     replay_buffer_size: int = 200_000
-    min_replay_size: int = 2_000
-    replay_alpha: float = 1.0    # priority exponent (0 = uniform)
-    replay_beta: float = 1.0     # IS correction exponent
+    min_replay_size: int = 5_000
+    replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
+    replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 
     # ── Training schedule ─────────────────────────────────────────────────
     num_total_steps: int = 500_000

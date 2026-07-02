@@ -125,8 +125,8 @@ def cmd_train(args) -> None:
             now = time.time()
             inactive_dur = now - tracker.last_activity_time
             
-            # Détection de freeze (aucune mise à jour d'activité depuis plus de 60s)
-            if inactive_dur > 60.0:
+            # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
+            if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
                     "[heartbeat] Phase: %s | Buffer: %d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs%s",

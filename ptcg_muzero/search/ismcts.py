@@ -259,7 +259,7 @@ def ismcts_action(
             params,
             z_item[None],
             logits_item[None],
-            v_item,
+            v_item[None],   # scalaire () → [1] requis par mctx
             mask_item[None],
             rng_item,
             dynamics_fn=dyn_fn,
@@ -352,7 +352,7 @@ def ismcts_action_batched(
             mz_params,
             z_item[None],
             logits_item[None],
-            v_item,
+            v_item[None],   # scalaire () → [1] requis par mctx
             mask_item[None],
             rng_item,
             dynamics_fn=dyn_fn,
