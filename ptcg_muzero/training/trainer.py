@@ -432,7 +432,7 @@ def train(cfg: Config) -> None:
     # Lancement parallèle pour le seeding
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         while len(buffer) < cfg.train.min_replay_size:
-            tracker.update(last_activity_time=time.time())
+            tracker.update()
             
             # Soumettre un lot de tâches concurrentes
             futures = [executor.submit(_play_single_game_worker, idx) for idx in range(NUM_WORKERS)]
@@ -461,7 +461,7 @@ def train(cfg: Config) -> None:
             rng, rng_sp = jax.random.split(rng)
             deck_logits_np, _ = deck_net.apply(deck_params)
             
-            tracker.update(phase=f"Self-Play Step {step}", last_activity_time=time.time())
+            tracker.update(phase=f"Self-Play Step {step}")
 
             # Worker pour la boucle d'entraînement principale
             def _play_train_worker(worker_idx):
