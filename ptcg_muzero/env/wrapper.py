@@ -384,3 +384,149 @@ def _log_int(obj, key: str, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def self_play_worker_fn(pipe, worker_id, cfg):
+    """
+    Worker loop designed to run in a spawned subprocess.
+    """
+    import os
+    # Force JAX to only use CPU in subprocesses to avoid CUDA conflicts/allocations
+    os.environ["JAX_PLATFORM_NAME"] = "cpu"
+    os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+    import jax
+    jax.config.update("jax_platform_name", "cpu")
+    import numpy as np
+
+    from env.wrapper import CabtEnv, DeckError
+    from env.encoding import encode_observation, extract_step_reward
+    from search.ismcts import sample_belief
+
+    env = CabtEnv()
+
+    while True:
+        try:
+            msg = pipe.recv()
+            if msg is None:  # Shutdown signal
+                break
+
+            cmd = msg.get("cmd")
+            if cmd == "start":
+                deck0 = msg["deck0"]
+                deck1 = msg["deck1"]
+
+                try:
+                    obs_dict, done = env.reset(deck0, deck1)
+                except DeckError as e:
+                    pipe.send({"status": "deck_error", "error": str(e)})
+                    continue
+
+                step_count = 0
+                prev_logs = [[], []]
+                from env.wrapper import GameHistory
+                hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
+
+                while not done:
+                    your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
+                    select = obs_dict.get("select")
+
+                    if select is None:
+                        deck_to_submit = deck0 if your_idx == 0 else deck1
+                        obs_dict, done = env.step(deck_to_submit)
+                        continue
+
+                    options = select.get("option", [])
+                    if not options:
+                        obs_dict, done = env.step([])
+                        continue
+
+                    mc = cfg.model
+                    sc = cfg.search
+                    N_samples = int(sc.num_belief_samples)
+
+                    rng_seed = np.random.randint(0, 2**31)
+                    rng_jax = jax.random.PRNGKey(rng_seed)
+                    rng_beliefs = jax.random.split(rng_jax, N_samples)
+
+                    det_list = []
+                    for s in range(N_samples):
+                        det_list.append(sample_belief(obs_dict, rng_beliefs[s], mc))
+
+                    encoded_samples = [encode_observation(d, your_idx, mc) for d in det_list]
+
+                    # Stack observations
+                    batched_enc = {}
+                    for k in encoded_samples[0].keys():
+                        batched_enc[k] = np.stack([x[k] for x in encoded_samples], axis=0)
+
+                    option_mask = encoded_samples[0]["option_mask"]
+
+                    # Request action from GPU coordinator
+                    pipe.send({
+                        "status": "need_action",
+                        "batched_enc": batched_enc,
+                        "option_mask": option_mask,
+                        "player_idx": your_idx
+                    })
+
+                    # Receive action from GPU coordinator
+                    action_msg = pipe.recv()
+                    action_indices = action_msg["action_indices"]
+                    search_pol = action_msg["search_pol"]
+                    search_val = action_msg["search_val"]
+
+                    hist[your_idx].raw_states.append(obs_dict)
+
+                    logs = obs_dict.get("logs", [])
+                    if len(logs) >= len(prev_logs[your_idx]):
+                        new_logs = logs[len(prev_logs[your_idx]):]
+                    else:
+                        new_logs = logs
+                    prev_logs[your_idx] = list(logs)
+
+                    reward = extract_step_reward(new_logs, your_idx)
+
+                    action_vec = np.zeros(mc.max_actions, dtype=np.float32)
+                    for idx in action_indices:
+                        if 0 <= int(idx) < mc.max_actions:
+                            action_vec[int(idx)] = 1.0
+
+                    hist[your_idx].observations.append(encoded_samples[0])
+                    hist[your_idx].actions.append(action_vec)
+                    hist[your_idx].rewards.append(reward)
+                    hist[your_idx].search_pols.append(search_pol)
+                    hist[your_idx].search_vals.append(float(search_val))
+                    hist[your_idx].select_types.append(int(select.get("type", 0)))
+
+                    obs_dict, done = env.step(action_indices)
+
+                result = env.result
+                for p in range(2):
+                    if hist[p].rewards:
+                        if result == p:
+                            hist[p].rewards[-1] += 1.0
+                            hist[p].game_won = True
+                        elif result == 1 - p:
+                            hist[p].rewards[-1] -= 1.0
+                            hist[p].game_won = False
+                        else:
+                            hist[p].game_won = None
+
+                for p in range(2):
+                    hist[p].compute_returns(cfg.train.gamma, cfg.train.td_steps)
+
+                pipe.send({
+                    "status": "game_over",
+                    "hist0": hist[0],
+                    "hist1": hist[1]
+                })
+
+        except Exception as e:
+            import traceback
+            pipe.send({"status": "error", "error": f"{e}\n{traceback.format_exc()}"})
+            break
+
+    env.close()
+

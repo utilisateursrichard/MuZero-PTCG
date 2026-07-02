@@ -58,7 +58,7 @@ from models.deck_builder import (
     set_energy_ids,
 )
 from models.networks import MuZeroNetwork
-from search.ismcts import add_exploration_noise, ismcts_action
+from search.ismcts import add_exploration_noise, ismcts_action, ismcts_action_batched
 from training.loss import collate_batch, muzero_loss
 from training.replay_buffer import PrioritizedReplayBuffer
 
@@ -254,6 +254,172 @@ def unshard(x: jnp.ndarray) -> jnp.ndarray:
     return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
 
 
+def run_parallel_self_play(
+    num_games_to_play: int,
+    num_workers: int,
+    deck_net,
+    deck_params,
+    network,
+    state_params,
+    cfg: Config,
+    rng: jnp.ndarray,
+    num_card_ids: int,
+    energy_ids,
+    ace_spec_ids,
+    is_seeding: bool = False
+):
+    import multiprocessing as mp
+    from env.wrapper import self_play_worker_fn
+    import numpy as np
+
+    ctx = mp.get_context("spawn")
+    pipes = []
+    processes = []
+    
+    for idx in range(num_workers):
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(target=self_play_worker_fn, args=(child_conn, idx, cfg), daemon=True)
+        p.start()
+        pipes.append(parent_conn)
+        processes.append(p)
+
+    games_started = 0
+    games_completed = 0
+    completed_histories = []
+    deck_builder_updates = []
+    deck_errors_count = 0
+
+    _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state_params) if len(state_params) > 0 else state_params
+
+    from models.deck_builder import sample_deck
+    deck_logits, _ = deck_net.apply(deck_params)
+
+    pipe_meta = [{} for _ in range(num_workers)]
+
+    def start_game_on_worker(pipe_idx, local_rng):
+        nonlocal games_started
+        local_rng, r_d0, r_d1 = jax.random.split(local_rng, 3)
+        deck0, ids0 = sample_deck(deck_logits[0], r_d0, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
+        deck1, ids1 = sample_deck(deck_logits[0], r_d1, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
+        
+        pipe_meta[pipe_idx] = {
+            "ids0": ids0,
+            "ids1": ids1,
+            "game_active": True
+        }
+        pipes[pipe_idx].send({
+            "cmd": "start",
+            "deck0": list(deck0),
+            "deck1": list(deck1)
+        })
+        games_started += 1
+
+    for i in range(num_workers):
+        if games_started < num_games_to_play:
+            rng, rng_start = jax.random.split(rng)
+            start_game_on_worker(i, rng_start)
+        else:
+            pipe_meta[i] = {"game_active": False}
+
+    while games_completed < num_games_to_play:
+        need_action_indices = []
+        batched_encs_list = []
+        option_masks_list = []
+        
+        active_pipes_list = [pipes[i] for i in range(num_workers) if pipe_meta[i].get("game_active")]
+        if not active_pipes_list:
+            break
+            
+        ready_pipes = mp.connection.wait(active_pipes_list, timeout=1.0)
+        
+        for pipe in ready_pipes:
+            pipe_idx = pipes.index(pipe)
+            if not pipe.poll():
+                continue
+            
+            try:
+                msg = pipe.recv()
+            except Exception as e:
+                logger.error(f"Failed to read from worker {pipe_idx}: {e}")
+                pipe_meta[pipe_idx]["game_active"] = False
+                games_completed += 1
+                continue
+
+            status = msg.get("status")
+            
+            if status == "need_action":
+                need_action_indices.append(pipe_idx)
+                batched_encs_list.append(msg["batched_enc"])
+                option_masks_list.append(msg["option_mask"])
+                
+            elif status == "deck_error":
+                deck_errors_count += 1
+                if games_started < num_games_to_play:
+                    rng, rng_restart = jax.random.split(rng)
+                    start_game_on_worker(pipe_idx, rng_restart)
+                else:
+                    pipe_meta[pipe_idx]["game_active"] = False
+                    
+            elif status == "game_over":
+                h0, h1 = msg["hist0"], msg["hist1"]
+                completed_histories.extend([h0, h1])
+                
+                if not is_seeding:
+                    reward_0 = float(h0.game_won or False) * 2 - 1
+                    reward_1 = float(h1.game_won or False) * 2 - 1
+                    deck_builder_updates.append((pipe_meta[pipe_idx]["ids0"], reward_0))
+                    deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
+                
+                games_completed += 1
+                
+                if games_started < num_games_to_play:
+                    rng, rng_next = jax.random.split(rng)
+                    start_game_on_worker(pipe_idx, rng_next)
+                else:
+                    pipe_meta[pipe_idx]["game_active"] = False
+                    
+            elif status == "error":
+                logger.error(f"Worker {pipe_idx} encountered error: {msg.get('error')}")
+                pipe_meta[pipe_idx]["game_active"] = False
+                games_completed += 1
+                if games_started < num_games_to_play:
+                    rng, rng_restart = jax.random.split(rng)
+                    start_game_on_worker(pipe_idx, rng_restart)
+
+        if need_action_indices:
+            B_active = len(need_action_indices)
+            keys = batched_encs_list[0].keys()
+            batched_enc = {}
+            for k in keys:
+                batched_enc[k] = jnp.stack([x[k] for x in batched_encs_list], axis=0)
+            
+            option_masks = np.stack(option_masks_list, axis=0)
+            
+            rng, rng_act = jax.random.split(rng)
+            best_actions, avg_policies, avg_values = ismcts_action_batched(
+                network, _params_cpu, batched_enc, option_masks, rng_act, cfg
+            )
+            
+            for idx_in_batch, pipe_idx in enumerate(need_action_indices):
+                pipes[pipe_idx].send({
+                    "action_indices": [int(best_actions[idx_in_batch])],
+                    "search_pol": np.array(avg_policies[idx_in_batch]),
+                    "search_val": float(avg_values[idx_in_batch])
+                })
+
+    for pipe in pipes:
+        try:
+            pipe.send(None)
+        except Exception:
+            pass
+    for p in processes:
+        p.join(timeout=1.0)
+        if p.is_alive():
+            p.terminate()
+
+    return completed_histories, deck_builder_updates, deck_errors_count
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Boucle principale
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,57 +560,32 @@ def train(cfg: Config) -> None:
     from training.activity import tracker
     tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
-    from concurrent.futures import ThreadPoolExecutor
-    _deck_errors = 0
     _start_seeding = time.time()
-    
-    # Nombre de workers concurrents (4 est un bon équilibre sur Kaggle)
     NUM_WORKERS = 4
+    _deck_errors = 0
 
-    def _play_single_game_worker(worker_id):
-        nonlocal _deck_errors, rng
-        # Split local keys safely
-        rng, rng_sp, rng_d0, rng_d1 = jax.random.split(rng, 4)
-        deck_logits_np, _ = deck_net.apply(deck_params)
-        deck0, _ = sample_deck(deck_logits_np[0], rng_d0, num_card_ids, energy_ids,
-                               ace_spec_ids=ace_spec_ids)
-        deck1, _ = sample_deck(deck_logits_np[0], rng_d1, num_card_ids, energy_ids,
-                               ace_spec_ids=ace_spec_ids)
-
-        agent = make_agent_fn(network, _params_cpu, cfg, rng_sp)
-        
-        logger.info(f"[seeding-worker-{worker_id}] Lancement d'une partie de self-play...")
-        game_start_t = time.time()
-        try:
-            h0, h1 = run_self_play_game(agent, deck0, deck1, cfg,
-                                        np.random.default_rng())
-            logger.info(
-                f"[seeding-worker-{worker_id}] Partie terminée en {time.time() - game_start_t:.1f}s. "
-                f"J0 steps={len(h0.action_seq)}, J1 steps={len(h1.action_seq)}"
-            )
-            return h0, h1
-        except DeckError as e:
-            _deck_errors += 1
-            tracker.update(deck_errors=_deck_errors)
-            logger.warning(f"[seeding-worker-{worker_id}] DeckError #{_deck_errors}: {e} — resampling deck")
-            return None
-
-    # Lancement parallèle pour le seeding
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        while len(buffer) < cfg.train.min_replay_size:
-            tracker.update()
-            
-            # Soumettre un lot de tâches concurrentes
-            futures = [executor.submit(_play_single_game_worker, idx) for idx in range(NUM_WORKERS)]
-            
-            for future in futures:
-                res = future.result()
-                if res is not None:
-                    h0, h1 = res
-                    for hist in (h0, h1):
-                        _add_history_to_buffer(hist, buffer, cfg)
-            
-            tracker.update(buffer_size=len(buffer))
+    while len(buffer) < cfg.train.min_replay_size:
+        tracker.update()
+        rng, rng_sp = jax.random.split(rng)
+        hists, _, errs = run_parallel_self_play(
+            num_games_to_play=8,
+            num_workers=NUM_WORKERS,
+            deck_net=deck_net,
+            deck_params=deck_params,
+            network=network,
+            state_params=_params_cpu,
+            cfg=cfg,
+            rng=rng_sp,
+            num_card_ids=num_card_ids,
+            energy_ids=energy_ids,
+            ace_spec_ids=ace_spec_ids,
+            is_seeding=True
+        )
+        _deck_errors += errs
+        tracker.update(deck_errors=_deck_errors)
+        for hist in hists:
+            _add_history_to_buffer(hist, buffer, cfg)
+        tracker.update(buffer_size=len(buffer))
 
     logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
 
@@ -459,55 +600,36 @@ def train(cfg: Config) -> None:
         if step % cfg.train.self_play_interval == 0:
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
             rng, rng_sp = jax.random.split(rng)
-            deck_logits_np, _ = deck_net.apply(deck_params)
             
             tracker.update(phase=f"Self-Play Step {step}")
 
-            # Worker pour la boucle d'entraînement principale
-            def _play_train_worker(worker_idx):
-                nonlocal rng
-                rng, rng_d0, rng_d1, rng_ag = jax.random.split(rng, 4)
-                deck0, ids0 = sample_deck(
-                    deck_logits_np[0], rng_d0, num_card_ids, energy_ids,
-                    ace_spec_ids=ace_spec_ids,
-                )
-                deck1, ids1 = sample_deck(
-                    deck_logits_np[0], rng_d1, num_card_ids, energy_ids,
-                    ace_spec_ids=ace_spec_ids,
-                )
-                agent = make_agent_fn(network, _params_cpu, cfg, rng_ag)
-                try:
-                    h0, h1 = run_self_play_game(
-                        agent, deck0, deck1, cfg, np.random.default_rng()
-                    )
-                    return h0, h1, ids0, ids1
-                except DeckError as e:
-                    logger.warning("[train] DeckError: %s — skipping game", e)
-                    return None
-
-            # Exécuter les games_per_self_play en parallèle
             n_games = cfg.train.games_per_self_play
-            with ThreadPoolExecutor(max_workers=min(NUM_WORKERS, n_games)) as executor:
-                futures = [executor.submit(_play_train_worker, idx) for idx in range(n_games)]
-                
-                for future in futures:
-                    res = future.result()
-                    if res is not None:
-                        h0, h1, ids0, ids1 = res
-                        for hist in (h0, h1):
-                            _add_history_to_buffer(hist, buffer, cfg)
+            hists, deck_updates, _ = run_parallel_self_play(
+                num_games_to_play=n_games,
+                num_workers=min(NUM_WORKERS, n_games),
+                deck_net=deck_net,
+                deck_params=deck_params,
+                network=network,
+                state_params=_params_cpu,
+                cfg=cfg,
+                rng=rng_sp,
+                num_card_ids=num_card_ids,
+                energy_ids=energy_ids,
+                ace_spec_ids=ace_spec_ids,
+                is_seeding=False
+            )
 
-                        # Deck builder REINFORCE update
-                        reward_0 = float(h0.game_won or False) * 2 - 1
-                        reward_1 = float(h1.game_won or False) * 2 - 1
-                        for deck_ids, rew in [(ids0, reward_0), (ids1, reward_1)]:
-                            deck_params, deck_opt_state, deck_baseline, d_loss = \
-                                deck_reinforce_update(
-                                    deck_net, deck_params, deck_opt_state, deck_optimizer,
-                                    deck_ids, rew, deck_baseline,
-                                    entropy_coef=cfg.train.deck_entropy_coef,
-                                    baseline_ema=cfg.train.deck_baseline_ema,
-                                )
+            for hist in hists:
+                _add_history_to_buffer(hist, buffer, cfg)
+
+            for deck_ids, rew in deck_updates:
+                deck_params, deck_opt_state, deck_baseline, d_loss = \
+                    deck_reinforce_update(
+                        deck_net, deck_params, deck_opt_state, deck_optimizer,
+                        deck_ids, rew, deck_baseline,
+                        entropy_coef=cfg.train.deck_entropy_coef,
+                        baseline_ema=cfg.train.deck_baseline_ema,
+                    )
 
         # ── b. Sample + train ─────────────────────────────────────────────
         entries, indices, is_w = buffer.sample(cfg.train.batch_size)
