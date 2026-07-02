@@ -327,13 +327,16 @@ def ismcts_action_batched(
     B = option_masks_np.shape[0]
     S = int(sc.num_belief_samples)
 
+    # Extraire uniquement les params MuZero (le dict complet contient aussi "probes")
+    mz_params = params["muzero"] if isinstance(params, dict) and "muzero" in params else params
+
     flat_obs = {}
     for k, v in batched_enc_obs.items():
         shape = v.shape
         flat_obs[k] = jnp.reshape(v, (B * S,) + shape[2:])
 
-    # GPU encoder forward pass
-    z, pi_logits, v = network.apply(params, flat_obs)
+    # GPU encoder forward pass — représentation pour tous les (game × belief) en une seule passe
+    z, pi_logits, v = network.apply(mz_params, flat_obs)
 
     option_masks_jnp = jnp.array(option_masks_np)
     mask_jax_batched = jnp.repeat(option_masks_jnp, S, axis=0)
@@ -346,7 +349,7 @@ def ismcts_action_batched(
 
     vmapped_mcts = jax.vmap(
         lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
-            params,
+            mz_params,
             z_item[None],
             logits_item[None],
             v_item,
