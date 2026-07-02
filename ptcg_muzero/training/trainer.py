@@ -289,8 +289,9 @@ def run_parallel_self_play(
     deck_builder_updates = []
     deck_errors_count = 0
 
-    # Dé-répliquer les paramètres depuis le device 0 (pmap produit shape [D, ...])
-    _params_cpu = jax.tree_util.tree_map(lambda x: np.array(x[0]), state_params)
+    # state_params est déjà dé-répliqué (x[0] effectué côté appelant)
+    # On convertit simplement en numpy pour s'assurer que les tenseurs sont sur CPU
+    _params_cpu = jax.tree_util.tree_map(lambda x: np.array(x), state_params)
 
     from models.deck_builder import sample_deck
     deck_logits, _ = deck_net.apply(deck_params)
