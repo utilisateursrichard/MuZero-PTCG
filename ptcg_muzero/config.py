@@ -104,9 +104,11 @@ class TrainConfig:
 @dataclass
 class HFConfig:
     enabled: bool = True
-    repo_id: str = "richard151111/muZero"   # ← CHANGE BEFORE RUNNING
+    repo_id: str = "richard151111/muZero"
     private: bool = True
-    token_env_var: str = "XXXX"              # env-var holding your HF token
+    # Nom de la variable d'environnement contenant le token HF
+    # (ex: export HF_TOKEN=hf_xxx dans le terminal Kaggle, PAS le token lui-même)
+    token_env_var: str = "HF_TOKEN"
     push_every_n_steps: int = 5_000
     local_dir: str = "./hf_checkpoints"
 
@@ -116,6 +118,12 @@ class InfraConfig:
     num_devices: int = 2         # dual-GPU via jax.pmap
     seed: int = 42
     card_csv: str = "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv"
+    # Deck de référence du sample_submission (garanti valide par le moteur)
+    # Utilisé pour détecter les cartes Ace Spec et amorcer le replay buffer.
+    reference_deck_csv: str = (
+        "/kaggle/input/competitions/pokemon-tcg-ai-battle"
+        "/sample_submission/sample_submission/deck.csv"
+    )
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     debug_no_jit: bool = False   # set True to disable JIT for debugging

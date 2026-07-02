@@ -37,6 +37,7 @@ from pathlib import Path
 # NOTE: cabt / cg-lib path discovery is handled centrally in env.cabt_api
 # (same glob pattern as the reference Kaggle notebook).
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +112,38 @@ def cmd_train(args) -> None:
     # Sauvegarde config pour reproductibilité
     Path(cfg.infra.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     cfg.save(Path(cfg.infra.checkpoint_dir) / "config.json")
+
+    # Import du tracker d'activité explicite et propre
+    import threading
+    import time
+    from training.activity import tracker, dump_all_stacks
+
+    # Thread heartbeat basé sur le temps réel (toutes les 15 secondes)
+    def _heartbeat():
+        while True:
+            time.sleep(15.0)
+            now = time.time()
+            inactive_dur = now - tracker.last_activity_time
+            
+            # Détection de freeze (aucune mise à jour d'activité depuis plus de 60s)
+            if inactive_dur > 60.0:
+                freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
+                logger.warning(
+                    "[heartbeat] Phase: %s | Buffer: %d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs%s",
+                    tracker.phase, tracker.buffer_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur, freeze_warning
+                )
+                try:
+                    dump_all_stacks()
+                except Exception as e:
+                    logger.error("Impossible de dumper la stack trace : %s", e)
+            else:
+                logger.info(
+                    "[heartbeat] Phase: %s | Buffer: %d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs",
+                    tracker.phase, tracker.buffer_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur
+                )
+            
+    h_thread = threading.Thread(target=_heartbeat, daemon=True)
+    h_thread.start()
 
     from training.trainer import train
     train(cfg)

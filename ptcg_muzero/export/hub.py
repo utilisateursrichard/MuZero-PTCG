@@ -119,8 +119,20 @@ def push_to_hub(
 
     token = os.environ.get(cfg.hf.token_env_var, "")
     if not token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            user_secrets = UserSecretsClient()
+            token = user_secrets.get_secret(cfg.hf.token_env_var)
+            if token:
+                logger.info("Token HF récupéré depuis Kaggle Secrets.")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning("Échec de la récupération du secret Kaggle: %s", e)
+
+    if not token:
         logger.warning(
-            "HF_TOKEN absent (variable '%s') — push ignoré.",
+            "HF_TOKEN absent (variable '%s' ou Secret Kaggle absent) — push ignoré.",
             cfg.hf.token_env_var,
         )
         return

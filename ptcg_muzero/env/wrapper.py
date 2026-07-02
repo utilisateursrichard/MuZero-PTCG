@@ -89,6 +89,14 @@ class GameHistory:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Deck error (rethrown as a specific type so callers can retry)
+# ─────────────────────────────────────────────────────────────────────────────
+class DeckError(ValueError):
+    """Raised when battle_start() rejects a deck (invalid cards, duplicates, etc)."""
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # cabt environment thin wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 class CabtEnv:
@@ -148,7 +156,7 @@ class CabtEnv:
                 error = "There are no Basic Pokémon in the deck."
             elif start_data.errorType == 4:
                 error = "You can include only one Ace Spec card in the deck."
-            raise ValueError(error)
+            raise DeckError(error)
 
         self._battle_started = True
         self.result = -1
@@ -238,12 +246,29 @@ def run_self_play_game(
         if done or obs_dict is None:
             return hist[0], hist[1]
 
+        step_count = 0
         while not done:
-            # yourIndex tells us which player must act now
+            step_count += 1
             your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
-            select   = obs_dict.get("select") or {}
+            select   = obs_dict.get("select")
+            
+            # Diagnostic log
+            from training.trainer import logger as t_logger
+            t_logger.info(
+                "[game step %d] your_idx=%d select_is_none=%s options_count=%d",
+                step_count, your_idx, select is None, 0 if select is None else len(select.get("option", []))
+            )
+            
+            from training.activity import tracker
+            tracker.update(current_game_steps=step_count)
+            
+            # Si select est absent, c'est l'initialisation (soumission du deck)
+            if select is None:
+                deck_to_submit = deck0 if your_idx == 0 else deck1
+                obs_dict, done = env.step(deck_to_submit)
+                continue
+                
             options  = select.get("option", [])
-
             if not options:
                 # No options available – auto-pass (engine may still advance)
                 obs_dict, done = env.step([])

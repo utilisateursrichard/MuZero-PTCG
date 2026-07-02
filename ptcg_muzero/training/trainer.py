@@ -38,13 +38,16 @@ from flax.training import train_state
 from cards.encoder import CardStaticFeatures, CardEmbedding, CARD_STATIC_DIM
 from config import Config
 from env.encoding import encode_observation
-from env.wrapper import GameHistory, run_self_play_game
+from env.wrapper import GameHistory, run_self_play_game, DeckError
 from export.hub import push_to_hub
 from interpretability.probes import (
     ProbeHeads,
     extract_probe_targets,
     probe_accuracy,
     probe_report,
+)
+from env.cabt_api import (
+    all_card_data,
 )
 from models.deck_builder import (
     DeckBuilderNetwork,
@@ -204,7 +207,7 @@ def make_agent_fn(
         option_mask = enc_obs["option_mask"]
 
         best_action, avg_policy, avg_value = ismcts_action(
-            network, params_cpu, enc_obs, option_mask, rng_act, cfg
+            network, params_cpu["muzero"], enc_obs, option_mask, rng_act, cfg
         )
 
         if train_mode:
@@ -276,8 +279,81 @@ def train(cfg: Config) -> None:
         if "Energy" in card_data._cards[cid].get("stage", "")
     ]
     set_energy_ids(energy_ids)
-    # Mark Ace Spec IDs (max 1 copy per deck)
-    ace_spec_ids = card_data.ace_spec_ids
+
+    # ── Détection des cartes Ace Spec via deck.csv de référence ──────────
+    # NOTE : deck.csv est un exemple officiel fourni par la compétition.
+    # Il est utilisé ICI UNIQUEMENT pour identifier quels card IDs sont
+    # des cartes Ace Spec (ceux qui n'apparaissent qu'une seule fois).
+    # Il n'est JAMAIS utilisé comme deck de jeu en self-play.
+    ace_spec_ids: list = []
+
+    ref_path = cfg.infra.reference_deck_csv
+    try:
+        if os.path.exists(ref_path):
+            with open(ref_path) as f:
+                ref_ids = [int(line.strip()) for line in f if line.strip().isdigit()]
+
+            from collections import Counter
+            counts = Counter(ref_ids)
+            energy_set = set(energy_ids)
+
+            # Ace Spec = apparait exactement 1 fois ET n'est pas une énergie de base
+            ace_spec_ids = [
+                cid for cid, cnt in counts.items()
+                if cnt == 1 and cid not in energy_set
+            ]
+            logger.info("[ace-spec] %d Ace Spec card(s) détecté(s) via reference deck.csv : %s",
+                        len(ace_spec_ids), ace_spec_ids)
+        else:
+            logger.warning("[ace-spec] reference_deck_csv introuvable : %s", ref_path)
+    except Exception as e:
+        logger.warning("[ace-spec] Lecture du reference deck échouée : %s", e)
+
+    # Fallback: engine all_card_data() inspection
+    if not ace_spec_ids:
+        try:
+            cg_cards = all_card_data()
+            items = list(cg_cards.items() if isinstance(cg_cards, dict) else enumerate(cg_cards))
+
+            def _card_is_ace(card) -> bool:
+                for attr in ('is_ace_spec', 'isAceSpec', 'ace_spec', 'is_ace', 'isAce'):
+                    v = getattr(card, attr, None)
+                    if isinstance(v, bool) and v:
+                        return True
+                try:
+                    d = vars(card)
+                except TypeError:
+                    d = {a: getattr(card, a, None) for a in dir(card) if not a.startswith('_')}
+                for k, v in d.items():
+                    if 'ace' in k.lower() and isinstance(v, bool) and v:
+                        return True
+                    if 'rule' in k.lower():
+                        texts = [v] if isinstance(v, str) else (list(v) if isinstance(v, (list, tuple)) else [])
+                        for t in texts:
+                            if isinstance(t, str) and 'ace spec' in t.lower():
+                                return True
+                return False
+
+            def _card_id(idx, card) -> int:
+                for attr in ('id', 'card_id', 'cardId'):
+                    v = getattr(card, attr, None)
+                    if v is not None:
+                        return int(v)
+                return int(idx)
+
+            ace_spec_ids = [_card_id(i, c) for i, c in items if _card_is_ace(c)]
+            logger.info("[ace-spec] Engine fallback: %d Ace Spec cards", len(ace_spec_ids))
+        except Exception as e:
+            logger.warning("[ace-spec] all_card_data() failed: %s", e)
+
+    # Fallback: CSV Rule column
+    if not ace_spec_ids:
+        ace_spec_ids = card_data.ace_spec_ids
+        logger.info("[ace-spec] CSV fallback: %d Ace Spec cards", len(ace_spec_ids))
+
+    if not ace_spec_ids:
+        logger.warning("[ace-spec] No Ace Spec cards detected — DeckErrors will be retried.")
+
     set_ace_spec_ids(ace_spec_ids)
     logger.info("Card pool: %d ids, %d energy ids, %d ace spec ids",
                 num_card_ids, len(energy_ids), len(ace_spec_ids))
@@ -310,24 +386,67 @@ def train(cfg: Config) -> None:
     # ── 6. Replay buffer ──────────────────────────────────────────────────
     buffer = PrioritizedReplayBuffer(cfg.train, cfg.model)
 
-    # ── 7. Self-play seed games ───────────────────────────────────────────
+    # ── 7. Parallel Self-play seed games ──────────────────────────────────
     logger.info("Seeding replay buffer (min=%d)…", cfg.train.min_replay_size)
     rng, rng_selfplay = jax.random.split(rng)
     _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
 
-    while len(buffer) < cfg.train.min_replay_size:
+    from training.activity import tracker
+    tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
+
+    from concurrent.futures import ThreadPoolExecutor
+    _deck_errors = 0
+    _start_seeding = time.time()
+    
+    # Nombre de workers concurrents (4 est un bon équilibre sur Kaggle)
+    NUM_WORKERS = 4
+
+    def _play_single_game_worker(worker_id):
+        nonlocal _deck_errors, rng
+        # Split local keys safely
         rng, rng_sp, rng_d0, rng_d1 = jax.random.split(rng, 4)
         deck_logits_np, _ = deck_net.apply(deck_params)
-        deck0, _ = sample_deck(deck_logits_np[0], rng_d0, num_card_ids, energy_ids)
-        deck1, _ = sample_deck(deck_logits_np[0], rng_d1, num_card_ids, energy_ids)
+        deck0, _ = sample_deck(deck_logits_np[0], rng_d0, num_card_ids, energy_ids,
+                               ace_spec_ids=ace_spec_ids)
+        deck1, _ = sample_deck(deck_logits_np[0], rng_d1, num_card_ids, energy_ids,
+                               ace_spec_ids=ace_spec_ids)
 
         agent = make_agent_fn(network, _params_cpu, cfg, rng_sp)
-        h0, h1 = run_self_play_game(agent, deck0, deck1, cfg,
-                                    np.random.default_rng())
-        for hist in (h0, h1):
-            _add_history_to_buffer(hist, buffer, cfg)
+        
+        logger.info(f"[seeding-worker-{worker_id}] Lancement d'une partie de self-play...")
+        game_start_t = time.time()
+        try:
+            h0, h1 = run_self_play_game(agent, deck0, deck1, cfg,
+                                        np.random.default_rng())
+            logger.info(
+                f"[seeding-worker-{worker_id}] Partie terminée en {time.time() - game_start_t:.1f}s. "
+                f"J0 steps={len(h0.action_seq)}, J1 steps={len(h1.action_seq)}"
+            )
+            return h0, h1
+        except DeckError as e:
+            _deck_errors += 1
+            tracker.update(deck_errors=_deck_errors)
+            logger.warning(f"[seeding-worker-{worker_id}] DeckError #{_deck_errors}: {e} — resampling deck")
+            return None
 
-    logger.info("Buffer seeded: %d entries", len(buffer))
+    # Lancement parallèle pour le seeding
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        while len(buffer) < cfg.train.min_replay_size:
+            tracker.update(last_activity_time=time.time())
+            
+            # Soumettre un lot de tâches concurrentes
+            futures = [executor.submit(_play_single_game_worker, idx) for idx in range(NUM_WORKERS)]
+            
+            for future in futures:
+                res = future.result()
+                if res is not None:
+                    h0, h1 = res
+                    for hist in (h0, h1):
+                        _add_history_to_buffer(hist, buffer, cfg)
+            
+            tracker.update(buffer_size=len(buffer))
+
+    logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
 
     # ── 8. Main training loop ─────────────────────────────────────────────
     global_step = 0
@@ -341,33 +460,54 @@ def train(cfg: Config) -> None:
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
             rng, rng_sp = jax.random.split(rng)
             deck_logits_np, _ = deck_net.apply(deck_params)
+            
+            tracker.update(phase=f"Self-Play Step {step}", last_activity_time=time.time())
 
-            for _ in range(cfg.train.games_per_self_play):
+            # Worker pour la boucle d'entraînement principale
+            def _play_train_worker(worker_idx):
+                nonlocal rng
                 rng, rng_d0, rng_d1, rng_ag = jax.random.split(rng, 4)
                 deck0, ids0 = sample_deck(
-                    deck_logits_np[0], rng_d0, num_card_ids, energy_ids
+                    deck_logits_np[0], rng_d0, num_card_ids, energy_ids,
+                    ace_spec_ids=ace_spec_ids,
                 )
                 deck1, ids1 = sample_deck(
-                    deck_logits_np[0], rng_d1, num_card_ids, energy_ids
+                    deck_logits_np[0], rng_d1, num_card_ids, energy_ids,
+                    ace_spec_ids=ace_spec_ids,
                 )
                 agent = make_agent_fn(network, _params_cpu, cfg, rng_ag)
-                h0, h1 = run_self_play_game(
-                    agent, deck0, deck1, cfg, np.random.default_rng()
-                )
-                for hist in (h0, h1):
-                    _add_history_to_buffer(hist, buffer, cfg)
+                try:
+                    h0, h1 = run_self_play_game(
+                        agent, deck0, deck1, cfg, np.random.default_rng()
+                    )
+                    return h0, h1, ids0, ids1
+                except DeckError as e:
+                    logger.warning("[train] DeckError: %s — skipping game", e)
+                    return None
 
-                # Deck builder REINFORCE update
-                reward_0 = float(h0.game_won or False) * 2 - 1
-                reward_1 = float(h1.game_won or False) * 2 - 1
-                for deck_ids, rew in [(ids0, reward_0), (ids1, reward_1)]:
-                    deck_params, deck_opt_state, deck_baseline, d_loss = \
-                        deck_reinforce_update(
-                            deck_net, deck_params, deck_opt_state, deck_optimizer,
-                            deck_ids, rew, deck_baseline,
-                            entropy_coef=cfg.train.deck_entropy_coef,
-                            baseline_ema=cfg.train.deck_baseline_ema,
-                        )
+            # Exécuter les games_per_self_play en parallèle
+            n_games = cfg.train.games_per_self_play
+            with ThreadPoolExecutor(max_workers=min(NUM_WORKERS, n_games)) as executor:
+                futures = [executor.submit(_play_train_worker, idx) for idx in range(n_games)]
+                
+                for future in futures:
+                    res = future.result()
+                    if res is not None:
+                        h0, h1, ids0, ids1 = res
+                        for hist in (h0, h1):
+                            _add_history_to_buffer(hist, buffer, cfg)
+
+                        # Deck builder REINFORCE update
+                        reward_0 = float(h0.game_won or False) * 2 - 1
+                        reward_1 = float(h1.game_won or False) * 2 - 1
+                        for deck_ids, rew in [(ids0, reward_0), (ids1, reward_1)]:
+                            deck_params, deck_opt_state, deck_baseline, d_loss = \
+                                deck_reinforce_update(
+                                    deck_net, deck_params, deck_opt_state, deck_optimizer,
+                                    deck_ids, rew, deck_baseline,
+                                    entropy_coef=cfg.train.deck_entropy_coef,
+                                    baseline_ema=cfg.train.deck_baseline_ema,
+                                )
 
         # ── b. Sample + train ─────────────────────────────────────────────
         entries, indices, is_w = buffer.sample(cfg.train.batch_size)

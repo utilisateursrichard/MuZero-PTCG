@@ -161,6 +161,9 @@ def sample_deck(
 
     rng_np = np.random.default_rng(int(rng[0]) % (2**31))
 
+    # Track if any Ace Spec card has already been added to the deck
+    has_ace_spec = False
+
     for _ in range(DECK_SIZE):
         # Build mask: 0 = available, -inf = forbidden
         mask = np.zeros(num_card_ids, dtype=np.float32)
@@ -169,7 +172,8 @@ def sample_deck(
             if cid in energy_set:
                 lim = num_card_ids          # pas de limite sur les énergies de base
             elif cid in ace_spec_set:
-                lim = 1                     # Ace Spec : 1 exemplaire max
+                # Si le deck contient déjà une carte Ace Spec, toutes les Ace Spec sont interdites
+                lim = 0 if has_ace_spec else 1
             else:
                 lim = max_copies_normal     # cartes normales : 4 max
             if counts[cid] >= lim:
@@ -179,6 +183,10 @@ def sample_deck(
         chosen = rng_np.choice(num_card_ids, p=probs)
         counts[chosen] += 1
         deck.append(int(chosen))
+        
+        # Si la carte choisie fait partie du set Ace Spec, on verrouille la contrainte globale
+        if chosen in ace_spec_set:
+            has_ace_spec = True
 
     return deck, jnp.array(deck, dtype=jnp.int32)
 

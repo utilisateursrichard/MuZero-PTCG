@@ -43,7 +43,8 @@ class MuZeroRecurrentFn(NamedTuple):
 # mctx recurrent function
 # ─────────────────────────────────────────────────────────────────────────────
 def make_recurrent_fn(
-    network,          # MuZeroNetwork Flax module (bound)
+    dynamics_fn: Callable,   # network.dynamics bound method
+    predict_fn: Callable,    # network.predict bound method
     params: dict,
     cfg: ModelConfig,
 ) -> Callable:
@@ -68,16 +69,14 @@ def make_recurrent_fn(
         # One-hot encode action
         action_onehot = jax.nn.one_hot(action, num_actions)   # [B, A]
 
-        # g: dynamics
-        reward, z_next = network.apply(
-            params, embedding, action_onehot,
-            method=network.dynamics,
+        # g: dynamics (using dynamics_fn directly with apply syntax wrapper)
+        reward, z_next = dynamics_fn(
+            params, embedding, action_onehot
         )
 
         # f: prediction from next state
-        pi_logits, value = network.apply(
-            params, z_next,
-            method=network.predict,
+        pi_logits, value = predict_fn(
+            params, z_next
         )
 
         recurrent_output = mctx.RecurrentFnOutput(
@@ -154,7 +153,7 @@ def sample_belief(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main ISMCTS entry point
 # ─────────────────────────────────────────────────────────────────────────────
-@partial(jax.jit, static_argnames=("network", "cfg_model", "cfg_search"))
+@partial(jax.jit, static_argnames=("dynamics_fn", "predict_fn", "max_actions", "num_simulations", "max_num_considered_actions"))
 def _run_single_mcts(
     params: dict,
     root_embedding: jnp.ndarray,   # [1, D]
@@ -163,15 +162,22 @@ def _run_single_mcts(
     option_mask: jnp.ndarray,      # [1, A] bool
     rng: jnp.ndarray,
     *,
-    network,
-    cfg_model: ModelConfig,
-    cfg_search: SearchConfig,
+    dynamics_fn: Callable,
+    predict_fn: Callable,
+    max_actions: int,
+    num_simulations: int,
+    max_num_considered_actions: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Run Gumbel MuZero search for one determinised world.
     Returns (policy [1,A], value [1]).
     """
-    recurrent_fn = make_recurrent_fn(network, params, cfg_model)
+    # Create a dummy container for max_actions to satisfy make_recurrent_fn
+    class _DummyCfg:
+        def __init__(self, ma):
+            self.max_actions = ma
+    
+    recurrent_fn = make_recurrent_fn(dynamics_fn, predict_fn, params, _DummyCfg(max_actions))
 
     # Mask illegal actions: set logits of invalid options to -1e9
     invalid_mask = ~option_mask           # True where action is INVALID
@@ -188,8 +194,8 @@ def _run_single_mcts(
         rng_key=rng,
         root=root,
         recurrent_fn=recurrent_fn,
-        num_simulations=cfg_search.num_simulations,
-        max_num_considered_actions=cfg_search.max_num_considered_actions,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
         invalid_actions=invalid_mask,
     )
 
@@ -220,48 +226,61 @@ def ismcts_action(
 
     sc  = cfg.search
     mc  = cfg.model
-    B   = 1  # single game, not batched here
+    N_samples = int(sc.num_belief_samples)
 
-    all_policies = []
-    all_values   = []
+    # 1. Générer toutes les déterminisations (belief samples) sur CPU
+    rng, *rng_beliefs = jax.random.split(rng, N_samples + 1)
+    rng_mcts_keys = jax.random.split(rng, N_samples)
+    
+    det_list = []
+    for s in range(N_samples):
+        det_list.append(sample_belief(obs, rng_beliefs[s], mc))
 
-    # Batch observation into shape [1, ...] for JAX
-    def _to_jax_batch(d: dict) -> dict:
-        return {k: jnp.array(v[None]) for k, v in d.items()}
+    # Assembler le batch d'observations JAX de taille [N_samples, ...]
+    jax_obs_batched = {}
+    for k in det_list[0].keys():
+        jax_obs_batched[k] = jnp.stack([d[k] for d in det_list], axis=0)
 
-    for s in range(sc.num_belief_samples):
-        rng, rng_belief, rng_mcts = jax.random.split(rng, 3)
+    # 2. Encoder l'état racine pour toutes les hypothèses en parallèle
+    # z: [N_samples, D], pi_logits: [N_samples, A], v: [N_samples, 1]
+    z, pi_logits, v = network.apply(params, jax_obs_batched)
 
-        # 1. Determinise
-        det_obs = sample_belief(obs, rng_belief, mc)
-        jax_obs = _to_jax_batch(det_obs)
+    # Préparer les masques d'option de taille [N_samples, A]
+    mask_jax_batched = jnp.stack([jnp.array(option_mask_np)] * N_samples, axis=0)
 
-        # 2. Encode root state
-        z, pi_logits, v = network.apply(params, jax_obs)  # [1,D], [1,A], [1]
+    # 3. Définir les fonctions lambda stables
+    dyn_fn = lambda p, z, a: network.apply(p, z, a, method=network.dynamics)
+    prd_fn = lambda p, z: network.apply(p, z, method=network.predict)
 
-        # 3. Mask and run MCTS
-        mask_jax = jnp.array(option_mask_np[None])   # [1, A]
-
-        action_weights, node_val = _run_single_mcts(
+    # 4. Vectoriser _run_single_mcts sur la dimension batch (axis 0)
+    # JAX va exécuter toutes les simulations MCTS en parallèle sur le GPU
+    vmapped_mcts = jax.vmap(
+        lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
             params,
-            z,
-            pi_logits,
-            v,
-            mask_jax,
-            rng_mcts,
-            network=network,
-            cfg_model=mc,
-            cfg_search=sc,
-        )
+            z_item[None],
+            logits_item[None],
+            v_item,
+            mask_item[None],
+            rng_item,
+            dynamics_fn=dyn_fn,
+            predict_fn=prd_fn,
+            max_actions=int(mc.max_actions),
+            num_simulations=int(sc.num_simulations),
+            max_num_considered_actions=int(sc.max_num_considered_actions),
+        ),
+        in_axes=(0, 0, 0, 0, 0)
+    )
 
-        all_policies.append(action_weights[0])    # [A]
-        all_values.append(float(node_val[0, 0]))
+    # Exécution vectorisée
+    action_weights_batched, node_val_batched = vmapped_mcts(
+        z, pi_logits, v, mask_jax_batched, rng_mcts_keys
+    )
 
-    # 4. Average across belief samples
-    avg_policy = jnp.mean(jnp.stack(all_policies), axis=0)    # [A]
-    avg_value  = float(np.mean(all_values))
+    # 5. Moyenne sur l'axe des belief samples
+    avg_policy = jnp.mean(action_weights_batched[:, 0, :], axis=0)  # [A]
+    avg_value  = float(jnp.mean(node_val_batched[:, 0, 0]))
 
-    # Mask then argmax
+    # Appliquer le masque d'options légales
     avg_policy = jnp.where(
         jnp.array(option_mask_np), avg_policy, -1e9
     )

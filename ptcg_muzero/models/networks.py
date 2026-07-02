@@ -458,4 +458,10 @@ class MuZeroNetwork(nn.Module):
         """Full forward pass for the root node: h → f."""
         z        = self.represent(obs, deterministic=deterministic)
         pi, v    = self.predict(z)
+        
+        # Force l'initialisation des paramètres du modèle de dynamique (self.g)
+        # pendant l'init sans affecter la sortie de la racine.
+        dummy_action = jnp.zeros((z.shape[0], self.cfg.max_actions))
+        _, _ = self.dynamics(z, dummy_action)
+        
         return z, pi, v
