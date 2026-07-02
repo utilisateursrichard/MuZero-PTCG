@@ -105,6 +105,7 @@ class TrainConfig:
 class HFConfig:
     enabled: bool = True
     repo_id: str = "richard151111/muZero"   # ← CHANGE BEFORE RUNNING
+    private: bool = True
     token_env_var: str = "XXXX"              # env-var holding your HF token
     push_every_n_steps: int = 5_000
     local_dir: str = "./hf_checkpoints"
@@ -114,7 +115,7 @@ class HFConfig:
 class InfraConfig:
     num_devices: int = 2         # dual-GPU via jax.pmap
     seed: int = 42
-    card_csv: str = "./data/cards.csv"
+    card_csv: str = "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv"
     checkpoint_dir: str = "./checkpoints"
     log_dir: str = "./logs"
     debug_no_jit: bool = False   # set True to disable JIT for debugging

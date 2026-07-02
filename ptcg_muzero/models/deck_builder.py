@@ -48,11 +48,21 @@ MAX_COPIES_ENERGY = 60  # pas de limite sur les énergies de base
 # Ces IDs sont remplis au démarrage par ``set_energy_ids``
 _BASIC_ENERGY_IDS: List[int] = []
 
+# IDs des cartes Ace Spec (max 1 exemplaire par deck)
+# Ces IDs sont remplis au démarrage par ``set_ace_spec_ids``
+_ACE_SPEC_IDS: List[int] = []
+
 
 def set_energy_ids(ids: List[int]) -> None:
     """Appelé une fois après parsing du CSV."""
     global _BASIC_ENERGY_IDS
     _BASIC_ENERGY_IDS = list(ids)
+
+
+def set_ace_spec_ids(ids: List[int]) -> None:
+    """Appelé une fois après parsing du CSV."""
+    global _ACE_SPEC_IDS
+    _ACE_SPEC_IDS = list(ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,13 +82,14 @@ class DeckBuilderNetwork(nn.Module):
     @nn.compact
     def __call__(
         self, context: jnp.ndarray | None = None
-    ) -> jnp.ndarray:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Args:
             context: optional float32 [B, context_dim] conditioning vector
                      (e.g. win-rate history per card).  Pass None to ignore.
         Returns:
             logits: [B, num_card_ids]  unnormalised card-selection scores
+            probs:  [B, num_card_ids]  normalised card-selection probabilities
         """
         D   = self.cfg.latent_dim
         N   = self.cfg.num_card_ids
@@ -111,7 +122,8 @@ class DeckBuilderNetwork(nn.Module):
         attn = jnp.einsum("bid,bjd->bij", q, card_repr_b)  # [B, 1, N]
         attn = attn / (D ** 0.5)
         logits = attn[:, 0, :]   # [B, N]
-        return logits   # [B, num_card_ids]
+        probs = jax.nn.softmax(logits, axis=-1)
+        return logits, probs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,11 +134,15 @@ def sample_deck(
     rng: jnp.ndarray,
     num_card_ids: int,
     energy_ids: List[int],
+    ace_spec_ids: List[int] | None = None,
     max_copies_normal: int = MAX_COPIES_NORMAL,
     temperature: float = 1.0,
 ) -> Tuple[List[int], jnp.ndarray]:
     """
-    Sample DECK_SIZE card IDs respecting PTCG rules.
+    Sample DECK_SIZE card IDs respecting PTCG rules:
+      - Basic Energy cards: unlimited copies
+      - Ace Spec cards: max 1 copy
+      - All other cards: max ``max_copies_normal`` copies (default 4)
     Uses sequential sampling with count-based masking (numpy, outside JIT).
 
     Returns:
@@ -135,7 +151,8 @@ def sample_deck(
     """
     import numpy as np
 
-    energy_set = set(energy_ids)
+    energy_set   = set(energy_ids)
+    ace_spec_set = set(ace_spec_ids) if ace_spec_ids else set(_ACE_SPEC_IDS)
     counts  = np.zeros(num_card_ids, dtype=np.int32)
     deck    = []
 
@@ -149,7 +166,12 @@ def sample_deck(
         mask = np.zeros(num_card_ids, dtype=np.float32)
         mask[0] = -np.inf   # ID 0 is padding / "no card"
         for cid in range(1, num_card_ids):
-            lim = max_copies_normal if cid not in energy_set else num_card_ids
+            if cid in energy_set:
+                lim = num_card_ids          # pas de limite sur les énergies de base
+            elif cid in ace_spec_set:
+                lim = 1                     # Ace Spec : 1 exemplaire max
+            else:
+                lim = max_copies_normal     # cartes normales : 4 max
             if counts[cid] >= lim:
                 mask[cid] = -np.inf
 
@@ -191,7 +213,8 @@ def deck_reinforce_update(
     advantage = reward - baseline
 
     def loss_fn(p):
-        logits = network.apply(p)[0]
+        logits, _ = network.apply(p)
+        logits = logits[0]
         log_probs = jax.nn.log_softmax(logits)
         selected_log_probs = log_probs[deck_ids]
         entropy = -jnp.sum(jnp.exp(log_probs) * log_probs)

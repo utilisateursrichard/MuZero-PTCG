@@ -34,6 +34,9 @@ import os
 import sys
 from pathlib import Path
 
+# NOTE: cabt / cg-lib path discovery is handled centrally in env.cabt_api
+# (same glob pattern as the reference Kaggle notebook).
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +133,7 @@ def cmd_eval(args) -> None:
 
     from cards.encoder import CardStaticFeatures
     from models.networks import MuZeroNetwork
-    from models.deck_builder import DeckBuilderNetwork, sample_deck, set_energy_ids
+    from models.deck_builder import DeckBuilderNetwork, sample_deck, set_energy_ids, set_ace_spec_ids
     from training.trainer import make_agent_fn
     from env.wrapper import run_self_play_game
 
@@ -144,6 +147,7 @@ def cmd_eval(args) -> None:
         if "Energy" in card_data._cards[cid].get("stage", "")
     ]
     set_energy_ids(energy_ids)
+    set_ace_spec_ids(card_data.ace_spec_ids)
 
     network  = MuZeroNetwork(cfg=cfg.model, static_features=static_jax)
     deck_net = DeckBuilderNetwork(cfg=cfg.model, static_features=static_jax)
@@ -201,8 +205,12 @@ _SUBMIT_TEMPLATE = '''"""
 PTCG MuZero — agent de soumission Kaggle.
 Générée automatiquement par main.py submit.
 """
-import os, sys
-sys.path.insert(0, "/kaggle/working")
+import glob, sys
+# Replicate the exact path setup from the reference Kaggle notebook:
+#   sys.path.append(glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0])
+_cg_hits = glob.glob('/kaggle/input/**/cg-lib', recursive=True)
+if _cg_hits:
+    sys.path.append(_cg_hits[0])
 
 HF_REPO = "{repo_id}"
 
@@ -245,6 +253,7 @@ _rng = jax.random.PRNGKey(42)
 _logits, _ = _deck_net.apply(_dk_params)
 _deck, _   = sample_deck(_logits[0], _rng, _n, _energy_ids, temperature=0.1)
 
+from cg.game import battle_start, battle_select, battle_finish
 from search.ismcts import ismcts_action
 from env.encoding import encode_observation
 

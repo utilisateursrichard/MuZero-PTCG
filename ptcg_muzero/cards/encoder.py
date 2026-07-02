@@ -118,6 +118,11 @@ class CardStaticFeatures:
     def max_card_id(self) -> int:
         return max(self._cards.keys()) if self._cards else 0
 
+    @property
+    def ace_spec_ids(self) -> List[int]:
+        """IDs des cartes Ace Spec (limite d'1 exemplaire par deck)."""
+        return [cid for cid, info in self._cards.items() if info.get("is_ace")]
+
     def feature_matrix(self, num_card_ids: int) -> np.ndarray:
         """
         Return float32 array of shape [num_card_ids, CARD_STATIC_DIM].

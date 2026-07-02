@@ -51,6 +51,7 @@ from models.deck_builder import (
     create_deck_train_state,
     deck_reinforce_update,
     sample_deck,
+    set_ace_spec_ids,
     set_energy_ids,
 )
 from models.networks import MuZeroNetwork
@@ -275,7 +276,11 @@ def train(cfg: Config) -> None:
         if "Energy" in card_data._cards[cid].get("stage", "")
     ]
     set_energy_ids(energy_ids)
-    logger.info("Card pool: %d ids, %d energy ids", num_card_ids, len(energy_ids))
+    # Mark Ace Spec IDs (max 1 copy per deck)
+    ace_spec_ids = card_data.ace_spec_ids
+    set_ace_spec_ids(ace_spec_ids)
+    logger.info("Card pool: %d ids, %d energy ids, %d ace spec ids",
+                num_card_ids, len(energy_ids), len(ace_spec_ids))
 
     # ── 2. Build modules ──────────────────────────────────────────────────
     network    = MuZeroNetwork(cfg=cfg.model, static_features=static_jax)

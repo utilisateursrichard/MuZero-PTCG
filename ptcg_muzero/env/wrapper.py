@@ -3,10 +3,19 @@ ptcg_muzero/env/wrapper.py
 ===========================
 Wraps the cabt Kaggle environment and provides:
 
-* ``CabtEnv``   – thin sync wrapper around ``battle_start / battle_select``.
-* ``GameHistory`` – trajectory object stored in the replay buffer.
-* ``run_self_play_game`` – plays one full game between two MuZero policies
-  and returns two ``GameHistory`` objects (one per player perspective).
+* ``CabtEnv``        – thin sync wrapper around ``battle_start / battle_select``
+                       from ``cg.game`` (same API as the reference notebook).
+* ``GameHistory``    – trajectory object stored in the replay buffer.
+* ``run_self_play_game`` – plays one full game between two agent functions and
+  returns two ``GameHistory`` objects (one per player perspective).
+
+Import pattern
+--------------
+All cabt / cg-lib symbols come from ``env.cabt_api`` which handles the
+``glob``-based path discovery exactly as the reference Kaggle notebook does::
+
+    sys.path.append(glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0])
+    from cg.game import battle_start, battle_select, battle_finish
 
 The self-play loop lives here (not in JAX) because the cabt engine is a
 Python/C++ binary that cannot be JIT-compiled.
@@ -20,6 +29,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from config import Config
+from env.cabt_api import (
+    battle_finish,
+    battle_select,
+    battle_start,
+    to_observation_class,
+)
 from env.encoding import encode_observation, extract_step_reward
 
 logger = logging.getLogger(__name__)
@@ -80,77 +95,97 @@ class CabtEnv:
     """
     Minimal synchronous wrapper around the Kaggle cabt environment.
 
+    Mirrors the reference notebook's loop::
+
+        obs, start_data = battle_start(deck0, deck1)
+        while obs["current"]["result"] < 0:
+            selected = agent(obs)
+            obs = battle_select(selected)
+        battle_finish()
+
     Usage::
 
         env = CabtEnv()
-        obs0, obs1, done = env.reset(deck0, deck1)
+        obs_dict, done = env.reset(deck0, deck1)
         while not done:
-            obs0, obs1, done = env.step([action0], [action1])
-        result = env.result  # 0 / 1 / 2 (draw)
+            obs_dict, done = env.step([action])
+        result = env.result   # 0 / 1 / 2  (player 0 win / player 1 win / draw)
     """
 
     def __init__(self) -> None:
         self._battle_started = False
-        self._last_obs: Optional[Any] = None
+        self._last_obs: Optional[dict] = None
         self.result: int = -1
 
+    # ------------------------------------------------------------------
     def reset(
         self,
         deck0: List[int],
         deck1: List[int],
-    ) -> Tuple[Optional[dict], Optional[dict], bool]:
+    ) -> Tuple[Optional[dict], bool]:
         """
         Start a new battle.
 
+        Calls ``battle_start(deck0, deck1)`` exactly as the reference notebook.
+        Validates the ``start_data`` error flags and raises on deck errors.
+
         Returns:
-            obs_for_player0, obs_for_player1, done
+            obs_dict, done
         """
-        try:
-            from cabt import game as cabt_game  # type: ignore
-            result = cabt_game.battle_start(deck0, deck1)
-            obs_raw, start_data = result
-        except Exception as exc:
-            logger.error("battle_start failed: %s", exc)
-            raise
+        obs_raw, start_data = battle_start(deck0, deck1)
+
+        # ── Deck validation (copied verbatim from reference notebook) ──────
+        if start_data.errorPlayer >= 0:
+            error = "Deck error."
+            if start_data.errorType == 1:
+                error = "The deck contains invalid card ID."
+            elif start_data.errorType == 2:
+                error = (
+                    "You can include up to four cards with the same name in the "
+                    "deck, excluding basic Energy cards."
+                )
+            elif start_data.errorType == 3:
+                error = "There are no Basic Pokémon in the deck."
+            elif start_data.errorType == 4:
+                error = "You can include only one Ace Spec card in the deck."
+            raise ValueError(error)
 
         self._battle_started = True
         self.result = -1
 
-        if obs_raw is None:
-            logger.error("battle_start returned None observation: %s", start_data)
-            return None, None, True
-
-        obs_dict = _to_dict(obs_raw)
+        # obs_raw is already a plain dict (the cg.game API returns a dict)
+        obs_dict = obs_raw if isinstance(obs_raw, dict) else _obs_to_dict(obs_raw)
         done = _is_done(obs_dict)
-        return obs_dict, obs_dict, done   # same obs sent to both; yourIndex disambiguates
+        self._last_obs = obs_dict
+        return obs_dict, done
 
-    def step(
-        self,
-        select_p0: List[int],
-        select_p1: List[int],
-    ) -> Tuple[Optional[dict], Optional[dict], bool]:
+    # ------------------------------------------------------------------
+    def step(self, select_list: List[int]) -> Tuple[Optional[dict], bool]:
         """
-        Advance the game state by submitting both players' selections.
-        Returns the new observation and whether the game is over.
-        """
-        try:
-            from cabt import game as cabt_game  # type: ignore
-            obs_raw = cabt_game.battle_select([select_p0, select_p1])
-        except Exception as exc:
-            logger.error("battle_select failed: %s", exc)
-            raise
+        Advance the game by submitting the current player's selection.
 
-        obs_dict = _to_dict(obs_raw) if obs_raw is not None else {}
+        Calls ``battle_select(select_list)`` exactly as the reference notebook::
+
+            obs = battle_select(selected)
+
+        Returns:
+            obs_dict, done
+        """
+        obs_raw = battle_select(select_list)
+
+        obs_dict = obs_raw if isinstance(obs_raw, dict) else _obs_to_dict(obs_raw)
         done = _is_done(obs_dict)
         if done:
             self.result = obs_dict.get("current", {}).get("result", 2)
-        return obs_dict, obs_dict, done
+        self._last_obs = obs_dict
+        return obs_dict, done
 
+    # ------------------------------------------------------------------
     def close(self) -> None:
+        """Call ``battle_finish()`` to release engine resources."""
         if self._battle_started:
             try:
-                from cabt import game as cabt_game  # type: ignore
-                cabt_game.battle_finish()
+                battle_finish()
             except Exception:
                 pass
             self._battle_started = False
@@ -177,10 +212,18 @@ def run_self_play_game(
     """
     Play one complete game and return trajectories for both players.
 
-    The agent_fn is called for whichever player the env is waiting on.
-    Steps where neither / both players need to act simultaneously are
-    handled by forwarding the other player's action as the "pass" action
-    (index 0 when they have only one legal option, or the first option).
+    The game loop matches the reference notebook::
+
+        obs, start_data = battle_start(deck0, deck1)
+        while obs["current"]["result"] < 0:
+            your_index = obs["current"]["yourIndex"]
+            selected = agent(obs)
+            obs = battle_select(selected)
+        battle_finish()
+
+    ``agent_fn`` is called for whichever player the env is waiting on.
+    Supports passing a tuple/list of two separate agent functions
+    (one per player index).
 
     Returns:
         hist0, hist1  – GameHistory for player 0 and player 1.
@@ -191,25 +234,26 @@ def run_self_play_game(
     terminal_seen = [False, False]
 
     try:
-        obs_dict, _, done = env.reset(deck0, deck1)
+        obs_dict, done = env.reset(deck0, deck1)
         if done or obs_dict is None:
             return hist[0], hist[1]
 
         while not done:
+            # yourIndex tells us which player must act now
             your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
             select   = obs_dict.get("select") or {}
             options  = select.get("option", [])
 
             if not options:
-                # Shouldn't happen, but guard
-                obs_dict, _, done = env.step([], [])
+                # No options available – auto-pass (engine may still advance)
+                obs_dict, done = env.step([])
                 continue
 
-            # Get current player's encoded obs for probing targets
+            # ── Encode observation ──────────────────────────────────────────
             enc_obs = encode_observation(obs_dict, your_idx, cfg.model)
             hist[your_idx].raw_states.append(obs_dict)
 
-            # Call agent function → returns selected indices + search info
+            # ── Select agent ───────────────────────────────────────────────
             active_agent = (
                 agent_fn[your_idx]
                 if isinstance(agent_fn, (tuple, list))
@@ -219,7 +263,7 @@ def run_self_play_game(
                 obs_dict, your_idx, cfg
             )
 
-            # Compute reward from accumulated logs
+            # ── Reward from logs ───────────────────────────────────────────
             logs = obs_dict.get("logs", [])
             if len(logs) >= len(prev_logs[your_idx]):
                 new_logs = logs[len(prev_logs[your_idx]):]
@@ -231,7 +275,7 @@ def run_self_play_game(
             )
             reward = extract_step_reward(new_logs, your_idx)
 
-            # Store in history
+            # ── Store step in history ──────────────────────────────────────
             action_vec = np.zeros(cfg.model.max_actions, dtype=np.float32)
             for idx in action_indices:
                 if 0 <= int(idx) < cfg.model.max_actions:
@@ -243,11 +287,8 @@ def run_self_play_game(
             hist[your_idx].search_vals.append(float(search_val))
             hist[your_idx].select_types.append(int(select.get("type", 0)))
 
-            # Step environment
-            if your_idx == 0:
-                obs_dict, _, done = env.step(action_indices, [0])
-            else:
-                obs_dict, _, done = env.step([0], action_indices)
+            # ── Advance environment ────────────────────────────────────────
+            obs_dict, done = env.step(action_indices)
 
         # ── Terminal reward adjustment ─────────────────────────────────────
         result = env.result
@@ -264,7 +305,7 @@ def run_self_play_game(
                 else:
                     hist[p].game_won = None   # draw
 
-        # ── Compute returns ───────────────────────────────────────────────
+        # ── Compute bootstrapped returns ───────────────────────────────────
         for p in range(2):
             hist[p].compute_returns(cfg.train.gamma, cfg.train.td_steps)
 
@@ -277,11 +318,15 @@ def run_self_play_game(
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _to_dict(obs) -> dict:
-    """Convert a cabt Observation object or dict to a plain dict."""
+def _obs_to_dict(obs) -> dict:
+    """
+    Convert a cg Observation object (or any dataclass/object) to a plain dict.
+
+    ``cg.game.battle_start`` / ``battle_select`` return plain Python dicts on
+    the Kaggle platform, but we guard against other representations just in case.
+    """
     if isinstance(obs, dict):
         return obs
-    # cabt returns dataclass-like objects; use vars() or __dict__
     try:
         import dataclasses
         if dataclasses.is_dataclass(obs):
@@ -295,10 +340,11 @@ def _to_dict(obs) -> dict:
 
 
 def _is_done(obs_dict: dict) -> bool:
+    """Return True when ``current.result`` is 0, 1, or 2 (game over)."""
     current = obs_dict.get("current")
     if current is None:
         return False
-    result = current.get("result", -1)
+    result = current.get("result", -1) if isinstance(current, dict) else getattr(current, "result", -1)
     return int(result) >= 0
 
 
