@@ -270,6 +270,13 @@ def run_parallel_self_play(
     min_batch_threshold: int = 4,   # attendre au moins N workers avant d'envoyer au GPU
     card_data = None,
 ):
+    if is_seeding:
+        import copy
+        cfg = copy.deepcopy(cfg)
+        cfg.search.num_simulations = 15
+        cfg.search.num_belief_samples = 1
+        logger.info("[self-play] Mode seeding active: acceleration MCTS (sims=15, belief_samples=1)")
+
     import multiprocessing as mp
     from training.worker_bootstrap import run as _worker_bootstrap
     import numpy as np
@@ -365,17 +372,13 @@ def run_parallel_self_play(
         if not active_pipes_list:
             break
 
-        # Attendre des messages : d'abord un poll court pour collecter ce qui est prêt
-        # puis re-poll si on n'a pas atteint le seuil minimum de batch
-        ready_pipes = mp.connection.wait(active_pipes_list, timeout=0.2)
+        # Attendre de façon non-bloquante/bloquante efficace qu'au moins un worker soit prêt
+        ready_pipes = list(mp.connection.wait(active_pipes_list))
 
-        # Si on a peu de réponses, attendre un peu plus pour avoir un batch GPU plus grand
-        if len(ready_pipes) < min(min_batch_threshold, len(active_pipes_list)):
-            extra = mp.connection.wait(
-                [p for p in active_pipes_list if p not in ready_pipes],
-                timeout=0.5
-            )
-            ready_pipes = list(ready_pipes) + extra
+        # Ajouter immédiatement tous les autres workers qui ont également fini leur étape (sans attendre)
+        for p in active_pipes_list:
+            if p not in ready_pipes and p.poll():
+                ready_pipes.append(p)
 
         for pipe in ready_pipes:
             pipe_idx = pipes.index(pipe)
@@ -461,14 +464,22 @@ def run_parallel_self_play(
             _inference_device_idx[0] += 1
             gpu_params = _gpu_params[dev_idx]
 
-            keys = batched_encs_list[0].keys()
+            # Rembourrage (padding) à taille statique `num_workers` pour éviter les recompilations JAX JIT
+            n_actual = len(need_action_indices)
+            padded_encs = list(batched_encs_list)
+            padded_masks = list(option_masks_list)
+            while len(padded_encs) < num_workers:
+                padded_encs.append(batched_encs_list[-1])
+                padded_masks.append(option_masks_list[-1])
+
+            keys = padded_encs[0].keys()
             batched_enc = {}
             for k in keys:
-                arr = np.stack([x[k] for x in batched_encs_list], axis=0)
+                arr = np.stack([x[k] for x in padded_encs], axis=0)
                 # Transférer les observations directement sur le GPU cible
                 batched_enc[k] = jax.device_put(arr, gpu_devices[dev_idx])
 
-            option_masks = np.stack(option_masks_list, axis=0)
+            option_masks = np.stack(padded_masks, axis=0)
 
             rng, rng_act = jax.random.split(rng)
             try:
@@ -476,14 +487,14 @@ def run_parallel_self_play(
                     network, gpu_params, batched_enc, option_masks, rng_act, cfg
                 )
             except Exception as e:
-                logger.error("[MCTS] Erreur ismcts_action_batched (batch=%d) : %s", len(need_action_indices), e, exc_info=True)
-                # Fallback : action aléatoire parmi les actions valides
+                logger.error("[MCTS] Erreur ismcts_action_batched (batch=%d) : %s", n_actual, e, exc_info=True)
+                # Fallback : action aléatoire parmi les actions valides (en utilisant les masques réels)
                 best_actions = np.array([
-                    int(np.random.choice(np.where(option_masks[i])[0]))
-                    for i in range(len(need_action_indices))
+                    int(np.random.choice(np.where(option_masks_list[i])[0]))
+                    for i in range(n_actual)
                 ])
-                avg_policies = np.zeros((len(need_action_indices), int(cfg.model.max_actions)), dtype=np.float32)
-                avg_values   = np.zeros(len(need_action_indices), dtype=np.float32)
+                avg_policies = np.zeros((n_actual, int(cfg.model.max_actions)), dtype=np.float32)
+                avg_values   = np.zeros(n_actual, dtype=np.float32)
 
             for idx_in_batch, pipe_idx in enumerate(need_action_indices):
                 pipes[pipe_idx].send({

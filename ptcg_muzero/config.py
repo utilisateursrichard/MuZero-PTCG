@@ -75,7 +75,7 @@ class TrainConfig:
 
     # ── Replay buffer ─────────────────────────────────────────────────────
     replay_buffer_size: int = 200_000
-    min_replay_size: int = 5_000
+    min_replay_size: int = 256
     replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
     replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 

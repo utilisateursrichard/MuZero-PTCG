@@ -294,15 +294,15 @@ def run_self_play_game(
             )
 
             # Validation des indices d'action pour éviter les IndexError fatals
-            num_opts = len(options)
             valid_action_indices = []
             for idx in action_indices:
-                if 0 <= int(idx) < num_opts:
-                    valid_action_indices.append(int(idx))
+                idx_int = int(idx)
+                if 0 <= idx_int < len(options) and options[idx_int] is not None:
+                    valid_action_indices.append(idx_int)
                 else:
-                    fallback_idx = 0
+                    fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                     logger.warning(
-                        f"[run_self_play_game] Action choisie invalide ({idx}) pour {num_opts} options. "
+                        f"[run_self_play_game] Action choisie invalide ({idx}) pour options {options}. "
                         f"Fallback vers {fallback_idx}."
                     )
                     valid_action_indices.append(fallback_idx)
@@ -467,9 +467,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     sc = cfg.search
                     N_samples = int(sc.num_belief_samples)
 
-                    rng_seed = np.random.randint(0, 2**31)
-                    rng_jax = jax.random.PRNGKey(rng_seed)
-                    rng_beliefs = jax.random.split(rng_jax, N_samples)
+                    rng_beliefs = np.random.randint(0, 2**31, size=N_samples)
 
                     det_list = []
                     for s in range(N_samples):
@@ -505,15 +503,15 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     search_val = action_msg["search_val"]
 
                     # Validation des indices d'action pour éviter les IndexError fatals
-                    num_opts = len(options)
                     valid_action_indices = []
                     for idx in action_indices:
-                        if 0 <= int(idx) < num_opts:
-                            valid_action_indices.append(int(idx))
+                        idx_int = int(idx)
+                        if 0 <= idx_int < len(options) and options[idx_int] is not None:
+                            valid_action_indices.append(idx_int)
                         else:
-                            fallback_idx = 0
+                            fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                             logger.warning(
-                                f"[worker-{worker_id}] Action choisie invalide ({idx}) pour {num_opts} options. "
+                                f"[worker-{worker_id}] Action choisie invalide ({idx}) pour options {options}. "
                                 f"Fallback vers {fallback_idx}."
                             )
                             valid_action_indices.append(fallback_idx)

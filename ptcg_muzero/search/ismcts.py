@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import mctx
 
 from config import Config, ModelConfig, SearchConfig
+from dataclasses import asdict
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Types
@@ -43,10 +44,8 @@ class MuZeroRecurrentFn(NamedTuple):
 # mctx recurrent function
 # ─────────────────────────────────────────────────────────────────────────────
 def make_recurrent_fn(
-    dynamics_fn: Callable,   # network.dynamics bound method
-    predict_fn: Callable,    # network.predict bound method
+    network,
     params: dict,
-    cfg: ModelConfig,
 ) -> Callable:
     """
     Return a ``recurrent_fn`` in the mctx format:
@@ -56,7 +55,7 @@ def make_recurrent_fn(
     ``embedding`` here is the latent state z of shape [B, latent_dim].
     ``action`` is an int32 scalar per sample in [0, max_actions).
     """
-    num_actions = cfg.max_actions
+    num_actions = network.cfg.max_actions
 
     def recurrent_fn(
         params_unused,   # mctx passes params through; we use closure
@@ -70,13 +69,13 @@ def make_recurrent_fn(
         action_onehot = jax.nn.one_hot(action, num_actions)   # [B, A]
 
         # g: dynamics (using dynamics_fn directly with apply syntax wrapper)
-        reward, z_next = dynamics_fn(
-            params, embedding, action_onehot
+        reward, z_next = network.apply(
+            params, embedding, action_onehot, method=network.dynamics
         )
 
         # f: prediction from next state
-        pi_logits, value = predict_fn(
-            params, z_next
+        pi_logits, value = network.apply(
+            params, z_next, method=network.predict
         )
 
         recurrent_output = mctx.RecurrentFnOutput(
@@ -136,7 +135,11 @@ def sample_belief(
     if len(unseen) == 0 or opp_hand_count == 0:
         return obs_out
 
-    rng_np = np.random.default_rng(int(rng[0]) % (2**31))
+    if hasattr(rng, "__len__") or hasattr(rng, "shape"):
+        seed = int(rng[0])
+    else:
+        seed = int(rng)
+    rng_np = np.random.default_rng(seed % (2**31))
     sample_count = min(opp_hand_count, len(unseen))
     sampled = rng_np.choice(unseen, size=sample_count, replace=False)
 
@@ -153,7 +156,7 @@ def sample_belief(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main ISMCTS entry point
 # ─────────────────────────────────────────────────────────────────────────────
-@partial(jax.jit, static_argnames=("dynamics_fn", "predict_fn", "max_actions", "num_simulations", "max_num_considered_actions"))
+@partial(jax.jit, static_argnames=("cfg_tuple", "max_actions", "num_simulations", "max_num_considered_actions"))
 def _run_single_mcts(
     params: dict,
     root_embedding: jnp.ndarray,   # [1, D]
@@ -161,9 +164,9 @@ def _run_single_mcts(
     root_value: jnp.ndarray,       # [1]
     option_mask: jnp.ndarray,      # [1, A] bool
     rng: jnp.ndarray,
+    static_features: jnp.ndarray,
     *,
-    dynamics_fn: Callable,
-    predict_fn: Callable,
+    cfg_tuple: tuple,
     max_actions: int,
     num_simulations: int,
     max_num_considered_actions: int,
@@ -172,12 +175,10 @@ def _run_single_mcts(
     Run Gumbel MuZero search for one determinised world.
     Returns (policy [1,A], value [1]).
     """
-    # Create a dummy container for max_actions to satisfy make_recurrent_fn
-    class _DummyCfg:
-        def __init__(self, ma):
-            self.max_actions = ma
-    
-    recurrent_fn = make_recurrent_fn(dynamics_fn, predict_fn, params, _DummyCfg(max_actions))
+    from models.networks import MuZeroNetwork
+    model_cfg = ModelConfig(**dict(cfg_tuple))
+    network = MuZeroNetwork(cfg=model_cfg, static_features=static_features)
+    recurrent_fn = make_recurrent_fn(network, params)
 
     # Mask illegal actions: set logits of invalid options to -1e9
     invalid_mask = ~option_mask           # True where action is INVALID
@@ -248,11 +249,10 @@ def ismcts_action(
     # Préparer les masques d'option de taille [N_samples, A]
     mask_jax_batched = jnp.stack([jnp.array(option_mask_np)] * N_samples, axis=0)
 
-    # 3. Définir les fonctions lambda stables
-    dyn_fn = lambda p, z, a: network.apply(p, z, a, method=network.dynamics)
-    prd_fn = lambda p, z: network.apply(p, z, method=network.predict)
+    cfg_tuple = tuple(asdict(cfg.model).items())
+    static_features = network.static_features
 
-    # 4. Vectoriser _run_single_mcts sur la dimension batch (axis 0)
+    # 3. Vectoriser _run_single_mcts sur la dimension batch (axis 0)
     # JAX va exécuter toutes les simulations MCTS en parallèle sur le GPU
     vmapped_mcts = jax.vmap(
         lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
@@ -262,8 +262,8 @@ def ismcts_action(
             v_item[None],   # scalaire () → [1] requis par mctx
             mask_item[None],
             rng_item,
-            dynamics_fn=dyn_fn,
-            predict_fn=prd_fn,
+            static_features,
+            cfg_tuple=cfg_tuple,
             max_actions=int(mc.max_actions),
             num_simulations=int(sc.num_simulations),
             max_num_considered_actions=int(sc.max_num_considered_actions),
@@ -344,8 +344,8 @@ def ismcts_action_batched(
     rng, rng_mcts = jax.random.split(rng)
     rng_mcts_keys = jax.random.split(rng_mcts, B * S)
 
-    dyn_fn = lambda p, z, a: network.apply(p, z, a, method=network.dynamics)
-    prd_fn = lambda p, z: network.apply(p, z, method=network.predict)
+    cfg_tuple = tuple(asdict(cfg.model).items())
+    static_features = network.static_features
 
     vmapped_mcts = jax.vmap(
         lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
@@ -355,8 +355,8 @@ def ismcts_action_batched(
             v_item[None],   # scalaire () → [1] requis par mctx
             mask_item[None],
             rng_item,
-            dynamics_fn=dyn_fn,
-            predict_fn=prd_fn,
+            static_features,
+            cfg_tuple=cfg_tuple,
             max_actions=int(mc.max_actions),
             num_simulations=int(sc.num_simulations),
             max_num_considered_actions=int(sc.max_num_considered_actions),
