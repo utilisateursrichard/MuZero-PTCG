@@ -75,7 +75,7 @@ class TrainConfig:
 
     # ── Replay buffer ─────────────────────────────────────────────────────
     replay_buffer_size: int = 200_000
-    min_replay_size: int = 256
+    min_replay_size: int = 10_000
     replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
     replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 
@@ -109,7 +109,7 @@ class HFConfig:
     # Nom de la variable d'environnement contenant le token HF
     # (ex: export HF_TOKEN=hf_xxx dans le terminal Kaggle, PAS le token lui-même)
     token_env_var: str = "HF_TOKEN"
-    push_every_n_steps: int = 5_000
+    push_every_n_transitions: int = 10_000
     local_dir: str = "./hf_checkpoints"
 
 

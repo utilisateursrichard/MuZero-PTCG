@@ -25,6 +25,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -63,6 +64,8 @@ from training.loss import collate_batch, muzero_loss
 from training.replay_buffer import PrioritizedReplayBuffer
 
 logger = logging.getLogger(__name__)
+
+_active_push_thread = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -684,6 +687,7 @@ def train(cfg: Config) -> None:
     # ── 8. Main training loop ─────────────────────────────────────────────
     global_step = 0
     t0 = time.time()
+    total_transitions_since_last_push = 0
 
     for step in range(cfg.train.num_total_steps):
         global_step = step
@@ -712,8 +716,11 @@ def train(cfg: Config) -> None:
                 card_data=card_data,
             )
 
+            added_transitions = 0
             for hist in hists:
-                _add_history_to_buffer(hist, buffer, cfg)
+                added_transitions += _add_history_to_buffer(hist, buffer, cfg)
+            
+            total_transitions_since_last_push += added_transitions
 
             for deck_ids, rew in deck_updates:
                 deck_params, deck_opt_state, deck_baseline, d_loss = \
@@ -765,15 +772,31 @@ def train(cfg: Config) -> None:
 
         # ── e. HF push ────────────────────────────────────────────────────
         if (cfg.hf.enabled
-                and step % cfg.hf.push_every_n_steps == 0
+                and total_transitions_since_last_push >= cfg.hf.push_every_n_transitions
                 and step > 0):
+            total_transitions_since_last_push -= cfg.hf.push_every_n_transitions
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
-            push_to_hub(_params_cpu, deck_params, cfg, step)
+            
+            global _active_push_thread
+            if _active_push_thread is not None and _active_push_thread.is_alive():
+                logger.warning(
+                    "[hf-push] Un push HuggingFace précédent est encore en cours. "
+                    "Saut du push pour l'étape %d pour éviter de bloquer.", step
+                )
+            else:
+                logger.info("[hf-push] Lancement du push asynchrone vers HuggingFace pour l'étape %d...", step)
+                _active_push_thread = threading.Thread(
+                    target=push_to_hub,
+                    args=(_params_cpu, deck_params, cfg, step),
+                    daemon=True
+                )
+                _active_push_thread.start()
 
     # Final checkpoint
     _save_checkpoint(state, deck_params, cfg, global_step)
     if cfg.hf.enabled:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
+        logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
         push_to_hub(_params_cpu, deck_params, cfg, global_step)
     logger.info("Training complete.")
 
@@ -781,9 +804,9 @@ def train(cfg: Config) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, cfg: Config):
+def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, cfg: Config) -> int:
     if len(hist) == 0 or hist.returns is None:
-        return
+        return 0
     probe_tgts = np.stack([
         extract_probe_targets(raw, hist.player_idx)
         for raw in hist.raw_states
@@ -797,6 +820,7 @@ def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, c
         returns     = hist.returns,
         probe_tgts  = probe_tgts[:len(hist.observations) + 1],
     )
+    return len(hist.actions)
 
 
 def _make_dummy_obs(cfg) -> dict:

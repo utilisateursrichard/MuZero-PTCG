@@ -125,12 +125,14 @@ def cmd_train(args) -> None:
             now = time.time()
             inactive_dur = now - tracker.last_activity_time
             
+            target_size = cfg.train.min_replay_size if tracker.buffer_size < cfg.train.min_replay_size else cfg.train.replay_buffer_size
+            
             # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
             if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
-                    "[heartbeat] Phase: %s | Buffer: %d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs%s",
-                    tracker.phase, tracker.buffer_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur, freeze_warning
+                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs%s",
+                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur, freeze_warning
                 )
                 try:
                     dump_all_stacks()
@@ -138,8 +140,8 @@ def cmd_train(args) -> None:
                     logger.error("Impossible de dumper la stack trace : %s", e)
             else:
                 logger.info(
-                    "[heartbeat] Phase: %s | Buffer: %d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs",
-                    tracker.phase, tracker.buffer_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur
+                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs",
+                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur
                 )
             
     h_thread = threading.Thread(target=_heartbeat, daemon=True)
