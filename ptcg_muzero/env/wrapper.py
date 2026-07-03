@@ -276,6 +276,11 @@ def run_self_play_game(
 
             # ── Encode observation ──────────────────────────────────────────
             enc_obs = encode_observation(obs_dict, your_idx, cfg.model)
+            option_mask = enc_obs["option_mask"]
+            if np.sum(option_mask) == 0:
+                obs_dict, done = env.step([])
+                continue
+
             hist[your_idx].raw_states.append(obs_dict)
 
             # ── Select agent ───────────────────────────────────────────────
@@ -287,6 +292,21 @@ def run_self_play_game(
             action_indices, search_pol, search_val = active_agent(
                 obs_dict, your_idx, cfg
             )
+
+            # Validation des indices d'action pour éviter les IndexError fatals
+            num_opts = len(options)
+            valid_action_indices = []
+            for idx in action_indices:
+                if 0 <= int(idx) < num_opts:
+                    valid_action_indices.append(int(idx))
+                else:
+                    fallback_idx = 0
+                    logger.warning(
+                        f"[run_self_play_game] Action choisie invalide ({idx}) pour {num_opts} options. "
+                        f"Fallback vers {fallback_idx}."
+                    )
+                    valid_action_indices.append(fallback_idx)
+            action_indices = valid_action_indices
 
             # ── Reward from logs ───────────────────────────────────────────
             logs = obs_dict.get("logs", [])
@@ -429,6 +449,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                 hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
 
                 while not done:
+                    step_count += 1
                     your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
                     select = obs_dict.get("select")
 
@@ -456,6 +477,11 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                     encoded_samples = [encode_observation(d, your_idx, mc) for d in det_list]
 
+                    option_mask = encoded_samples[0]["option_mask"]
+                    if np.sum(option_mask) == 0:
+                        obs_dict, done = env.step([])
+                        continue
+
                     # Stack observations
                     batched_enc = {}
                     for k in encoded_samples[0].keys():
@@ -468,7 +494,8 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         "status": "need_action",
                         "batched_enc": batched_enc,
                         "option_mask": option_mask,
-                        "player_idx": your_idx
+                        "player_idx": your_idx,
+                        "step_count": step_count
                     })
 
                     # Receive action from GPU coordinator
@@ -476,6 +503,21 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     action_indices = action_msg["action_indices"]
                     search_pol = action_msg["search_pol"]
                     search_val = action_msg["search_val"]
+
+                    # Validation des indices d'action pour éviter les IndexError fatals
+                    num_opts = len(options)
+                    valid_action_indices = []
+                    for idx in action_indices:
+                        if 0 <= int(idx) < num_opts:
+                            valid_action_indices.append(int(idx))
+                        else:
+                            fallback_idx = 0
+                            logger.warning(
+                                f"[worker-{worker_id}] Action choisie invalide ({idx}) pour {num_opts} options. "
+                                f"Fallback vers {fallback_idx}."
+                            )
+                            valid_action_indices.append(fallback_idx)
+                    action_indices = valid_action_indices
 
                     hist[your_idx].raw_states.append(obs_dict)
 
@@ -525,7 +567,12 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
         except Exception as e:
             import traceback
-            pipe.send({"status": "error", "error": f"{e}\n{traceback.format_exc()}"})
+            err_msg = f"{e}\n{traceback.format_exc()}"
+            logger.error(f"[worker-{worker_id}] Exception fatale rencontree : {err_msg}")
+            try:
+                pipe.send({"status": "error", "error": err_msg})
+            except Exception as pipe_err:
+                logger.error(f"[worker-{worker_id}] Impossible d'envoyer l'erreur via le pipe : {pipe_err}")
             break
 
     env.close()

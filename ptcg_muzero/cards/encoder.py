@@ -169,7 +169,7 @@ class CardStaticFeatures:
                         "retreat":         _parse_float(row.get("Retreat", "0")),
                         "is_ex":    ("ex" in rule_raw or " ex" in name_raw.lower()),
                         "is_tera":  ("tera" in rule_raw or "tera " in name_raw.lower()),
-                        "is_ace":   ("ace spec" in rule_raw),
+                        "is_ace":   ("ace spec" in rule_raw or stage_raw.strip().lower() == "ace spec"),
                         "damages":  [],
                     }
 

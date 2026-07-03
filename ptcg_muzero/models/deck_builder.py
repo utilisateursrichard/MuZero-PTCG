@@ -180,9 +180,9 @@ def sample_deck(
                 mask[cid] = -np.inf
 
         probs = _softmax_np(logits_np + mask)
-        chosen = rng_np.choice(num_card_ids, p=probs)
+        chosen = int(rng_np.choice(num_card_ids, p=probs))
         counts[chosen] += 1
-        deck.append(int(chosen))
+        deck.append(chosen)
         
         # Si la carte choisie fait partie du set Ace Spec, on verrouille la contrainte globale
         if chosen in ace_spec_set:

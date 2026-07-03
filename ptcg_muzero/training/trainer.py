@@ -266,12 +266,26 @@ def run_parallel_self_play(
     num_card_ids: int,
     energy_ids,
     ace_spec_ids,
-    is_seeding: bool = False
+    is_seeding: bool = False,
+    min_batch_threshold: int = 4,   # attendre au moins N workers avant d'envoyer au GPU
+    card_data = None,
 ):
     import multiprocessing as mp
-    from env.wrapper import self_play_worker_fn
+    from training.worker_bootstrap import run as _worker_bootstrap
     import numpy as np
     from training.activity import tracker
+
+    # Pré-transférer les params sur les GPUs UNE SEULE FOIS (évite CPU→GPU à chaque inférence)
+    devices = jax.devices()
+    gpu_devices = [d for d in devices if d.platform == "gpu"]
+    if not gpu_devices:
+        gpu_devices = devices  # fallback CPU
+    # On répartit les inférences alternativement sur tous les GPUs disponibles
+    logger.info("[self-play] GPU devices pour MCTS : %s", gpu_devices)
+    _gpu_params = [
+        jax.device_put(state_params, dev) for dev in gpu_devices
+    ]
+    _inference_device_idx = [0]  # compteur pour alterner les GPUs
 
     ctx = mp.get_context("spawn")
     pipes = []
@@ -279,7 +293,8 @@ def run_parallel_self_play(
     
     for idx in range(num_workers):
         parent_conn, child_conn = ctx.Pipe()
-        p = ctx.Process(target=self_play_worker_fn, args=(child_conn, idx, cfg), daemon=True)
+        # bootstrap : pose CUDA_VISIBLE_DEVICES="" AVANT tout import JAX dans le fils
+        p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
         p.start()
         pipes.append(parent_conn)
         processes.append(p)
@@ -290,32 +305,49 @@ def run_parallel_self_play(
     deck_builder_updates = []
     deck_errors_count = 0
 
-    # state_params est déjà dé-répliqué (x[0] effectué côté appelant)
-    # On convertit simplement en numpy pour s'assurer que les tenseurs sont sur CPU
-    _params_cpu = jax.tree_util.tree_map(lambda x: np.array(x), state_params)
-
     from models.deck_builder import sample_deck
     deck_logits, _ = deck_net.apply(deck_params)
 
     pipe_meta = [{} for _ in range(num_workers)]
+    worker_steps = [0] * num_workers
 
     def start_game_on_worker(pipe_idx, local_rng):
         nonlocal games_started
+        worker_steps[pipe_idx] = 0
         local_rng, r_d0, r_d1 = jax.random.split(local_rng, 3)
         deck0, ids0 = sample_deck(deck_logits[0], r_d0, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
         deck1, ids1 = sample_deck(deck_logits[0], r_d1, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
         
+        # Réanimation robuste du worker s'il s'est arrêté (ex. suite à une exception)
+        p = processes[pipe_idx]
+        if not p.is_alive():
+            logger.info(f"[coordinateur] Relance du worker {pipe_idx} qui s'était arrêté...")
+            try:
+                pipes[pipe_idx].close()
+            except Exception:
+                pass
+            parent_conn, child_conn = ctx.Pipe()
+            new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, pipe_idx, cfg), daemon=True)
+            new_p.start()
+            pipes[pipe_idx] = parent_conn
+            processes[pipe_idx] = new_p
+
         pipe_meta[pipe_idx] = {
             "ids0": ids0,
             "ids1": ids1,
             "game_active": True
         }
-        pipes[pipe_idx].send({
-            "cmd": "start",
-            "deck0": list(deck0),
-            "deck1": list(deck1)
-        })
-        games_started += 1
+        try:
+            pipes[pipe_idx].send({
+                "cmd": "start",
+                "deck0": list(deck0),
+                "deck1": list(deck1)
+            })
+            games_started += 1
+        except Exception as e:
+            logger.error(f"[coordinateur] Échec d'envoi au worker {pipe_idx} relancé : {e}")
+            pipe_meta[pipe_idx]["game_active"] = False
+
 
     for i in range(num_workers):
         if games_started < num_games_to_play:
@@ -329,20 +361,27 @@ def run_parallel_self_play(
         batched_encs_list = []
         option_masks_list = []
         
-        # Signaler l'activité au heartbeat (évite faux-positif de freeze pendant JIT/jeu)
-        tracker.update(buffer_size=len(completed_histories))
-
         active_pipes_list = [pipes[i] for i in range(num_workers) if pipe_meta[i].get("game_active")]
         if not active_pipes_list:
             break
-            
-        ready_pipes = mp.connection.wait(active_pipes_list, timeout=1.0)
-        
+
+        # Attendre des messages : d'abord un poll court pour collecter ce qui est prêt
+        # puis re-poll si on n'a pas atteint le seuil minimum de batch
+        ready_pipes = mp.connection.wait(active_pipes_list, timeout=0.2)
+
+        # Si on a peu de réponses, attendre un peu plus pour avoir un batch GPU plus grand
+        if len(ready_pipes) < min(min_batch_threshold, len(active_pipes_list)):
+            extra = mp.connection.wait(
+                [p for p in active_pipes_list if p not in ready_pipes],
+                timeout=0.5
+            )
+            ready_pipes = list(ready_pipes) + extra
+
         for pipe in ready_pipes:
             pipe_idx = pipes.index(pipe)
             if not pipe.poll():
                 continue
-            
+
             try:
                 msg = pipe.recv()
             except Exception as e:
@@ -352,60 +391,100 @@ def run_parallel_self_play(
                 continue
 
             status = msg.get("status")
-            
+            if status == "need_action":
+                worker_steps[pipe_idx] = msg.get("step_count", 0)
+                tracker.update(current_game_steps=int(np.max(worker_steps)))
+            else:
+                tracker.update()
+
+
             if status == "need_action":
                 need_action_indices.append(pipe_idx)
                 batched_encs_list.append(msg["batched_enc"])
                 option_masks_list.append(msg["option_mask"])
-                
+
             elif status == "deck_error":
                 deck_errors_count += 1
+                logger.warning(f"[coordinateur] Erreur de deck sur le worker {pipe_idx} : {msg.get('error')}")
+                
+                # Récupération et analyse des cartes sélectionnées pour ce worker (diagnostic)
+                meta = pipe_meta[pipe_idx]
+                for p_idx, ids in [("joueur 0", meta.get("ids0")), ("joueur 1", meta.get("ids1"))]:
+                    if ids is not None:
+                        from collections import Counter
+                        counts = Counter(list(np.array(ids)))
+                        deck_summary = []
+                        for cid, count in counts.items():
+                            name = card_data.card_name(int(cid)) if card_data else f"ID {cid}"
+                            is_ace = int(cid) in ace_spec_ids
+                            deck_summary.append(f"{name} (ID: {cid}, count: {count}{', ACE' if is_ace else ''})")
+                        logger.info(f"  Deck de {p_idx} impliqué : {', '.join(deck_summary)}")
+
+                # Relancer simplement une nouvelle partie sur ce worker
                 if games_started < num_games_to_play:
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
                 else:
                     pipe_meta[pipe_idx]["game_active"] = False
-                    
+
             elif status == "game_over":
                 h0, h1 = msg["hist0"], msg["hist1"]
                 completed_histories.extend([h0, h1])
-                
+
                 if not is_seeding:
                     reward_0 = float(h0.game_won or False) * 2 - 1
                     reward_1 = float(h1.game_won or False) * 2 - 1
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids0"], reward_0))
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
-                
+
                 games_completed += 1
-                
+                logger.info(f"[coordinateur] Partie completee sur worker {pipe_idx} ! ({games_completed}/{num_games_to_play} completes, {games_started}/{num_games_to_play} lancees)")
+
                 if games_started < num_games_to_play:
                     rng, rng_next = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_next)
                 else:
                     pipe_meta[pipe_idx]["game_active"] = False
-                    
+
             elif status == "error":
-                logger.error(f"Worker {pipe_idx} encountered error: {msg.get('error')}")
+                logger.error(f"[coordinateur] Le worker {pipe_idx} a envoye une erreur fatale : {msg.get('error')}")
                 pipe_meta[pipe_idx]["game_active"] = False
                 games_completed += 1
                 if games_started < num_games_to_play:
+                    logger.info(f"[coordinateur] Tentative de remplacement pour le worker {pipe_idx} en échec...")
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
 
         if need_action_indices:
-            B_active = len(need_action_indices)
+            # Alterner entre les GPUs disponibles pour utiliser tous les GPUs
+            dev_idx = _inference_device_idx[0] % len(_gpu_params)
+            _inference_device_idx[0] += 1
+            gpu_params = _gpu_params[dev_idx]
+
             keys = batched_encs_list[0].keys()
             batched_enc = {}
             for k in keys:
-                batched_enc[k] = jnp.stack([x[k] for x in batched_encs_list], axis=0)
-            
+                arr = np.stack([x[k] for x in batched_encs_list], axis=0)
+                # Transférer les observations directement sur le GPU cible
+                batched_enc[k] = jax.device_put(arr, gpu_devices[dev_idx])
+
             option_masks = np.stack(option_masks_list, axis=0)
-            
+
             rng, rng_act = jax.random.split(rng)
-            best_actions, avg_policies, avg_values = ismcts_action_batched(
-                network, _params_cpu, batched_enc, option_masks, rng_act, cfg
-            )
-            
+            try:
+                best_actions, avg_policies, avg_values = ismcts_action_batched(
+                    network, gpu_params, batched_enc, option_masks, rng_act, cfg
+                )
+            except Exception as e:
+                logger.error("[MCTS] Erreur ismcts_action_batched (batch=%d) : %s", len(need_action_indices), e, exc_info=True)
+                # Fallback : action aléatoire parmi les actions valides
+                best_actions = np.array([
+                    int(np.random.choice(np.where(option_masks[i])[0]))
+                    for i in range(len(need_action_indices))
+                ])
+                avg_policies = np.zeros((len(need_action_indices), int(cfg.model.max_actions)), dtype=np.float32)
+                avg_values   = np.zeros(len(need_action_indices), dtype=np.float32)
+
             for idx_in_batch, pipe_idx in enumerate(need_action_indices):
                 pipes[pipe_idx].send({
                     "action_indices": [int(best_actions[idx_in_batch])],
@@ -453,11 +532,9 @@ def train(cfg: Config) -> None:
     set_energy_ids(energy_ids)
 
     # ── Détection des cartes Ace Spec via deck.csv de référence ──────────
-    # NOTE : deck.csv est un exemple officiel fourni par la compétition.
-    # Il est utilisé ICI UNIQUEMENT pour identifier quels card IDs sont
-    # des cartes Ace Spec (ceux qui n'apparaissent qu'une seule fois).
-    # Il n'est JAMAIS utilisé comme deck de jeu en self-play.
-    ace_spec_ids: list = []
+    # Détection exhaustive des cartes Ace Spec en combinant toutes les sources (CSV complet, deck de référence, moteur)
+    ace_spec_set = set(card_data.ace_spec_ids)
+    logger.info("[ace-spec] %d Ace Spec card(s) détecté(s) via cards.csv : %s", len(ace_spec_set), list(ace_spec_set))
 
     ref_path = cfg.infra.reference_deck_csv
     try:
@@ -470,61 +547,58 @@ def train(cfg: Config) -> None:
             energy_set = set(energy_ids)
 
             # Ace Spec = apparait exactement 1 fois ET n'est pas une énergie de base
-            ace_spec_ids = [
+            ref_ace = [
                 cid for cid, cnt in counts.items()
                 if cnt == 1 and cid not in energy_set
             ]
-            logger.info("[ace-spec] %d Ace Spec card(s) détecté(s) via reference deck.csv : %s",
-                        len(ace_spec_ids), ace_spec_ids)
+            ace_spec_set.update(ref_ace)
+            logger.info("[ace-spec] Après fusion avec reference deck.csv : %d Ace Spec cards", len(ace_spec_set))
         else:
             logger.warning("[ace-spec] reference_deck_csv introuvable : %s", ref_path)
     except Exception as e:
         logger.warning("[ace-spec] Lecture du reference deck échouée : %s", e)
 
-    # Fallback: engine all_card_data() inspection
+    # Complétion via l'API de l'engine si disponible
+    try:
+        from env.cabt_api import all_card_data
+        cg_cards = all_card_data()
+        items = list(cg_cards.items() if isinstance(cg_cards, dict) else enumerate(cg_cards))
+
+        def _card_is_ace(card) -> bool:
+            for attr in ('is_ace_spec', 'isAceSpec', 'ace_spec', 'is_ace', 'isAce'):
+                v = getattr(card, attr, None)
+                if isinstance(v, bool) and v:
+                    return True
+            try:
+                d = vars(card)
+            except TypeError:
+                d = {a: getattr(card, a, None) for a in dir(card) if not a.startswith('_')}
+            for k, v in d.items():
+                if 'ace' in k.lower() and isinstance(v, bool) and v:
+                    return True
+                if 'rule' in k.lower():
+                    texts = [v] if isinstance(v, str) else (list(v) if isinstance(v, (list, tuple)) else [])
+                    for t in texts:
+                        if isinstance(t, str) and 'ace spec' in t.lower():
+                            return True
+            return False
+
+        def _card_id(idx, card) -> int:
+            for attr in ('id', 'card_id', 'cardId'):
+                v = getattr(card, attr, None)
+                if v is not None:
+                    return int(v)
+            return int(idx)
+
+        engine_ace = [_card_id(i, c) for i, c in items if _card_is_ace(c)]
+        ace_spec_set.update(engine_ace)
+        logger.info("[ace-spec] Après fusion avec all_card_data() : %d Ace Spec cards", len(ace_spec_set))
+    except Exception as e:
+        logger.warning("[ace-spec] all_card_data() failed: %s", e)
+
+    ace_spec_ids = sorted(list(ace_spec_set))
     if not ace_spec_ids:
-        try:
-            cg_cards = all_card_data()
-            items = list(cg_cards.items() if isinstance(cg_cards, dict) else enumerate(cg_cards))
-
-            def _card_is_ace(card) -> bool:
-                for attr in ('is_ace_spec', 'isAceSpec', 'ace_spec', 'is_ace', 'isAce'):
-                    v = getattr(card, attr, None)
-                    if isinstance(v, bool) and v:
-                        return True
-                try:
-                    d = vars(card)
-                except TypeError:
-                    d = {a: getattr(card, a, None) for a in dir(card) if not a.startswith('_')}
-                for k, v in d.items():
-                    if 'ace' in k.lower() and isinstance(v, bool) and v:
-                        return True
-                    if 'rule' in k.lower():
-                        texts = [v] if isinstance(v, str) else (list(v) if isinstance(v, (list, tuple)) else [])
-                        for t in texts:
-                            if isinstance(t, str) and 'ace spec' in t.lower():
-                                return True
-                return False
-
-            def _card_id(idx, card) -> int:
-                for attr in ('id', 'card_id', 'cardId'):
-                    v = getattr(card, attr, None)
-                    if v is not None:
-                        return int(v)
-                return int(idx)
-
-            ace_spec_ids = [_card_id(i, c) for i, c in items if _card_is_ace(c)]
-            logger.info("[ace-spec] Engine fallback: %d Ace Spec cards", len(ace_spec_ids))
-        except Exception as e:
-            logger.warning("[ace-spec] all_card_data() failed: %s", e)
-
-    # Fallback: CSV Rule column
-    if not ace_spec_ids:
-        ace_spec_ids = card_data.ace_spec_ids
-        logger.info("[ace-spec] CSV fallback: %d Ace Spec cards", len(ace_spec_ids))
-
-    if not ace_spec_ids:
-        logger.warning("[ace-spec] No Ace Spec cards detected — DeckErrors will be retried.")
+        logger.warning("[ace-spec] Aucune carte Ace Spec détectée !")
 
     set_ace_spec_ids(ace_spec_ids)
     logger.info("Card pool: %d ids, %d energy ids, %d ace spec ids",
@@ -567,7 +641,7 @@ def train(cfg: Config) -> None:
     tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
     _start_seeding = time.time()
-    NUM_WORKERS = 4
+    NUM_WORKERS = 8   # 8 workers CPU-only (bootstrap garantit pas de GPU dans les fils)
     _deck_errors = 0
 
     while len(buffer) < cfg.train.min_replay_size:
@@ -585,7 +659,8 @@ def train(cfg: Config) -> None:
             num_card_ids=num_card_ids,
             energy_ids=energy_ids,
             ace_spec_ids=ace_spec_ids,
-            is_seeding=True
+            is_seeding=True,
+            card_data=card_data,
         )
         _deck_errors += errs
         tracker.update(deck_errors=_deck_errors)
@@ -612,7 +687,7 @@ def train(cfg: Config) -> None:
             n_games = cfg.train.games_per_self_play
             hists, deck_updates, _ = run_parallel_self_play(
                 num_games_to_play=n_games,
-                num_workers=min(NUM_WORKERS, n_games),
+                num_workers=min(NUM_WORKERS, max(n_games, 16)),
                 deck_net=deck_net,
                 deck_params=deck_params,
                 network=network,
@@ -622,7 +697,8 @@ def train(cfg: Config) -> None:
                 num_card_ids=num_card_ids,
                 energy_ids=energy_ids,
                 ace_spec_ids=ace_spec_ids,
-                is_seeding=False
+                is_seeding=False,
+                card_data=card_data,
             )
 
             for hist in hists:

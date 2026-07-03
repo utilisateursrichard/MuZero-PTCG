@@ -181,7 +181,8 @@ def _policy_loss_per_example(
 ) -> jnp.ndarray:
     log_pi = jax.nn.log_softmax(logits, axis=-1)
     target_sum = jnp.sum(target, axis=-1, keepdims=True)
-    target_norm = jnp.where(target_sum > 0, target / target_sum, target)
+    safe_target_sum = jnp.where(target_sum > 0, target_sum, 1.0)
+    target_norm = jnp.where(target_sum > 0, target / safe_target_sum, target)
     return -jnp.sum(target_norm * log_pi, axis=-1)
 
 
