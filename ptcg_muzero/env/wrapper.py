@@ -498,11 +498,22 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                     # Receive action from GPU coordinator
                     action_msg = pipe.recv()
-                    action_indices = action_msg["action_indices"]
+                    best_action = action_msg["action_indices"][0]
                     search_pol = action_msg["search_pol"]
                     search_val = action_msg["search_val"]
 
-                    # Validation des indices d'action pour éviter les IndexError fatals
+                    # Déterminer les indices réels en gérant maxCount > 1 (sélection top-k par politique MCTS)
+                    max_count = int(select.get("maxCount", 1))
+                    if max_count > 1:
+                        valid_mask = np.array([
+                            (opt is not None) for opt in options
+                        ] + [False] * (mc.max_actions - len(options)))
+                        masked = np.where(option_mask & valid_mask, search_pol, -1e9)
+                        action_indices = np.argsort(masked)[::-1][:max_count].tolist()
+                    else:
+                        action_indices = [int(best_action)]
+
+                    # Validation finale des indices d'action pour éviter les IndexError fatals
                     valid_action_indices = []
                     for idx in action_indices:
                         idx_int = int(idx)
