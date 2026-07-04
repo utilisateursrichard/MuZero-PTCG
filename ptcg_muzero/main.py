@@ -118,8 +118,23 @@ def cmd_train(args) -> None:
     import time
     from training.activity import tracker, dump_all_stacks
 
+    # Initialisation propre des temps du tracker pour l'estimation de l'ETA
+    tracker.start_time = time.time()
+    tracker.last_activity_time = time.time()
+    tracker.games_completed = 0
+
     # Thread heartbeat basé sur le temps réel (toutes les 15 secondes)
     def _heartbeat():
+        def format_time(seconds: float) -> str:
+            if seconds <= 0:
+                return "0s"
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            if h > 0:
+                return f"{h}h {m}m {s}s"
+            return f"{m}m {s}s"
+
         while True:
             time.sleep(15.0)
             now = time.time()
@@ -127,12 +142,25 @@ def cmd_train(args) -> None:
             
             target_size = cfg.train.min_replay_size if tracker.buffer_size < cfg.train.min_replay_size else cfg.train.replay_buffer_size
             
+            elapsed = now - tracker.start_time
+            games = tracker.games_completed
+            sec_per_game = elapsed / games if games > 0 else 0.0
+            
+            current_size = tracker.buffer_size
+            next_milestone = ((current_size // 10000) + 1) * 10000
+            milestone_k = next_milestone // 1000
+            
+            rate = current_size / elapsed if elapsed > 0 else 0.0
+            remaining = next_milestone - current_size
+            eta_s = remaining / rate if rate > 0 else 0.0
+            eta_str = format_time(eta_s)
+
             # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
             if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
-                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs%s",
-                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur, freeze_warning
+                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
+                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
                 )
                 try:
                     dump_all_stacks()
@@ -140,8 +168,8 @@ def cmd_train(args) -> None:
                     logger.error("Impossible de dumper la stack trace : %s", e)
             else:
                 logger.info(
-                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu en cours: %d | Inactif depuis: %.1fs",
-                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, inactive_dur
+                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
+                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
                 )
             
     h_thread = threading.Thread(target=_heartbeat, daemon=True)
@@ -191,6 +219,27 @@ def cmd_eval(args) -> None:
     wins = 0
     total = cfg.train.eval_games
 
+    # Initialisation robuste avec fallback si aucun checkpoint n'est fourni ou valide
+    if not params or not deck_params:
+        logger.info("Initialisation de paramètres aléatoires pour l'évaluation...")
+        from training.trainer import _make_dummy_obs
+        from interpretability.probes import ProbeHeads
+        
+        dummy_obs = _make_dummy_obs(cfg.model)
+        batch_obs = {k: jnp.array(v[None]) for k, v in dummy_obs.items()}
+        rng, rng_mz, rng_pr, rng_dk = jax.random.split(rng, 4)
+        
+        if not params:
+            probe_heads = ProbeHeads(cfg=cfg.model)
+            mz_params = network.init(rng_mz, batch_obs)
+            z_dummy  = jnp.zeros((1, cfg.model.latent_dim))
+            pr_params = probe_heads.init(rng_pr, z_dummy)
+            params = {"muzero": mz_params, "probes": pr_params}
+            
+        if not deck_params:
+            dummy_ctx = jnp.zeros((1, cfg.model.latent_dim))
+            deck_params = deck_net.init(rng_dk, context=dummy_ctx)
+
     for g in range(total):
         rng, rng_d, rng_ag = jax.random.split(rng, 3)
         deck_logits, _ = deck_net.apply(deck_params)
@@ -198,7 +247,7 @@ def cmd_eval(args) -> None:
         # Agent 1 : aléatoire
         deck1 = deck0[:]  # même deck, adversaire aléatoire
 
-        agent = make_agent_fn(network, params["muzero"], cfg, rng_ag, train_mode=False)
+        agent = make_agent_fn(network, params, cfg, rng_ag, train_mode=False)
 
         def random_agent(obs_dict, player_idx, _cfg):
             opts = (obs_dict.get("select") or {}).get("option", [])

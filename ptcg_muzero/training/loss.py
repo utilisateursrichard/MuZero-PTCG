@@ -114,19 +114,39 @@ def muzero_loss(
         val_loss_k = _value_loss_per_example(v_k, batch["target_val"][:, k + 1])
         rew_loss_k = _reward_loss_per_example(reward_pred, batch["reward_seq"][:, k])
 
-        return z_next, (pol_loss_k, val_loss_k, rew_loss_k, pi_k, v_k, z_next)
+        # EfficientZero Consistency Loss:
+        # 1. Encodage réel de l'observation cible à k+1
+        obs_k_plus_1 = _slice_obs(batch["obs_seq"], k + 1)
+        s_k = network.apply(mz_params, obs_k_plus_1, method=network.represent)
+
+        # 2. Projection de la cible avec arrêt de gradient
+        target_proj = network.apply(mz_params, s_k, method=network.project_state)
+        target_proj = jax.lax.stop_gradient(target_proj)
+
+        # 3. Projection et prédiction du futur latent virtuel
+        pred_proj = network.apply(mz_params, z_next, method=network.project_state)
+        pred_pred = network.apply(mz_params, pred_proj, method=network.predict_state)
+
+        # 4. Similarité cosinus négative
+        eps = 1e-8
+        pred_norm = pred_pred / (jnp.linalg.norm(pred_pred, axis=-1, keepdims=True) + eps)
+        target_norm = target_proj / (jnp.linalg.norm(target_proj, axis=-1, keepdims=True) + eps)
+        consistency_loss_k = - jnp.sum(pred_norm * target_norm, axis=-1)
+
+        return z_next, (pol_loss_k, val_loss_k, rew_loss_k, consistency_loss_k, pi_k, v_k, z_next)
 
     # Use lax.scan for unrolling — avoids Python-level loop in JIT
-    _, (pol_losses, val_losses, rew_losses, _, _, zs) = jax.lax.scan(
+    _, (pol_losses, val_losses, rew_losses, consistency_losses, _, _, zs) = jax.lax.scan(
         lambda carry, k: unroll_step(carry, k),
         z_cur,
         jnp.arange(K),
     )
-    # pol_losses / val_losses / rew_losses : [K, B]
+    # pol_losses / val_losses / rew_losses / consistency_losses : [K, B]
 
     total_pol_ex += jnp.mean(pol_losses, axis=0)
     total_val_ex += jnp.mean(val_losses, axis=0)
     total_rew_ex  = jnp.mean(rew_losses, axis=0)
+    total_consistency_ex = jnp.mean(consistency_losses, axis=0)
 
     # ── 3. Probe losses (computed on root latent only to save compute) ────
     total_prb = prb_loss_0
@@ -138,12 +158,14 @@ def muzero_loss(
     pol_loss = _weighted_mean(total_pol_ex, w)
     val_loss = _weighted_mean(total_val_ex, w)
     rew_loss = _weighted_mean(total_rew_ex, w)
+    consistency_loss = _weighted_mean(total_consistency_ex, w)
 
     total_loss = (
         cfg_train.policy_loss_weight * pol_loss
         + cfg_train.value_loss_weight  * val_loss
         + cfg_train.reward_loss_weight * rew_loss
         + cfg_train.probe_loss_weight  * total_prb
+        + cfg_train.consistency_loss_weight * consistency_loss
     )
 
     # TD-error for priority update (absolute value error on value at root)
@@ -155,6 +177,7 @@ def muzero_loss(
         "loss_value":  val_loss,
         "loss_reward": rew_loss,
         "loss_probes": total_prb,
+        "loss_consistency": consistency_loss,
         "td_error_mean": jnp.mean(td_error),
         "probe_per_task": per_probe_0,   # [5]
     }

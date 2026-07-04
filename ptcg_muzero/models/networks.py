@@ -420,7 +420,34 @@ class DynamicsNetwork(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Unified MuZero model (all three networks)
+# Projector and Predictor for EfficientZero Consistency Loss
+# ─────────────────────────────────────────────────────────────────────────────
+class Projector(nn.Module):
+    cfg: ModelConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        D = self.cfg.latent_dim
+        h = nn.Dense(D, name="fc1")(x)
+        h = nn.gelu(h)
+        h = nn.Dense(D, name="fc2")(h)
+        return h
+
+
+class Predictor(nn.Module):
+    cfg: ModelConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        D = self.cfg.latent_dim
+        h = nn.Dense(D, name="fc1")(x)
+        h = nn.gelu(h)
+        h = nn.Dense(D, name="fc2")(h)
+        return h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified MuZero model (all three networks + projector/predictor)
 # ─────────────────────────────────────────────────────────────────────────────
 class MuZeroNetwork(nn.Module):
     """
@@ -436,6 +463,8 @@ class MuZeroNetwork(nn.Module):
         )
         self.f = PredictionNetwork(cfg=self.cfg)
         self.g = DynamicsNetwork(cfg=self.cfg)
+        self.project = Projector(cfg=self.cfg)
+        self.predict_next = Predictor(cfg=self.cfg)
 
     def represent(
         self, obs: dict, deterministic: bool = True
@@ -452,6 +481,12 @@ class MuZeroNetwork(nn.Module):
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         return self.g(z, action_onehot)
 
+    def project_state(self, z: jnp.ndarray) -> jnp.ndarray:
+        return self.project(z)
+
+    def predict_state(self, proj_z: jnp.ndarray) -> jnp.ndarray:
+        return self.predict_next(proj_z)
+
     def __call__(
         self, obs: dict, deterministic: bool = True
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -460,8 +495,11 @@ class MuZeroNetwork(nn.Module):
         pi, v    = self.predict(z)
         
         # Force l'initialisation des paramètres du modèle de dynamique (self.g)
-        # pendant l'init sans affecter la sortie de la racine.
+        # et des têtes de projection/prédiction pendant l'init sans affecter la sortie de la racine.
         dummy_action = jnp.zeros((z.shape[0], self.cfg.max_actions))
         _, _ = self.dynamics(z, dummy_action)
+        
+        proj_z = self.project_state(z)
+        _ = self.predict_state(proj_z)
         
         return z, pi, v

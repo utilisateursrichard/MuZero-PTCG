@@ -269,6 +269,8 @@ def run_parallel_self_play(
     num_card_ids: int,
     energy_ids,
     ace_spec_ids,
+    pipes: list,
+    processes: list,
     is_seeding: bool = False,
     min_batch_threshold: int = 4,   # attendre au moins N workers avant d'envoyer au GPU
     card_data = None,
@@ -298,16 +300,6 @@ def run_parallel_self_play(
     _inference_device_idx = [0]  # compteur pour alterner les GPUs
 
     ctx = mp.get_context("spawn")
-    pipes = []
-    processes = []
-    
-    for idx in range(num_workers):
-        parent_conn, child_conn = ctx.Pipe()
-        # bootstrap : pose CUDA_VISIBLE_DEVICES="" AVANT tout import JAX dans le fils
-        p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
-        p.start()
-        pipes.append(parent_conn)
-        processes.append(p)
 
     games_started = 0
     games_completed = 0
@@ -320,6 +312,7 @@ def run_parallel_self_play(
 
     pipe_meta = [{} for _ in range(num_workers)]
     worker_steps = [0] * num_workers
+    last_msg_time = [time.time()] * num_workers
 
     def start_game_on_worker(pipe_idx, local_rng):
         nonlocal games_started
@@ -347,11 +340,13 @@ def run_parallel_self_play(
             "ids1": ids1,
             "game_active": True
         }
+        last_msg_time[pipe_idx] = time.time()
         try:
             pipes[pipe_idx].send({
                 "cmd": "start",
                 "deck0": list(deck0),
-                "deck1": list(deck1)
+                "deck1": list(deck1),
+                "num_belief_samples": int(cfg.search.num_belief_samples)
             })
             games_started += 1
         except Exception as e:
@@ -375,8 +370,8 @@ def run_parallel_self_play(
         if not active_pipes_list:
             break
 
-        # Attendre de façon non-bloquante/bloquante efficace qu'au moins un worker soit prêt
-        ready_pipes = list(mp.connection.wait(active_pipes_list))
+        # Attendre de façon non-bloquante/bloquante efficace qu'au moins un worker soit prêt (timeout de 10s pour faire vivre le coordinateur)
+        ready_pipes = list(mp.connection.wait(active_pipes_list, timeout=10.0))
 
         # Ajouter immédiatement tous les autres workers qui ont également fini leur étape (sans attendre)
         for p in active_pipes_list:
@@ -390,6 +385,7 @@ def run_parallel_self_play(
 
             try:
                 msg = pipe.recv()
+                last_msg_time[pipe_idx] = time.time()
             except Exception as e:
                 logger.error(f"Failed to read from worker {pipe_idx}: {e}")
                 pipe_meta[pipe_idx]["game_active"] = False
@@ -444,6 +440,7 @@ def run_parallel_self_play(
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
 
                 games_completed += 1
+                tracker.update(games_completed=tracker.games_completed + 1)
                 logger.info(f"[coordinateur] Partie completee sur worker {pipe_idx} ! ({games_completed}/{num_games_to_play} completes, {games_started}/{num_games_to_play} lancees)")
 
                 if games_started < num_games_to_play:
@@ -460,6 +457,42 @@ def run_parallel_self_play(
                     logger.info(f"[coordinateur] Tentative de remplacement pour le worker {pipe_idx} en échec...")
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
+
+        # Détecter et relancer les workers gelés (inactivité > 120s)
+        now = time.time()
+        for idx in range(num_workers):
+            if pipe_meta[idx].get("game_active") and (now - last_msg_time[idx] > 120.0):
+                logger.warning(
+                    f"[coordinateur] Le worker {idx} semble gele (inactif depuis {now - last_msg_time[idx]:.1f}s, etape {worker_steps[idx]}). Force restart..."
+                )
+                try:
+                    processes[idx].terminate()
+                    processes[idx].join(timeout=2.0)
+                    if processes[idx].is_alive():
+                        processes[idx].kill()
+                except Exception as e:
+                    logger.error(f"[coordinateur] Erreur lors de la coupure du worker {idx} : {e}")
+
+                try:
+                    pipes[idx].close()
+                except Exception:
+                    pass
+
+                parent_conn, child_conn = ctx.Pipe()
+                new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+                new_p.start()
+                pipes[idx] = parent_conn
+                processes[idx] = new_p
+
+                pipe_meta[idx] = {"game_active": False}
+                last_msg_time[idx] = now
+                worker_steps[idx] = 0
+
+                if games_started < num_games_to_play:
+                    rng, rng_restart = jax.random.split(rng)
+                    start_game_on_worker(idx, rng_restart)
+                else:
+                    games_completed += 1
 
         if need_action_indices:
             # Alterner entre les GPUs disponibles pour utiliser tous les GPUs
@@ -505,16 +538,6 @@ def run_parallel_self_play(
                     "search_pol": np.array(avg_policies[idx_in_batch]),
                     "search_val": float(avg_values[idx_in_batch])
                 })
-
-    for pipe in pipes:
-        try:
-            pipe.send(None)
-        except Exception:
-            pass
-    for p in processes:
-        p.join(timeout=1.0)
-        if p.is_alive():
-            p.terminate()
 
     return completed_histories, deck_builder_updates, deck_errors_count
 
@@ -626,15 +649,42 @@ def train(cfg: Config) -> None:
     # ── 3. Dummy obs for init ─────────────────────────────────────────────
     dummy_obs = _make_dummy_obs(cfg.model)
 
-    # ── 4. Init train states ──────────────────────────────────────────────
+    # ── 4. Init train states (avec support de reprise depuis le checkpoint latest) ──
     rng      = jax.random.PRNGKey(cfg.infra.seed)
     rng, r1, r2, r3 = jax.random.split(rng, 4)
 
-    state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
+    latest_path = Path(cfg.infra.checkpoint_dir) / "ckpt_latest.pkl"
+    start_step = 0
+    loaded_params = None
+    loaded_deck_params = None
 
-    deck_params, deck_opt_state, deck_baseline = create_deck_train_state(
-        deck_net, cfg, r2
-    )
+    if latest_path.exists():
+        try:
+            import pickle
+            with open(latest_path, "rb") as f:
+                ckpt_data = pickle.load(f)
+            start_step = ckpt_data.get("step", 0)
+            loaded_params = ckpt_data["params"]
+            loaded_deck_params = ckpt_data.get("deck", {})
+            logger.info("=== Reprise de l'entraînement depuis le checkpoint : %s (étape %d) ===", latest_path, start_step)
+        except Exception as e:
+            logger.warning("Échec du chargement du checkpoint existant : %s. Démarrage à zéro.", e)
+
+    if loaded_params is not None:
+        state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
+        params_jax = jax.tree_util.tree_map(jax.device_put, loaded_params)
+        state = state.replace(params=params_jax)
+    else:
+        state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
+
+    if loaded_deck_params is not None:
+        deck_params = jax.tree_util.tree_map(jax.device_put, loaded_deck_params)
+        deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
+        deck_baseline = 0.0
+    else:
+        deck_params, deck_opt_state, deck_baseline = create_deck_train_state(
+            deck_net, cfg, r2
+        )
     deck_optimizer = optax.adam(cfg.train.deck_lr)
 
     # ── 5. Replicate onto 2 devices ───────────────────────────────────────
@@ -658,6 +708,20 @@ def train(cfg: Config) -> None:
     NUM_WORKERS = 8   # 8 workers CPU-only (bootstrap garantit pas de GPU dans les fils)
     _deck_errors = 0
 
+    # ── Spawn persistent worker processes pool ───────────────────────────
+    import multiprocessing as mp
+    from training.worker_bootstrap import run as _worker_bootstrap
+    ctx = mp.get_context("spawn")
+    pipes = []
+    processes = []
+    logger.info("[train] Spawning %d persistent worker processes...", NUM_WORKERS)
+    for idx in range(NUM_WORKERS):
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+        p.start()
+        pipes.append(parent_conn)
+        processes.append(p)
+
     while len(buffer) < cfg.train.min_replay_size:
         tracker.update()
         rng, rng_sp = jax.random.split(rng)
@@ -673,6 +737,8 @@ def train(cfg: Config) -> None:
             num_card_ids=num_card_ids,
             energy_ids=energy_ids,
             ace_spec_ids=ace_spec_ids,
+            pipes=pipes,
+            processes=processes,
             is_seeding=True,
             card_data=card_data,
         )
@@ -689,12 +755,16 @@ def train(cfg: Config) -> None:
     t0 = time.time()
     total_transitions_since_last_push = 0
 
-    for step in range(cfg.train.num_total_steps):
+    for step in range(start_step, cfg.train.num_total_steps):
         global_step = step
 
         # ── a. Self-play ──────────────────────────────────────────────────
         if step % cfg.train.self_play_interval == 0:
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
+            
+            # Enregistrer immédiatement le modèle entraîné courant pour la suite
+            _save_checkpoint(state, deck_params, cfg, step, force_latest_only=True)
+            
             rng, rng_sp = jax.random.split(rng)
             
             tracker.update(phase=f"Self-Play Step {step}")
@@ -702,7 +772,7 @@ def train(cfg: Config) -> None:
             n_games = cfg.train.games_per_self_play
             hists, deck_updates, _ = run_parallel_self_play(
                 num_games_to_play=n_games,
-                num_workers=min(NUM_WORKERS, max(n_games, 16)),
+                num_workers=NUM_WORKERS,
                 deck_net=deck_net,
                 deck_params=deck_params,
                 network=network,
@@ -712,6 +782,8 @@ def train(cfg: Config) -> None:
                 num_card_ids=num_card_ids,
                 energy_ids=energy_ids,
                 ace_spec_ids=ace_spec_ids,
+                pipes=pipes,
+                processes=processes,
                 is_seeding=False,
                 card_data=card_data,
             )
@@ -766,31 +838,26 @@ def train(cfg: Config) -> None:
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
             _log_probe_metrics(metrics, cfg)
 
-        # ── d. Checkpoint ─────────────────────────────────────────────────
+        # ── d. Checkpoint & HF push ───────────────────────────────────────
         if step % cfg.train.checkpoint_every == 0 and step > 0:
             _save_checkpoint(state, deck_params, cfg, step)
-
-        # ── e. HF push ────────────────────────────────────────────────────
-        if (cfg.hf.enabled
-                and total_transitions_since_last_push >= cfg.hf.push_every_n_transitions
-                and step > 0):
-            total_transitions_since_last_push -= cfg.hf.push_every_n_transitions
-            _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
             
-            global _active_push_thread
-            if _active_push_thread is not None and _active_push_thread.is_alive():
-                logger.warning(
-                    "[hf-push] Un push HuggingFace précédent est encore en cours. "
-                    "Saut du push pour l'étape %d pour éviter de bloquer.", step
-                )
-            else:
-                logger.info("[hf-push] Lancement du push asynchrone vers HuggingFace pour l'étape %d...", step)
-                _active_push_thread = threading.Thread(
-                    target=push_to_hub,
-                    args=(_params_cpu, deck_params, cfg, step),
-                    daemon=True
-                )
-                _active_push_thread.start()
+            if cfg.hf.enabled:
+                _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
+                global _active_push_thread
+                if _active_push_thread is not None and _active_push_thread.is_alive():
+                    logger.warning(
+                        "[hf-push] Un push HuggingFace précédent est encore en cours. "
+                        "Saut du push pour l'étape %d pour éviter de bloquer.", step
+                    )
+                else:
+                    logger.info("[hf-push] Lancement du push asynchrone vers HuggingFace pour l'étape %d...", step)
+                    _active_push_thread = threading.Thread(
+                        target=push_to_hub,
+                        args=(_params_cpu, deck_params, cfg, step),
+                        daemon=True
+                    )
+                    _active_push_thread.start()
 
     # Final checkpoint
     _save_checkpoint(state, deck_params, cfg, global_step)
@@ -798,6 +865,19 @@ def train(cfg: Config) -> None:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
         logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
         push_to_hub(_params_cpu, deck_params, cfg, global_step)
+
+    # Clean up persistent workers pool
+    logger.info("[train] Nettoyage du pool de workers persistants...")
+    for pipe in pipes:
+        try:
+            pipe.send(None)
+        except Exception:
+            pass
+    for p in processes:
+        p.join(timeout=1.0)
+        if p.is_alive():
+            p.terminate()
+
     logger.info("Training complete.")
 
 
@@ -855,13 +935,20 @@ def _make_dummy_obs(cfg) -> dict:
     }
 
 
-def _save_checkpoint(state, deck_params, cfg: Config, step: int):
+def _save_checkpoint(state, deck_params, cfg: Config, step: int, force_latest_only: bool = False):
     import pickle
-    path = Path(cfg.infra.checkpoint_dir) / f"ckpt_{step:07d}.pkl"
     params_cpu = jax.tree_util.tree_map(lambda x: np.array(x[0]), state.params)
-    with open(path, "wb") as f:
+    
+    if not force_latest_only:
+        path = Path(cfg.infra.checkpoint_dir) / f"ckpt_{step:07d}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump({"step": step, "params": params_cpu, "deck": deck_params}, f)
+        logger.info("Checkpoint saved: %s", path)
+        
+    latest_path = Path(cfg.infra.checkpoint_dir) / "ckpt_latest.pkl"
+    with open(latest_path, "wb") as f:
         pickle.dump({"step": step, "params": params_cpu, "deck": deck_params}, f)
-    logger.info("Checkpoint saved: %s", path)
+    logger.info("Latest checkpoint updated: %s", latest_path)
 
 
 def _log_probe_metrics(metrics: dict, cfg: Config):

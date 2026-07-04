@@ -242,9 +242,12 @@ def ismcts_action(
     for k in det_list[0].keys():
         jax_obs_batched[k] = jnp.stack([d[k] for d in det_list], axis=0)
 
+    # Extract only MuZero parameters (the full parameter dict also contains "probes")
+    mz_params = params["muzero"] if isinstance(params, dict) and "muzero" in params else params
+
     # 2. Encoder l'état racine pour toutes les hypothèses en parallèle
     # z: [N_samples, D], pi_logits: [N_samples, A], v: [N_samples, 1]
-    z, pi_logits, v = network.apply(params, jax_obs_batched)
+    z, pi_logits, v = network.apply(mz_params, jax_obs_batched)
 
     # Préparer les masques d'option de taille [N_samples, A]
     mask_jax_batched = jnp.stack([jnp.array(option_mask_np)] * N_samples, axis=0)
@@ -256,7 +259,7 @@ def ismcts_action(
     # JAX va exécuter toutes les simulations MCTS en parallèle sur le GPU
     vmapped_mcts = jax.vmap(
         lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
-            params,
+            mz_params,
             z_item[None],
             logits_item[None],
             v_item[None],   # scalaire () → [1] requis par mctx

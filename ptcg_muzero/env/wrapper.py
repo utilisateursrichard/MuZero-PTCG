@@ -436,6 +436,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
             if cmd == "start":
                 deck0 = msg["deck0"]
                 deck1 = msg["deck1"]
+                num_belief_samples = msg.get("num_belief_samples", cfg.search.num_belief_samples)
 
                 try:
                     obs_dict, done = env.reset(deck0, deck1)
@@ -464,8 +465,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         continue
 
                     mc = cfg.model
-                    sc = cfg.search
-                    N_samples = int(sc.num_belief_samples)
+                    N_samples = int(num_belief_samples)
 
                     rng_beliefs = np.random.randint(0, 2**31, size=N_samples)
 

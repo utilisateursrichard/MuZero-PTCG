@@ -94,6 +94,7 @@ class TrainConfig:
     policy_loss_weight: float = 1.0
     probe_loss_weight: float = 0.05
     deck_loss_weight: float = 0.1
+    consistency_loss_weight: float = 2.0
 
     # ── Deck builder ──────────────────────────────────────────────────────
     deck_lr: float = 1e-3

@@ -12,8 +12,10 @@ class ActivityTracker:
         self.deck_errors = 0
         self.current_game_steps = 0
         self.last_activity_time = time.time()
+        self.games_completed = 0
+        self.start_time = time.time()
 
-    def update(self, phase=None, buffer_size=None, deck_errors=None, current_game_steps=None):
+    def update(self, phase=None, buffer_size=None, deck_errors=None, current_game_steps=None, games_completed=None):
         if phase is not None:
             self.phase = phase
         if buffer_size is not None:
@@ -22,6 +24,8 @@ class ActivityTracker:
             self.deck_errors = deck_errors
         if current_game_steps is not None:
             self.current_game_steps = current_game_steps
+        if games_completed is not None:
+            self.games_completed = games_completed
         self.last_activity_time = time.time()
 
 # Singleton partagé
