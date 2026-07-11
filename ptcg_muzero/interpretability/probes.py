@@ -37,6 +37,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import logging
+import threading
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -44,6 +47,8 @@ import numpy as np
 
 from config import ModelConfig
 from env.encoding import GLOBAL_FEAT_DIM
+
+_probe_logger = logging.getLogger("ptcg_muzero.probes")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Définition des 5 sondes
@@ -95,6 +100,36 @@ class ProbeHeads(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cache thread-safe pour la base de données des cartes du moteur
+_card_db: dict | None = None
+_card_db_lock = threading.Lock()
+
+def _get_card_db() -> dict:
+    """Charge (au premier appel) et met en cache la base de données du moteur.
+    Thread-safe grâce au verrou. Fallback sur {} si le moteur n'est pas disponible
+    (tous les steps de type_advantage seront alors marqués -1, ignorés par probe_loss).
+    """
+    global _card_db
+    if _card_db is None:
+        with _card_db_lock:
+            if _card_db is None:   # double-checked locking
+                try:
+                    from env.cabt_api import all_card_data
+                    _card_db = {c.cardId: c for c in all_card_data()}
+                    _probe_logger.info(
+                        "[probes] card_db chargé : %d cartes", len(_card_db)
+                    )
+                except Exception as exc:
+                    _probe_logger.warning(
+                        "[probes] Impossible de charger card_db (%s). "
+                        "Les targets type_advantage seront ignorées (target=-1).",
+                        exc,
+                    )
+                    _card_db = {}
+    return _card_db
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Extraction des cibles depuis l'observation
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_probe_targets(
@@ -129,22 +164,31 @@ def extract_probe_targets(
             targets[0] = int(max_dmg >= my_hp)
 
     # ── Sonde 1 : type_advantage ─────────────────────────────────────────
-    # -1 = désavantage, 0 = neutre, 1 = avantage
+    # 0 = désavantage, 1 = neutre, 2 = avantage
     if my_active_list and opp_active_list:
         my_poke  = my_active_list[0]
         opp_poke = opp_active_list[0]
         if my_poke is not None and opp_poke is not None:
-            my_type   = _safe_int(my_poke, "type", -1)
-            opp_type  = _safe_int(opp_poke, "type", -1)
-            opp_weak  = _safe_int(opp_poke, "weakness", -1)
-            opp_res   = _safe_int(opp_poke, "resistance", -1)
-            if my_type >= 0:
-                if my_type == opp_weak:
-                    targets[1] = 2    # avantage
-                elif my_type == opp_res:
-                    targets[1] = 0    # désavantage
-                else:
-                    targets[1] = 1    # neutre
+            my_card_id = _safe_int(my_poke, "id", -1)
+            opp_card_id = _safe_int(opp_poke, "id", -1)
+            db = _get_card_db()
+            my_card = db.get(my_card_id)
+            opp_card = db.get(opp_card_id)
+            if my_card is not None and opp_card is not None:
+                my_type = getattr(my_card.energyType, "value", int(my_card.energyType))
+                opp_weak_enum = opp_card.weakness
+                opp_res_enum = opp_card.resistance
+                
+                opp_weak = getattr(opp_weak_enum, "value", int(opp_weak_enum)) if opp_weak_enum is not None else -1
+                opp_res = getattr(opp_res_enum, "value", int(opp_res_enum)) if opp_res_enum is not None else -1
+                
+                if my_type >= 0:
+                    if my_type == opp_weak:
+                        targets[1] = 2    # avantage
+                    elif my_type == opp_res:
+                        targets[1] = 0    # désavantage
+                    else:
+                        targets[1] = 1    # neutre
 
     # ── Sonde 2 : prize_lead ─────────────────────────────────────────────
     my_prizes  = len(me.get("prize") or [])

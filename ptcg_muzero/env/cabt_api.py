@@ -39,10 +39,24 @@ if _cg_parent is None:
             _cg_parent = _root
             break
 
+# 5. Fallback local pour le développement et test hors Kaggle
+if _cg_parent is None:
+    from pathlib import Path
+    workspace_root = Path(__file__).parent.parent.parent
+    local_paths = [
+        workspace_root / "competiton" / "sample_submission" / "sample_submission",
+        workspace_root / "competiton" / "sample_submission",
+        workspace_root / "competiton",
+    ]
+    for lp in local_paths:
+        if (lp / "cg").is_dir():
+            _cg_parent = str(lp.resolve())
+            break
+
 if _cg_parent is None:
     raise RuntimeError(
-        "Impossible de localiser la bibliothèque 'cg' dans /kaggle/input. "
-        "Vérifiez que le dataset de la compétition est bien attaché au notebook."
+        "Impossible de localiser la bibliothèque 'cg' dans /kaggle/input ni dans les chemins locaux du workspace. "
+        "Vérifiez que le dataset de la compétition est bien attaché au notebook ou disponible dans le dossier 'competiton'."
     )
 
 sys.path.append(_cg_parent)
