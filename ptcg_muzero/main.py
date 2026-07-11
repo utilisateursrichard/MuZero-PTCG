@@ -143,14 +143,28 @@ def cmd_train(args) -> None:
             target_size = cfg.train.min_replay_size if tracker.buffer_size < cfg.train.min_replay_size else cfg.train.replay_buffer_size
             
             elapsed = now - tracker.start_time
-            games = tracker.games_completed
-            sec_per_game = elapsed / games if games > 0 else 0.0
+            # Le temps par partie (durée moyenne d'une session de self-play de 8 parties parallèles)
+            sec_per_game = tracker.avg_self_play_time
             
             current_size = tracker.buffer_size
             next_milestone = ((current_size // 10000) + 1) * 10000
             milestone_k = next_milestone // 1000
             
-            rate = current_size / elapsed if elapsed > 0 else 0.0
+            is_seeding = current_size < cfg.train.min_replay_size
+            avg_trans_game = tracker.avg_transitions_per_game
+            avg_sp_time = tracker.avg_self_play_time
+            avg_step_time = tracker.avg_train_step_time
+            
+            if is_seeding:
+                games_per_cycle = 8
+                transitions_per_cycle = games_per_cycle * avg_trans_game
+                time_per_cycle = avg_sp_time
+            else:
+                games_per_cycle = cfg.train.games_per_self_play
+                transitions_per_cycle = games_per_cycle * avg_trans_game
+                time_per_cycle = avg_sp_time + cfg.train.self_play_interval * avg_step_time
+
+            rate = transitions_per_cycle / time_per_cycle if time_per_cycle > 0 else 1.0
             remaining = next_milestone - current_size
             eta_s = remaining / rate if rate > 0 else 0.0
             eta_str = format_time(eta_s)

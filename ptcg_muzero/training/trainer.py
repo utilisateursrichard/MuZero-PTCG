@@ -59,7 +59,7 @@ from models.deck_builder import (
     set_energy_ids,
 )
 from models.networks import MuZeroNetwork
-from search.ismcts import add_exploration_noise, ismcts_action, ismcts_action_batched
+from search.ismcts import add_exploration_noise, ismcts_action, ismcts_action_batched, reanalyze_root
 from training.loss import collate_batch, muzero_loss
 from training.replay_buffer import PrioritizedReplayBuffer
 
@@ -106,12 +106,55 @@ def make_train_step(
     Fabrique le train_step pmappé, en fermant sur ``network`` et ``probe_heads``.
     Les modules Flax n'ont pas besoin d'être passés comme arguments — on les
     capture dans la closure avant jit/pmap.
+
+    Paramètres complémentaires par rapport à l'ancienne version :
+      rng : jnp.ndarray  — clé PRNG passée depuis le coordinateur et répliquée
+            sur tous les devices.  À l'intérieur du pmap on utilise
+            ``jax.random.fold_in(rng, axis_index)`` pour différencier les devices.
     """
+    reanalyze_sims     = cfg.train.reanalyze_num_simulations
+    reanalyze_consider = cfg.search.max_num_considered_actions
 
     def _step(
         state: train_state.TrainState,
         batch: dict,
+        rng: jnp.ndarray,                           # ← NOUVEAU : clé PRNG
     ) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
+
+        mz_params = state.params["muzero"]
+
+        # ── Reanalyze In-Pipeline GPU ───────────────────────────────────────
+        # Chaque device obtient une clé différente via fold_in.
+        # Note : reanalyze_root est appelé en-dehors de loss_fn pour que les
+        # fresh targets ne dépendent pas des params (pas de double gradient).
+        rng_device = jax.random.fold_in(rng, jax.lax.axis_index("devices"))
+
+        # Extraire l'observation racine (step k=0) — déjà sur le GPU
+        obs0 = {k: v[:, 0] for k, v in batch["obs_seq"].items()}  # [B, ...]
+
+        # Forward pass h+f avec les params courants (stop_gradient implicite
+        # car on est hors de la fermeture loss_fn)
+        z_root     = network.apply(mz_params, obs0, method=network.represent)
+        pi_root, v_root = network.apply(mz_params, z_root, method=network.predict)
+
+        # Approximation du masque d'actions légales depuis les target_pol stockées :
+        # les actions avec target > 0 étaient légales lors de la self-play.
+        mask_root = (batch["target_pol"][:, 0] > 0).astype(jnp.bool_)  # [B, A]
+
+        # MCTS Gumbel allégé sur le batch root entier — GPU, natif [B]
+        fresh_pol, fresh_val = reanalyze_root(
+            mz_params, network, z_root, pi_root, v_root, mask_root,
+            rng_device, reanalyze_sims, reanalyze_consider,
+        )
+
+        # Remplacement des targets k=0 dans le batch (pas dans loss_fn → pas de gradient)
+        batch = {
+            **batch,
+            "target_pol": batch["target_pol"].at[:, 0].set(jax.lax.stop_gradient(fresh_pol)),
+            "target_val": batch["target_val"].at[:, 0].set(jax.lax.stop_gradient(fresh_val)),
+        }
+
+        # ── Gradient step ──────────────────────────────────────────────────────
         def loss_fn(params):
             loss, metrics, td_err = muzero_loss(
                 params, network, probe_heads, batch,
@@ -272,7 +315,7 @@ def run_parallel_self_play(
     pipes: list,
     processes: list,
     is_seeding: bool = False,
-    min_batch_threshold: int = 4,   # attendre au moins N workers avant d'envoyer au GPU
+    min_batch_threshold: int = -1,   # -1 = utiliser num_workers (batch GPU toujours complet)
     card_data = None,
 ):
     if is_seeding:
@@ -281,6 +324,10 @@ def run_parallel_self_play(
         cfg.search.num_simulations = 15
         cfg.search.num_belief_samples = 1
         logger.info("[self-play] Mode seeding active: acceleration MCTS (sims=15, belief_samples=1)")
+
+    # Résoudre min_batch_threshold=-1 → num_workers (batch GPU toujours plein)
+    if min_batch_threshold < 0:
+        min_batch_threshold = num_workers
 
     import multiprocessing as mp
     from training.worker_bootstrap import run as _worker_bootstrap
@@ -725,6 +772,8 @@ def train(cfg: Config) -> None:
     while len(buffer) < cfg.train.min_replay_size:
         tracker.update()
         rng, rng_sp = jax.random.split(rng)
+        
+        t_sp_start = time.time()
         hists, _, errs = run_parallel_self_play(
             num_games_to_play=8,
             num_workers=NUM_WORKERS,
@@ -742,10 +791,13 @@ def train(cfg: Config) -> None:
             is_seeding=True,
             card_data=card_data,
         )
+        tracker.self_play_times.append(time.time() - t_sp_start)
+        
         _deck_errors += errs
         tracker.update(deck_errors=_deck_errors)
         for hist in hists:
-            _add_history_to_buffer(hist, buffer, cfg)
+            t_added = _add_history_to_buffer(hist, buffer, cfg)
+            tracker.transitions_per_game_list.append(t_added)
         tracker.update(buffer_size=len(buffer))
 
     logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
@@ -770,6 +822,7 @@ def train(cfg: Config) -> None:
             tracker.update(phase=f"Self-Play Step {step}")
 
             n_games = cfg.train.games_per_self_play
+            t_sp_start = time.time()
             hists, deck_updates, _ = run_parallel_self_play(
                 num_games_to_play=n_games,
                 num_workers=NUM_WORKERS,
@@ -787,10 +840,13 @@ def train(cfg: Config) -> None:
                 is_seeding=False,
                 card_data=card_data,
             )
+            tracker.self_play_times.append(time.time() - t_sp_start)
 
             added_transitions = 0
             for hist in hists:
-                added_transitions += _add_history_to_buffer(hist, buffer, cfg)
+                t_added = _add_history_to_buffer(hist, buffer, cfg)
+                added_transitions += t_added
+                tracker.transitions_per_game_list.append(t_added)
             
             total_transitions_since_last_push += added_transitions
 
@@ -810,11 +866,25 @@ def train(cfg: Config) -> None:
         )
         batch_sharded = shard_batch(batch_cpu, cfg.infra.num_devices)
 
-        state, metrics, td_errs = train_step_fn(state, batch_sharded)
+        # Clé PRNG pour Reanalyze — répliquée puis différenciée par device via fold_in
+        rng, rng_step = jax.random.split(rng)
+        rng_step_replicated = jnp.broadcast_to(
+            rng_step[None], (cfg.infra.num_devices,) + rng_step.shape
+        )
 
-        # Update priorities
+        t_step_start = time.time()
+        state, metrics, td_errs = train_step_fn(state, batch_sharded, rng_step_replicated)
+        tracker.train_step_times.append(time.time() - t_step_start)
+
+        # Update priorities (TD error basé sur les fresh targets Reanalyze)
         td_err_flat = np.array(unshard(td_errs))
         buffer.update_priorities(indices, td_err_flat)
+
+        # ── Priority Refresh allégé (tous les N steps) ────────────────────
+        if step % cfg.train.priority_refresh_every == 0 and len(buffer) > 0:
+            _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], state.params)["muzero"]
+            _refresh_buffer_priorities(buffer, network, _params_cpu_mz, cfg)
+
 
         # ── c. Logging ────────────────────────────────────────────────────
         if step % 100 == 0:
@@ -884,7 +954,45 @@ def train(cfg: Config) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _refresh_buffer_priorities(
+    buffer: PrioritizedReplayBuffer,
+    network,
+    mz_params: dict,
+    cfg: Config,
+) -> None:
+    """
+    Recalcule les priorités PER sur une fraction aléatoire du buffer.
+
+    Utilise uniquement h+f (représentation + prédiction), sans MCTS.
+    Rapide : une seule passe forward sur ~5% du buffer.
+    La priorité mise à jour = |v_pred - v_target_stockée|.
+    """
+    fraction = cfg.train.priority_refresh_fraction
+    n = max(1, int(len(buffer) * fraction))
+    indices = np.random.choice(len(buffer), size=n, replace=False)
+
+    entries = [buffer._entries[int(i)] for i in indices if buffer._entries[int(i)] is not None]
+    if not entries:
+        return
+
+    # Construire un mini-batch d'obs root (k=0)
+    obs_keys = entries[0].obs_seq[0].keys()
+    obs_batch = {k: jnp.array(np.stack([e.obs_seq[0][k] for e in entries])) for k in obs_keys}
+
+    # Forward pass h+f : pas de gradient, pas de MCTS
+    z = network.apply(mz_params, obs_batch, method=network.represent)
+    _, v_pred = network.apply(mz_params, z, method=network.predict)
+
+    v_pred_np  = np.array(v_pred)
+    v_target   = np.array([e.target_val[0] for e in entries], dtype=np.float32)
+    new_td_err = np.abs(v_pred_np - v_target)
+
+    valid_indices = [int(i) for i in indices if buffer._entries[int(i)] is not None]
+    buffer.update_priorities(np.array(valid_indices[:len(new_td_err)]), new_td_err)
+
+
 def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, cfg: Config) -> int:
+
     if len(hist) == 0 or hist.returns is None:
         return 0
     probe_tgts = np.stack([

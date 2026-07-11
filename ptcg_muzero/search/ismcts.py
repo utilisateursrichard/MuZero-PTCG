@@ -21,7 +21,7 @@ Point d'entrée principal : ``ismcts_action``
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Dict, NamedTuple, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -186,7 +186,7 @@ def _run_single_mcts(
 
     root = mctx.RootFnOutput(
         prior_logits=masked_logits,
-        value=root_value,
+        value=jnp.reshape(root_value, (1,)),   # guarantee shape [1] for mctx
         embedding=root_embedding,
     )
 
@@ -262,7 +262,7 @@ def ismcts_action(
             mz_params,
             z_item[None],
             logits_item[None],
-            v_item[None],   # scalaire () → [1] requis par mctx
+            jnp.atleast_1d(v_item),   # () or [1] → always [1] for mctx
             mask_item[None],
             rng_item,
             static_features,
@@ -311,6 +311,68 @@ def add_exploration_noise(
     return jnp.where(option_mask, noisy, policy_logits)
 
 
+def reanalyze_root(
+    params: dict,
+    network,
+    z: jnp.ndarray,                    # [B, D]   latent states déjà encodés
+    pi_logits: jnp.ndarray,            # [B, A]
+    v: jnp.ndarray,                    # [B]
+    option_mask: jnp.ndarray,          # [B, A]   bool
+    rng: jnp.ndarray,                  # PRNGKey
+    num_simulations: int,
+    max_num_considered_actions: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Reanalyze In-Pipeline GPU : relance un MCTS Gumbel allégé sur le batch
+    root entier en utilisant les paramètres courants du réseau.
+
+    Contrairement à ismcts_action_batched (self-play) qui utilise vmap parce
+    qu'il gère B×S mondes indépendants (belief samples), ici il y a exactement
+    un monde par exemple → mctx.gumbel_muzero_policy accepte [B] nativement,
+    sans vmap.  Cela s'intègre directement dans la closure pmap de train_step.
+
+    Paramètres
+    ----------
+    params  : uniquement les params MuZero (pas "probes")
+    z       : latent states racine [B, D], déjà calculés par network.represent
+    pi_logits : logits de politique [B, A], déjà calculés par network.predict
+    v       : valeurs racine [B], déjà calculées par network.predict
+    option_mask : masque des actions légales [B, A] bool
+    rng     : clé PRNG (doit être unique par device dans pmap)
+
+    Retourne
+    --------
+    fresh_target_pol : [B, A]  nouvelles politiques cibles (action_weights MCTS)
+    fresh_target_val : [B]     nouvelles valeurs cibles (valeur de la racine MCTS)
+    """
+    recurrent_fn = make_recurrent_fn(network, params)
+
+    invalid_mask = ~option_mask
+    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
+
+    # mctx attend value: [B], embedding: [B, D], prior_logits: [B, A] — batché nativement
+    root = mctx.RootFnOutput(
+        prior_logits=masked_logits,
+        value=v,           # [B]   — pas de [None] nécessaire ici
+        embedding=z,       # [B, D]
+    )
+
+    policy_output = mctx.gumbel_muzero_policy(
+        params=params,
+        rng_key=rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        invalid_actions=invalid_mask,
+    )
+
+    fresh_pol = policy_output.action_weights              # [B, A]
+    fresh_val = policy_output.search_tree.node_values[:, 0]  # [B]  valeur à la racine
+    return fresh_pol, fresh_val
+
+
+
 def ismcts_action_batched(
     network,
     params: dict,
@@ -355,7 +417,7 @@ def ismcts_action_batched(
             mz_params,
             z_item[None],
             logits_item[None],
-            v_item[None],   # scalaire () → [1] requis par mctx
+            jnp.atleast_1d(v_item),   # () or [1] → always [1] for mctx
             mask_item[None],
             rng_item,
             static_features,

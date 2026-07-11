@@ -78,9 +78,26 @@ def muzero_loss(
     mz_params  = params["muzero"]
     prb_params = params["probes"]
 
+    # ── 0. Pré-encoder TOUTES les K+1 observations en une seule passe ────────
+    # Shape batch["obs_seq"][key] : [B, K+1, ...]
+    # On aplatit en [B*(K+1), ...], encode, puis reshape → [B, K+1, D]
+    # Cela élimine K appels séquentiels à h() dans le scan (gain ~20-30%).
+    obs_flat = {k: v.reshape((B * (K + 1),) + v.shape[2:])
+                for k, v in batch["obs_seq"].items()}
+
+    # h : [B*(K+1), D]
+    z_all_flat = network.apply(mz_params, obs_flat, method=network.represent)
+    z_all = z_all_flat.reshape(B, K + 1, -1)   # [B, K+1, D]
+
+    # Projections pour consistency loss cible (stop_gradient côté cible uniquement)
+    # project_state : [B*(K+1), D]
+    proj_all_flat = network.apply(mz_params, z_all_flat, method=network.project_state)
+    # stop_gradient : la cible de consistency ne doit pas être différenciée
+    proj_all = jax.lax.stop_gradient(proj_all_flat.reshape(B, K + 1, -1))  # [B, K+1, D]
+
     # ── 1. Encode root (step k=0) ─────────────────────────────────────────
-    obs0 = _slice_obs(batch["obs_seq"], 0)   # dict [B, ...]
-    z    = network.apply(mz_params, obs0, method=network.represent)
+    # z[:,0,:] est déjà dans z_all — pas de second encodage
+    z    = z_all[:, 0, :]                                          # [B, D]
     pi_logits, v = network.apply(mz_params, z, method=network.predict)
 
     total_pol_ex = jnp.zeros((B,), dtype=jnp.float32)
@@ -114,22 +131,18 @@ def muzero_loss(
         val_loss_k = _value_loss_per_example(v_k, batch["target_val"][:, k + 1])
         rew_loss_k = _reward_loss_per_example(reward_pred, batch["reward_seq"][:, k])
 
-        # EfficientZero Consistency Loss:
-        # 1. Encodage réel de l'observation cible à k+1
-        obs_k_plus_1 = _slice_obs(batch["obs_seq"], k + 1)
-        s_k = network.apply(mz_params, obs_k_plus_1, method=network.represent)
+        # EfficientZero Consistency Loss (vectorisée) :
+        # La cible est proj_all[:,k+1] — pré-calculée et stop_gradient avant le scan.
+        # Plus de h() ni project_state() ici → économie de K forward passes.
+        target_proj = proj_all[:, k + 1]       # [B, D]  — gratuit, déjà stop_gradient
 
-        # 2. Projection de la cible avec arrêt de gradient
-        target_proj = network.apply(mz_params, s_k, method=network.project_state)
-        target_proj = jax.lax.stop_gradient(target_proj)
-
-        # 3. Projection et prédiction du futur latent virtuel
+        # Projection et prédiction du futur latent virtuel (côté prédiction, gradients actifs)
         pred_proj = network.apply(mz_params, z_next, method=network.project_state)
         pred_pred = network.apply(mz_params, pred_proj, method=network.predict_state)
 
-        # 4. Similarité cosinus négative
+        # Similarité cosinus négative
         eps = 1e-8
-        pred_norm = pred_pred / (jnp.linalg.norm(pred_pred, axis=-1, keepdims=True) + eps)
+        pred_norm   = pred_pred   / (jnp.linalg.norm(pred_pred,   axis=-1, keepdims=True) + eps)
         target_norm = target_proj / (jnp.linalg.norm(target_proj, axis=-1, keepdims=True) + eps)
         consistency_loss_k = - jnp.sum(pred_norm * target_norm, axis=-1)
 
@@ -182,6 +195,7 @@ def muzero_loss(
         "probe_per_task": per_probe_0,   # [5]
     }
     return total_loss, metrics, td_error
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

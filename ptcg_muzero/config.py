@@ -49,11 +49,11 @@ class ModelConfig:
 
 @dataclass
 class SearchConfig:
-    num_simulations: int = 50
+    num_simulations: int = 25           # réduit de 50 → 25 : Gumbel MuZero reste efficace
     # ISMCTS: number of determinizations sampled at each root
     num_belief_samples: int = 4
     # Gumbel MuZero: number of considered actions at each node
-    max_num_considered_actions: int = 16
+    max_num_considered_actions: int = 8  # réduit de 16 → 8 : sélectionne les meilleures actions
     # Dirichlet noise at root (self-play exploration)
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -87,6 +87,13 @@ class TrainConfig:
     checkpoint_every: int = 1_000
     eval_every: int = 5_000
     eval_games: int = 20
+
+    # ── Reanalyze (In-Pipeline GPU) ────────────────────────────────────────
+    reanalyze_num_simulations: int = 10   # MCTS allégé pour Reanalyze (vs 25 en self-play)
+
+    # ── Priority Refresh ───────────────────────────────────────────────────
+    priority_refresh_every: int = 500     # steps entre refreshes globaux du buffer
+    priority_refresh_fraction: float = 0.05  # fraction du buffer recalculée par refresh
 
     # ── Loss weights ──────────────────────────────────────────────────────
     value_loss_weight: float = 0.25
