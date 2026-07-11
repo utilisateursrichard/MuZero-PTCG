@@ -2,3 +2,5 @@
 !.gitignore
 !.github/
 __pycache__
+pokemon-tcg-ai-battle.zip
+competiton/*.pdf
