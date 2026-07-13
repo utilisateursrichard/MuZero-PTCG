@@ -408,19 +408,102 @@ def run_parallel_self_play(
         else:
             pipe_meta[i] = {"game_active": False}
 
+    # ── Architecture producer-consumer asynchrone ─────────────────────────
+    # • Thread principal  : lit les pipes, gère game_over/deck_error,
+    #                       met les need_action dans work_queue
+    # • GPU thread i      : bloque sur work_queue, collecte 20ms,
+    #                       lance l'inférence, envoie les résultats
+    # Les deux GPUs fonctionnent totalement en parallèle sans se bloquer.
+    # ──────────────────────────────────────────────────────────────────────
+    import queue as _pyqueue
+    import threading
+
+    work_queue: "_pyqueue.Queue" = _pyqueue.Queue()
+    stop_event = threading.Event()
+
+    # RNG séparé par GPU thread (évite tout partage de state JAX entre threads)
+    rng, _rng_gpu0, _rng_gpu1 = jax.random.split(rng, 3)
+    _gpu_thread_rngs = [_rng_gpu0, _rng_gpu1]
+
+    def _gpu_inference_worker(gpu_idx: int):
+        _rng = _gpu_thread_rngs[gpu_idx]
+        while not stop_event.is_set():
+            # ── Attendre le premier item disponible (timeout court pour re-vérifier stop_event) ──
+            try:
+                first = work_queue.get(timeout=0.050)
+            except _pyqueue.Empty:
+                continue
+
+            items = [first]
+
+            # ── Collecte pendant 20ms : agréger tous les workers en attente ──
+            _t0 = time.time()
+            while time.time() - _t0 < 0.020:
+                try:
+                    items.append(work_queue.get_nowait())
+                except _pyqueue.Empty:
+                    time.sleep(0.001)
+
+            # ── Build batch padded à num_workers (taille fixe → pas de recompilation JAX) ──
+            na_indices  = [it[0] for it in items]
+            na_encs     = [it[1] for it in items]
+            na_masks    = [it[2] for it in items]
+
+            _pe = list(na_encs)
+            _pm = list(na_masks)
+            while len(_pe) < num_workers:
+                _pe.append(na_encs[-1])
+                _pm.append(na_masks[-1])
+
+            _enc = {}
+            for k in _pe[0].keys():
+                _arr = np.stack([x[k] for x in _pe], axis=0)
+                _enc[k] = jax.device_put(_arr, gpu_devices[gpu_idx])
+            _omasks = np.stack(_pm, axis=0)
+
+            _rng, _rng_act = jax.random.split(_rng)
+            _n = len(na_indices)
+
+            try:
+                _ba, _ap, _av = ismcts_action_batched(
+                    network, _gpu_params[gpu_idx], _enc, _omasks, _rng_act, cfg
+                )
+                ba_np = np.array(_ba)
+                ap_np = np.array(_ap)
+                av_np = np.array(_av)
+            except Exception as _e:
+                logger.error("[GPU%d] Erreur inférence (batch=%d) : %s", gpu_idx, _n, _e, exc_info=True)
+                ba_np = np.array([int(np.random.choice(np.where(na_masks[i])[0])) for i in range(_n)])
+                ap_np = np.zeros((_n, int(cfg.model.max_actions)), dtype=np.float32)
+                av_np = np.zeros(_n, dtype=np.float32)
+
+            # ── Envoyer les résultats aux workers (chaque pipe est écrit par ce thread uniquement) ──
+            for _i, _pidx in enumerate(na_indices):
+                try:
+                    pipes[_pidx].send({
+                        "action_indices": [int(ba_np[_i])],
+                        "search_pol":     ap_np[_i],
+                        "search_val":     float(av_np[_i]),
+                    })
+                except Exception as _e:
+                    logger.error("[GPU%d] Erreur envoi action worker %d : %s", gpu_idx, _pidx, _e)
+
+    # Lancer autant de threads GPU qu'il y a de devices (1 ou 2)
+    gpu_threads = []
+    for _gidx in range(len(_gpu_params)):
+        _t = threading.Thread(target=_gpu_inference_worker, args=(_gidx,), daemon=True,
+                              name=f"gpu-inference-{_gidx}")
+        _t.start()
+        gpu_threads.append(_t)
+        logger.info("[coordinateur] GPU inference thread %d démarré (device: %s)", _gidx, gpu_devices[_gidx])
+
+    # ── Boucle principale : I/O uniquement, pas d'inférence GPU ───────────
     while games_completed < num_games_to_play:
-        need_action_indices = []
-        batched_encs_list = []
-        option_masks_list = []
-        
         active_pipes_list = [pipes[i] for i in range(num_workers) if pipe_meta[i].get("game_active")]
         if not active_pipes_list:
             break
 
-        # Attendre de façon non-bloquante/bloquante efficace qu'au moins un worker soit prêt (timeout de 10s pour faire vivre le coordinateur)
         ready_pipes = list(mp.connection.wait(active_pipes_list, timeout=10.0))
-
-        # Ajouter immédiatement tous les autres workers qui ont également fini leur étape (sans attendre)
         for p in active_pipes_list:
             if p not in ready_pipes and p.poll():
                 ready_pipes.append(p)
@@ -443,20 +526,15 @@ def run_parallel_self_play(
             if status == "need_action":
                 worker_steps[pipe_idx] = msg.get("step_count", 0)
                 tracker.update(current_game_steps=int(np.max(worker_steps)))
+                # → GPU thread se charge de l'inférence et de l'envoi du résultat
+                work_queue.put((pipe_idx, msg["batched_enc"], msg["option_mask"]))
+
             else:
                 tracker.update()
 
-
-            if status == "need_action":
-                need_action_indices.append(pipe_idx)
-                batched_encs_list.append(msg["batched_enc"])
-                option_masks_list.append(msg["option_mask"])
-
-            elif status == "deck_error":
+            if status == "deck_error":
                 deck_errors_count += 1
                 logger.warning(f"[coordinateur] Erreur de deck sur le worker {pipe_idx} : {msg.get('error')}")
-                
-                # Récupération et analyse des cartes sélectionnées pour ce worker (diagnostic)
                 meta = pipe_meta[pipe_idx]
                 for p_idx, ids in [("joueur 0", meta.get("ids0")), ("joueur 1", meta.get("ids1"))]:
                     if ids is not None:
@@ -468,8 +546,6 @@ def run_parallel_self_play(
                             is_ace = int(cid) in ace_spec_ids
                             deck_summary.append(f"{name} (ID: {cid}, count: {count}{', ACE' if is_ace else ''})")
                         logger.info(f"  Deck de {p_idx} impliqué : {', '.join(deck_summary)}")
-
-                # Relancer simplement une nouvelle partie sur ce worker
                 if games_started < num_games_to_play:
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
@@ -479,17 +555,14 @@ def run_parallel_self_play(
             elif status == "game_over":
                 h0, h1 = msg["hist0"], msg["hist1"]
                 completed_histories.extend([h0, h1])
-
                 if not is_seeding:
                     reward_0 = float(h0.game_won or False) * 2 - 1
                     reward_1 = float(h1.game_won or False) * 2 - 1
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids0"], reward_0))
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
-
                 games_completed += 1
                 tracker.update(games_completed=tracker.games_completed + 1)
                 logger.info(f"[coordinateur] Partie completee sur worker {pipe_idx} ! ({games_completed}/{num_games_to_play} completes, {games_started}/{num_games_to_play} lancees)")
-
                 if games_started < num_games_to_play:
                     rng, rng_next = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_next)
@@ -519,74 +592,31 @@ def run_parallel_self_play(
                         processes[idx].kill()
                 except Exception as e:
                     logger.error(f"[coordinateur] Erreur lors de la coupure du worker {idx} : {e}")
-
                 try:
                     pipes[idx].close()
                 except Exception:
                     pass
-
                 parent_conn, child_conn = ctx.Pipe()
                 new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
                 new_p.start()
                 pipes[idx] = parent_conn
                 processes[idx] = new_p
-
                 pipe_meta[idx] = {"game_active": False}
                 last_msg_time[idx] = now
                 worker_steps[idx] = 0
-
                 if games_started < num_games_to_play:
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(idx, rng_restart)
                 else:
                     games_completed += 1
 
-        if need_action_indices:
-            # Alterner entre les GPUs disponibles pour utiliser tous les GPUs
-            dev_idx = _inference_device_idx[0] % len(_gpu_params)
-            _inference_device_idx[0] += 1
-            gpu_params = _gpu_params[dev_idx]
-
-            # Rembourrage (padding) à taille statique `num_workers` pour éviter les recompilations JAX JIT
-            n_actual = len(need_action_indices)
-            padded_encs = list(batched_encs_list)
-            padded_masks = list(option_masks_list)
-            while len(padded_encs) < num_workers:
-                padded_encs.append(batched_encs_list[-1])
-                padded_masks.append(option_masks_list[-1])
-
-            keys = padded_encs[0].keys()
-            batched_enc = {}
-            for k in keys:
-                arr = np.stack([x[k] for x in padded_encs], axis=0)
-                # Transférer les observations directement sur le GPU cible
-                batched_enc[k] = jax.device_put(arr, gpu_devices[dev_idx])
-
-            option_masks = np.stack(padded_masks, axis=0)
-
-            rng, rng_act = jax.random.split(rng)
-            try:
-                best_actions, avg_policies, avg_values = ismcts_action_batched(
-                    network, gpu_params, batched_enc, option_masks, rng_act, cfg
-                )
-            except Exception as e:
-                logger.error("[MCTS] Erreur ismcts_action_batched (batch=%d) : %s", n_actual, e, exc_info=True)
-                # Fallback : action aléatoire parmi les actions valides (en utilisant les masques réels)
-                best_actions = np.array([
-                    int(np.random.choice(np.where(option_masks_list[i])[0]))
-                    for i in range(n_actual)
-                ])
-                avg_policies = np.zeros((n_actual, int(cfg.model.max_actions)), dtype=np.float32)
-                avg_values   = np.zeros(n_actual, dtype=np.float32)
-
-            for idx_in_batch, pipe_idx in enumerate(need_action_indices):
-                pipes[pipe_idx].send({
-                    "action_indices": [int(best_actions[idx_in_batch])],
-                    "search_pol": np.array(avg_policies[idx_in_batch]),
-                    "search_val": float(avg_values[idx_in_batch])
-                })
+    # ── Arrêt propre des GPU threads ──────────────────────────────────────
+    stop_event.set()
+    for _t in gpu_threads:
+        _t.join(timeout=5.0)
 
     return completed_histories, deck_builder_updates, deck_errors_count
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -749,6 +779,7 @@ def train(cfg: Config) -> None:
     _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
 
     from training.activity import tracker
+    tracker.attach_buffer(buffer)  # lecture en direct de len(buffer) dans le heartbeat
     tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
     _start_seeding = time.time()
