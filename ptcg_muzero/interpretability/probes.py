@@ -51,7 +51,7 @@ from env.encoding import GLOBAL_FEAT_DIM
 _probe_logger = logging.getLogger("ptcg_muzero.probes")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Définition des 5 sondes
+# Définition des sondes
 # ─────────────────────────────────────────────────────────────────────────────
 PROBE_DEFS: List[Dict] = [
     {"name": "active_in_ko_range",  "num_classes": 2, "idx": 0},
@@ -59,6 +59,12 @@ PROBE_DEFS: List[Dict] = [
     {"name": "prize_lead",          "num_classes": 3, "idx": 2},
     {"name": "hand_advantage",      "num_classes": 2, "idx": 3},
     {"name": "opp_energy_ready",    "num_classes": 2, "idx": 4},
+    {"name": "opp_bench_attacker_ready", "num_classes": 2, "idx": 5},
+    {"name": "gust_ko_opportunity",      "num_classes": 2, "idx": 6},
+    {"name": "deck_out_risk",            "num_classes": 2, "idx": 7},
+    {"name": "evolution_in_hand",        "num_classes": 2, "idx": 8},
+    {"name": "ko_next_turn_probable",    "num_classes": 2, "idx": 9},
+    {"name": "energy_attachment_available", "num_classes": 2, "idx": 10},
 ]
 NUM_PROBES      = len(PROBE_DEFS)
 MAX_PROBE_CLASS = max(d["num_classes"] for d in PROBE_DEFS)
@@ -213,6 +219,36 @@ def extract_probe_targets(
         energies = opp_poke.get("energies") or []
         targets[4] = int(len(energies) >= 2)
 
+    opp_bench = [p for p in (opp.get("bench") or []) if p is not None]
+    targets[5] = int(any(_pokemon_attack_ready(p) for p in opp_bench))
+    if my_active_list and my_active_list[0] is not None and opp_bench:
+        targets[6] = int(any(
+            _safe_int(p, "hp", 100) <= _estimate_max_damage(my_active_list[0])
+            for p in opp_bench
+        ))
+
+    my_deck = _safe_int(me, "deckCount", -1)
+    opp_deck = _safe_int(opp, "deckCount", -1)
+    if my_deck >= 0 and opp_deck >= 0:
+        targets[7] = int(my_deck <= 5 or opp_deck <= 5)
+
+    board = [p for p in (my_active_list + (me.get("bench") or [])) if p is not None]
+    hand = [c for c in (me.get("hand") or []) if c is not None]
+    if board and hand:
+        targets[8] = int(_has_matching_evolution(board, hand))
+
+    if my_active_list and opp_active_list and my_active_list[0] is not None and opp_active_list[0] is not None:
+        targets[9] = int(
+            _pokemon_attack_ready(my_active_list[0]) and
+            _estimate_max_damage(my_active_list[0]) >= _safe_int(opp_active_list[0], "hp", 100)
+        )
+
+    if me.get("hand") is not None:
+        targets[10] = int(
+            not bool(current.get("energyAttached", False)) and
+            any(_is_energy_card(c) for c in hand)
+        )
+
     return targets
 
 
@@ -237,6 +273,43 @@ def _estimate_max_damage(poke: dict) -> int:
     # L'adversaire a potentiellement une attaque à ~60% de l'HP de n'importe qui
     # C'est une borne supérieure grossière — à affiner avec les données CSV
     return max(60, hp_total // 2)
+
+
+def _pokemon_attack_ready(poke: dict) -> bool:
+    return len(poke.get("energies") or []) >= 2 and _estimate_max_damage(poke) > 0
+
+
+def _card_name(card) -> str:
+    if isinstance(card, dict):
+        return str(card.get("name", card.get("cardName", "")))
+    return str(getattr(card, "name", getattr(card, "cardName", "")))
+
+
+def _has_matching_evolution(board: list, hand: list) -> bool:
+    db = _get_card_db()
+    hand_ids = {_safe_int(c, "id", -1) for c in hand}
+    hand_names = {_card_name(c).lower() for c in hand}
+    for pokemon in board:
+        cid = _safe_int(pokemon, "id", -1)
+        base = db.get(cid)
+        base_name = _card_name(base).lower() if base is not None else _card_name(pokemon).lower()
+        for hid in hand_ids:
+            card = db.get(hid)
+            parent = str(getattr(card, "evolvesFrom", getattr(card, "evolves_from", "")) or "").lower() if card else ""
+            if parent and parent == base_name:
+                return True
+        if base_name and any(base_name in name for name in hand_names):
+            return True
+    return False
+
+
+def _is_energy_card(card) -> bool:
+    keys = ("stage", "category", "type", "cardType")
+    if isinstance(card, dict):
+        text = " ".join(str(card.get(k, "")) for k in keys).lower()
+    else:
+        text = " ".join(str(getattr(card, k, "")) for k in keys).lower()
+    return "energy" in text
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -169,12 +169,13 @@ def cmd_train(args) -> None:
             eta_s = remaining / rate if rate > 0 else 0.0
             eta_str = format_time(eta_s)
 
+            step_str = f"Step: {tracker.current_step} | " if tracker.current_step > 0 else ""
             # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
             if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
-                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
-                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
+                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
+                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
                 )
                 try:
                     dump_all_stacks()
@@ -182,8 +183,8 @@ def cmd_train(args) -> None:
                     logger.error("Impossible de dumper la stack trace : %s", e)
             else:
                 logger.info(
-                    "[heartbeat] Phase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
-                    tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
+                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
+                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
                 )
             
     h_thread = threading.Thread(target=_heartbeat, daemon=True)
@@ -210,7 +211,7 @@ def cmd_eval(args) -> None:
 
     from cards.encoder import CardStaticFeatures
     from models.networks import MuZeroNetwork
-    from models.deck_builder import DeckBuilderNetwork, sample_deck, set_energy_ids, set_ace_spec_ids
+    from models.deck_builder import DeckBuilderNetwork, sample_deck, set_basic_pokemon_ids, set_energy_ids, set_ace_spec_ids
     from training.trainer import make_agent_fn
     from env.wrapper import run_self_play_game
 
@@ -224,6 +225,11 @@ def cmd_eval(args) -> None:
         if "Energy" in card_data._cards[cid].get("stage", "")
     ]
     set_energy_ids(energy_ids)
+    set_basic_pokemon_ids([
+        cid for cid in card_data.card_ids
+        if card_data._cards[cid].get("stage", "").strip().lower()
+        in ("basic pokémon", "basic pokemon")
+    ])
     set_ace_spec_ids(card_data.ace_spec_ids)
 
     network  = MuZeroNetwork(cfg=cfg.model, static_features=static_jax)
@@ -316,10 +322,13 @@ def _load():
     from huggingface_hub import hf_hub_download
     from safetensors.numpy import load_file
     import json, jax, jax.numpy as jnp
+    from export.hub import get_hf_token
 
-    mz_path  = hf_hub_download(HF_REPO, "muzero.safetensors")
-    cfg_path = hf_hub_download(HF_REPO, "config.json")
-    dk_path  = hf_hub_download(HF_REPO, "deck_builder.safetensors")
+    token = get_hf_token()
+
+    mz_path  = hf_hub_download(HF_REPO, "muzero.safetensors", token=token)
+    cfg_path = hf_hub_download(HF_REPO, "config.json", token=token)
+    dk_path  = hf_hub_download(HF_REPO, "deck_builder.safetensors", token=token)
 
     from export.hub import _unflatten_params
     from config import Config
@@ -333,7 +342,7 @@ _mz_params, _dk_params, _cfg = _load()
 
 from cards.encoder import CardStaticFeatures
 from models.networks import MuZeroNetwork
-from models.deck_builder import DeckBuilderNetwork, sample_deck, set_energy_ids
+from models.deck_builder import DeckBuilderNetwork, sample_deck, set_basic_pokemon_ids, set_energy_ids
 import jax, jax.numpy as jnp
 
 _card_data = CardStaticFeatures("/kaggle/input/cards.csv")
@@ -343,6 +352,11 @@ _static = jnp.array(_card_data.feature_matrix(_n))
 _energy_ids = [c for c in _card_data.card_ids
                if "Energy" in _card_data._cards[c].get("stage","")]
 set_energy_ids(_energy_ids)
+set_basic_pokemon_ids([
+    cid for cid in _card_data.card_ids
+    if _card_data._cards[cid].get("stage", "").strip().lower()
+    in ("basic pokémon", "basic pokemon")
+])
 
 _network  = MuZeroNetwork(cfg=_cfg.model, static_features=_static)
 _deck_net = DeckBuilderNetwork(cfg=_cfg.model, static_features=_static)
@@ -446,6 +460,17 @@ def _load_checkpoint(ckpt_path: str | None, cfg: "Config") -> tuple:
             jax.tree_util.tree_map(jax.device_put, data["params"]),
             jax.tree_util.tree_map(jax.device_put, data.get("deck", {})),
         )
+
+    if cfg.hf.enabled and cfg.hf.repo_id:
+        try:
+            from export.hub import load_from_hub
+            logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
+            mz_params, deck_params, _, hf_step = load_from_hub(cfg.hf.repo_id, cfg=cfg)
+            if mz_params:
+                logger.info("Checkpoint HuggingFace Hub chargé avec succès (%s, step=%d)", cfg.hf.repo_id, hf_step)
+                return mz_params, deck_params
+        except Exception as e:
+            logger.warning("Échec du chargement depuis HuggingFace Hub : %s", e)
 
     logger.warning("Aucun checkpoint fourni — paramètres aléatoires.")
     return {}, {}

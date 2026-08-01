@@ -85,11 +85,32 @@ def save_local(
     # ── config.json ───────────────────────────────────────────────────────
     (out_dir / "config.json").write_text(cfg.to_json())
 
+    # ── meta.json ─────────────────────────────────────────────────────────
+    (out_dir / "meta.json").write_text(json.dumps({"step": step}))
+
     # ── model_card.md ─────────────────────────────────────────────────────
     (out_dir / "README.md").write_text(_generate_model_card(cfg, step))
 
     logger.info("Saved checkpoint locally → %s", out_dir)
     return out_dir
+
+
+def get_hf_token(cfg: Config | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
+    """Récupère le token HuggingFace depuis les variables d'environnement ou Kaggle Secrets."""
+    env_var = cfg.hf.token_env_var if (cfg and hasattr(cfg, "hf") and hasattr(cfg.hf, "token_env_var")) else token_env_var
+    token = os.environ.get(env_var, "") or os.environ.get("HF_TOKEN", "") or os.environ.get("HUGGINGFACE_TOKEN", "")
+    if not token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            user_secrets = UserSecretsClient()
+            token = user_secrets.get_secret(env_var)
+            if not token and env_var != "HF_TOKEN":
+                token = user_secrets.get_secret("HF_TOKEN")
+            if token:
+                logger.info("Token HF récupéré depuis Kaggle Secrets.")
+        except Exception:
+            pass
+    return token if token else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,13 +121,15 @@ def push_to_hub(
     deck_params:   dict,
     cfg:           Config,
     step:          int,
-) -> None:
+) -> bool:
     """
     Sauvegarde localement puis pousse vers le Hub.
-    Échoue silencieusement (log de l'erreur) pour ne pas bloquer l'entraînement.
+    Publie d'abord un snapshot immuable puis son pointeur ``latest.json``.
+    Le pointeur n'est écrit qu'après succès du snapshot, afin qu'un lecteur ne
+    puisse jamais charger un mélange de fichiers provenant de deux étapes.
     """
     if not cfg.hf.enabled:
-        return
+        return False
 
     try:
         from huggingface_hub import HfApi, create_repo
@@ -115,27 +138,15 @@ def push_to_hub(
             "huggingface_hub non installé — push désactivé. "
             "Lancez : pip install huggingface_hub"
         )
-        return
+        return False
 
-    token = os.environ.get(cfg.hf.token_env_var, "")
-    if not token:
-        try:
-            from kaggle_secrets import UserSecretsClient
-            user_secrets = UserSecretsClient()
-            token = user_secrets.get_secret(cfg.hf.token_env_var)
-            if token:
-                logger.info("Token HF récupéré depuis Kaggle Secrets.")
-        except ImportError:
-            pass
-        except Exception as e:
-            logger.warning("Échec de la récupération du secret Kaggle: %s", e)
-
+    token = get_hf_token(cfg)
     if not token:
         logger.warning(
             "HF_TOKEN absent (variable '%s' ou Secret Kaggle absent) — push ignoré.",
             cfg.hf.token_env_var,
         )
-        return
+        return False
 
     try:
         # Sauvegarde locale
@@ -162,24 +173,25 @@ def push_to_hub(
             token=token,
         )
 
-        # Met aussi à jour la racine (dernier checkpoint = latest)
-        for fname in ("muzero.safetensors", "deck_builder.safetensors",
-                      "config.json", "README.md"):
-            src = out_dir / fname
-            if src.exists():
-                api.upload_file(
-                    path_or_fileobj=str(src),
-                    path_in_repo=fname,
-                    repo_id=cfg.hf.repo_id,
-                    commit_message=f"Latest — step {step}",
-                    token=token,
-                )
+        # Publish the pointer only after the complete, immutable snapshot is
+        # available on the Hub.  One file/one commit makes this atomic.
+        latest_path = out_dir / "latest.json"
+        latest_path.write_text(json.dumps({"step": step, "path": f"step_{step:07d}"}))
+        api.upload_file(
+            path_or_fileobj=str(latest_path),
+            path_in_repo="latest.json",
+            repo_id=cfg.hf.repo_id,
+            commit_message=f"Latest checkpoint pointer — step {step}",
+            token=token,
+        )
 
         logger.info("✓ Pushed to HuggingFace Hub  repo=%s  step=%d",
                     cfg.hf.repo_id, step)
+        return True
 
     except Exception as exc:
         logger.error("HF push failed (step=%d): %s", step, exc)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,18 +201,30 @@ def load_from_hub(
     repo_id: str,
     step:    int | None = None,
     token:   str | None = None,
-) -> tuple[dict, dict, Config]:
+    cfg:     Config | None = None,
+) -> tuple[dict, dict, Config, int]:
     """
     Télécharge les poids depuis le Hub et retourne
-    (muzero_params, deck_params, cfg).
+    (muzero_params, deck_params, cfg, step).
 
-    Si step=None, charge le dernier checkpoint (racine du repo).
+    Si step=None, charge le snapshot désigné par ``latest.json``. Les anciens
+    dépôts sans pointeur restent compatibles via les fichiers à la racine.
     """
     try:
         from huggingface_hub import hf_hub_download
         from safetensors.numpy import load_file
     except ImportError:
         raise ImportError("Installez : pip install huggingface_hub safetensors")
+
+    if not token:
+        token = get_hf_token(cfg)
+
+    if step is None:
+        try:
+            latest = hf_hub_download(repo_id=repo_id, filename="latest.json", token=token)
+            step = int(json.loads(Path(latest).read_text())["step"])
+        except Exception:
+            logger.warning("latest.json absent : fallback vers le format HF historique à la racine.")
 
     subfolder = f"step_{step:07d}" if step is not None else ""
 
@@ -215,9 +239,17 @@ def load_from_hub(
     dk_path  = _dl("deck_builder.safetensors")
     cfg_path = _dl("config.json")
 
+    step_val = step if step is not None else 0
+    try:
+        meta_path = _dl("meta.json")
+        meta = json.loads(Path(meta_path).read_text())
+        step_val = meta.get("step", step_val)
+    except Exception:
+        pass
+
     mz_flat  = load_file(mz_path)
     dk_flat  = load_file(dk_path)
-    cfg      = Config.from_json(Path(cfg_path).read_text())
+    loaded_cfg = Config.from_json(Path(cfg_path).read_text())
 
     muzero_params = _unflatten_params(mz_flat)
     deck_params   = _unflatten_params(dk_flat)
@@ -225,7 +257,8 @@ def load_from_hub(
     return (
         jax.tree_util.tree_map(jax.device_put, muzero_params),
         jax.tree_util.tree_map(jax.device_put, deck_params),
-        cfg,
+        loaded_cfg,
+        step_val,
     )
 
 

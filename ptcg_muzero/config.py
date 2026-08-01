@@ -41,7 +41,7 @@ class ModelConfig:
     max_prize_size: int = 6
 
     # ── Interpretability ──────────────────────────────────────────────────
-    num_probe_tasks: int = 5
+    num_probe_tasks: int = 11
 
     # ── Deck builder ──────────────────────────────────────────────────────
     num_deck_slots: int = 60
@@ -67,7 +67,9 @@ class TrainConfig:
     gamma: float = 0.997
 
     # ── Optimiser ─────────────────────────────────────────────────────────
-    batch_size: int = 256        # total across all devices
+    # 256 samples required ~19.5 GB per GPU with the current transformer and
+    # MuZero unroll.  64 keeps each of the two replicas at 32 samples.
+    batch_size: int = 64         # total across all devices
     learning_rate: float = 3e-4
     lr_warmup_steps: int = 2_000
     weight_decay: float = 1e-4
@@ -83,6 +85,9 @@ class TrainConfig:
     num_total_steps: int = 500_000
     self_play_interval: int = 100    # global steps between self-play batches
     games_per_self_play: int = 8
+    # Safety bound for a single engine episode.  A normal game is far shorter;
+    # this prevents a non-progressing engine/action loop from stalling training.
+    max_game_steps: int = 2_000
 
     checkpoint_every: int = 1_000
     eval_every: int = 5_000
@@ -92,8 +97,10 @@ class TrainConfig:
     reanalyze_num_simulations: int = 10   # MCTS allégé pour Reanalyze (vs 25 en self-play)
 
     # ── Priority Refresh ───────────────────────────────────────────────────
-    priority_refresh_every: int = 500     # steps entre refreshes globaux du buffer
-    priority_refresh_fraction: float = 0.05  # fraction du buffer recalculée par refresh
+    priority_refresh_every: int = 500     # steps between refreshes
+    priority_refresh_fraction: float = 0.05  # fraction considered per refresh
+    priority_refresh_max_entries: int = 256  # hard bound: attention is O(batch²)
+    priority_refresh_batch_size: int = 32    # GPU micro-batch for the forward pass
 
     # ── Loss weights ──────────────────────────────────────────────────────
     value_loss_weight: float = 0.25

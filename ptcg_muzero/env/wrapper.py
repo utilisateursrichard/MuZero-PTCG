@@ -249,6 +249,11 @@ def run_self_play_game(
         step_count = 0
         while not done:
             step_count += 1
+            if step_count > cfg.train.max_game_steps:
+                raise RuntimeError(
+                    f"Game exceeded max_game_steps={cfg.train.max_game_steps}; "
+                    "aborting a non-progressing self-play episode."
+                )
             your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
             select   = obs_dict.get("select")
             
@@ -451,6 +456,11 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                 while not done:
                     step_count += 1
+                    if step_count > cfg.train.max_game_steps:
+                        raise RuntimeError(
+                            f"Worker game exceeded max_game_steps={cfg.train.max_game_steps}; "
+                            "aborting a non-progressing self-play episode."
+                        )
                     your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
                     select = obs_dict.get("select")
 
@@ -585,4 +595,3 @@ def self_play_worker_fn(pipe, worker_id, cfg):
             break
 
     env.close()
-

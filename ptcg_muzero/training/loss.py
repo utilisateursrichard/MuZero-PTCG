@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import optax
 
 from config import ModelConfig, TrainConfig
-from interpretability.probes import ProbeHeads, probe_loss
+from interpretability.probes import ProbeHeads, probe_accuracy, probe_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,6 +112,7 @@ def muzero_loss(
 
     probe_logits_0 = probe_heads.apply(prb_params, z)
     prb_loss_0, per_probe_0 = probe_loss(probe_logits_0, batch["probe_tgts"][:, 0, :])
+    acc_per_probe_0 = probe_accuracy(probe_logits_0, batch["probe_tgts"][:, 0, :])
 
     # ── 2. Unroll K steps ─────────────────────────────────────────────────
     z_cur = z
@@ -192,7 +193,8 @@ def muzero_loss(
         "loss_probes": total_prb,
         "loss_consistency": consistency_loss,
         "td_error_mean": jnp.mean(td_error),
-        "probe_per_task": per_probe_0,   # [5]
+        "probe_per_task": per_probe_0,   # [NUM_PROBES]
+        "probe_acc_per_task": acc_per_probe_0,  # [NUM_PROBES]
     }
     return total_loss, metrics, td_error
 
@@ -216,11 +218,15 @@ def _policy_loss_per_example(
     logits: jnp.ndarray,
     target: jnp.ndarray,
 ) -> jnp.ndarray:
-    log_pi = jax.nn.log_softmax(logits, axis=-1)
+    # Keeping finite logits in this loss avoids the indeterminate 0 * -inf
+    # when an action has zero target probability.  A genuinely bad (NaN)
+    # activation is still caught by the train-step finite guard.
+    log_pi = jax.nn.log_softmax(jnp.clip(logits, -1e4, 1e4), axis=-1)
     target_sum = jnp.sum(target, axis=-1, keepdims=True)
     safe_target_sum = jnp.where(target_sum > 0, target_sum, 1.0)
     target_norm = jnp.where(target_sum > 0, target / safe_target_sum, target)
-    return -jnp.sum(target_norm * log_pi, axis=-1)
+    terms = jnp.where(target_norm != 0, target_norm * log_pi, 0.0)
+    return -jnp.sum(terms, axis=-1)
 
 
 def _value_loss(
@@ -282,7 +288,7 @@ def collate_batch(
     # target_pol / val : pad or truncate to K+1
     target_pol = np.zeros((B, K + 1, max_actions), dtype=np.float32)
     target_val = np.zeros((B, K + 1), dtype=np.float32)
-    probe_tgts = np.full((B, K + 1, 5), -1, dtype=np.int32)
+    probe_tgts = np.full((B, K + 1, 11), -1, dtype=np.int32)
 
     for i, e in enumerate(entries):
         n = min(len(e.target_pol), K + 1)

@@ -1,0 +1,496 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 3165" width="1000" height="3165">
+
+    <defs>
+        <style>
+            .bg { fill: #0f172a; }
+            .header-title { font-family: system-ui, -apple-system, sans-serif; font-size: 26px; font-weight: 800; fill: #f8fafc; }
+            .header-sub { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; fill: #94a3b8; }
+            .sec-title { font-family: system-ui, -apple-system, sans-serif; font-size: 18px; font-weight: 700; }
+            .card-bg { fill: #1e293b; rx: 8px; ry: 8px; stroke: #334155; stroke-width: 1.5; }
+            .card-name { font-family: system-ui, -apple-system, sans-serif; font-size: 15px; font-weight: 600; fill: #f1f5f9; }
+            .card-detail { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; fill: #94a3b8; }
+            .badge-bg { rx: 12px; ry: 12px; }
+            .badge-txt { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 800; fill: #0f172a; text-anchor: middle; }
+            .id-txt { font-family: monospace; font-size: 12px; fill: #64748b; }
+        </style>
+        <linearGradient id="grad-header" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.2"/>
+            <stop offset="100%" stop-color="#818cf8" stop-opacity="0.05"/>
+        </linearGradient>
+    </defs>
+    
+<rect width="1000" height="3165" class="bg" />
+<rect x="20" y="20" width="960" height="60" rx="10" fill="url(#grad-header)" stroke="#38bdf8" stroke-opacity="0.3" stroke-width="1" />
+<text x="40" y="58" class="header-title">⚡ Deck PTCG MuZero</text>
+<text x="960" y="56" class="header-sub" text-anchor="end">Total cartes : <tspan font-weight="bold" fill="#38bdf8">60</tspan> / 60</text>
+<text x="30" y="120" class="sec-title" fill="#e53e3e">● Pokémon (49)</text>
+<line x1="30" y1="130" x2="970" y2="130" stroke="#e53e3e" stroke-opacity="0.3" stroke-width="2" />
+<g transform="translate(30, 145)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">2x</text>
+<text x="60" y="26" class="card-name">Capsakid</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #925</text>
+</g>
+<g transform="translate(30, 195)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">2x</text>
+<text x="60" y="26" class="card-name">Karrablast</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #487</text>
+</g>
+<g transform="translate(30, 245)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Boltund</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 130 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #808</text>
+</g>
+<g transform="translate(30, 295)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Cynthia's Roserade</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 130 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #342</text>
+</g>
+<g transform="translate(30, 345)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Wugtrio ex ex</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 250 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #52</text>
+</g>
+<g transform="translate(30, 395)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Scrafty</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 120 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #21</text>
+</g>
+<g transform="translate(30, 445)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Mega Starmie ex ex</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 330 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1031</text>
+</g>
+<g transform="translate(30, 495)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Alcremie</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 90 | Type: {P}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #769</text>
+</g>
+<g transform="translate(30, 545)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Nickit</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #690</text>
+</g>
+<g transform="translate(30, 595)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Shinx</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1035</text>
+</g>
+<g transform="translate(30, 645)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Eevee</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 50 | Type: {C}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #43</text>
+</g>
+<g transform="translate(30, 695)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">PalossandEX ex</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 280 | Type: {P}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #223</text>
+</g>
+<g transform="translate(30, 745)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Mega Absol ex ex</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 280 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #687</text>
+</g>
+<g transform="translate(30, 795)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Cynthia's Gabite</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 100 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #380</text>
+</g>
+<g transform="translate(30, 845)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Whirlipede</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 100 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #536</text>
+</g>
+<g transform="translate(30, 895)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Morpeko</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #36</text>
+</g>
+<g transform="translate(30, 945)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Drednaw</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 140 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #158</text>
+</g>
+<g transform="translate(30, 995)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Silcoon</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 90 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #851</text>
+</g>
+<g transform="translate(30, 1045)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Gliscor</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 120 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #821</text>
+</g>
+<g transform="translate(30, 1095)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Mega Heracross ex ex</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 280 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #781</text>
+</g>
+<g transform="translate(30, 1145)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Stunfisk</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 110 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #869</text>
+</g>
+<g transform="translate(30, 1195)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Sneasel</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #825</text>
+</g>
+<g transform="translate(30, 1245)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Team Rocket's Exeggcute ex</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {P}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #873</text>
+</g>
+<g transform="translate(30, 1295)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Litwick</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {R}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #493</text>
+</g>
+<g transform="translate(30, 1345)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Hoothoot</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {C}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #172</text>
+</g>
+<g transform="translate(30, 1395)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Erika's Tangela</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 80 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #915</text>
+</g>
+<g transform="translate(30, 1445)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Cinderace</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 2 Pokémon | HP: 160 | Type: {R}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #666</text>
+</g>
+<g transform="translate(30, 1495)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Shroomish</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #394</text>
+</g>
+<g transform="translate(30, 1545)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Deino</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 80 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #616</text>
+</g>
+<g transform="translate(30, 1595)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Meditite</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #445</text>
+</g>
+<g transform="translate(30, 1645)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Meganium</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 2 Pokémon | HP: 160 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #710</text>
+</g>
+<g transform="translate(30, 1695)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Team Rocket's Tarountula</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 50 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #400</text>
+</g>
+<g transform="translate(30, 1745)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Pachirisu</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #738</text>
+</g>
+<g transform="translate(30, 1795)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Wash Rotom</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 80 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #420</text>
+</g>
+<g transform="translate(30, 1845)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Mamoswine ex ex</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 2 Pokémon | HP: 340 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #283</text>
+</g>
+<g transform="translate(30, 1895)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Honchkrow</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 130 | Type: {D}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #774</text>
+</g>
+<g transform="translate(30, 1945)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Finizen</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 70 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #105</text>
+</g>
+<g transform="translate(30, 1995)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Volcanion</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 130 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1034</text>
+</g>
+<g transform="translate(30, 2045)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Passimian</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 110 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #978</text>
+</g>
+<g transform="translate(30, 2095)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Hop’s Corviknight</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 2 Pokémon | HP: 170 | Type: {M}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #298</text>
+</g>
+<g transform="translate(30, 2145)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Rellor</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 50 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #73</text>
+</g>
+<g transform="translate(30, 2195)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Snover</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 90 | Type: {W}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #418</text>
+</g>
+<g transform="translate(30, 2245)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Trapinch</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #187</text>
+</g>
+<g transform="translate(30, 2295)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Cottonee</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {G}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #560</text>
+</g>
+<g transform="translate(30, 2345)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Bronzor</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {M}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #989</text>
+</g>
+<g transform="translate(30, 2395)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Lycanroc</text>
+<text x="320" y="26" class="card-detail">Stage: Stage 1 Pokémon | HP: 120 | Type: {F}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #287</text>
+</g>
+<g transform="translate(30, 2445)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#e53e3e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Dunsparce</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Pokémon | HP: 60 | Type: {C}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #65</text>
+</g>
+<text x="30" y="2530" class="sec-title" fill="#3182ce">● Dresseurs (Trainers) (10)</text>
+<line x1="30" y1="2540" x2="970" y2="2540" stroke="#3182ce" stroke-opacity="0.3" stroke-width="2" />
+<g transform="translate(30, 2555)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Rescue Board</text>
+<text x="320" y="26" class="card-detail">Stage: Pokémon Tool | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1157</text>
+</g>
+<g transform="translate(30, 2605)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Explorer’s Guidance</text>
+<text x="320" y="26" class="card-detail">Stage: Supporter | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1185</text>
+</g>
+<g transform="translate(30, 2655)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Hand Trimmer</text>
+<text x="320" y="26" class="card-detail">Stage: Item | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1087</text>
+</g>
+<g transform="translate(30, 2705)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Bug Catching Set</text>
+<text x="320" y="26" class="card-detail">Stage: Item | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1094</text>
+</g>
+<g transform="translate(30, 2755)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Battle Cage</text>
+<text x="320" y="26" class="card-detail">Stage: Stadium | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1264</text>
+</g>
+<g transform="translate(30, 2805)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Perilous Jungle</text>
+<text x="320" y="26" class="card-detail">Stage: Stadium | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1243</text>
+</g>
+<g transform="translate(30, 2855)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Brilliant Blender</text>
+<text x="320" y="26" class="card-detail">Stage: Item | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1128</text>
+</g>
+<g transform="translate(30, 2905)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Lana’s Aid</text>
+<text x="320" y="26" class="card-detail">Stage: Supporter | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1184</text>
+</g>
+<g transform="translate(30, 2955)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Ultra Ball</text>
+<text x="320" y="26" class="card-detail">Stage: Item | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1121</text>
+</g>
+<g transform="translate(30, 3005)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#3182ce" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Night Stretcher</text>
+<text x="320" y="26" class="card-detail">Stage: Item | Type: n/a</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #1097</text>
+</g>
+<text x="30" y="3090" class="sec-title" fill="#d69e2e">● Énergies (1)</text>
+<line x1="30" y1="3100" x2="970" y2="3100" stroke="#d69e2e" stroke-opacity="0.3" stroke-width="2" />
+<g transform="translate(30, 3115)">
+<rect width="940" height="42" class="card-bg" />
+<rect x="10" y="8" width="36" height="26" class="badge-bg" fill="#d69e2e" />
+<text x="28" y="25" class="badge-txt">1x</text>
+<text x="60" y="26" class="card-name">Basic {L} Energy</text>
+<text x="320" y="26" class="card-detail">Stage: Basic Energy | Type: {L}</text>
+<text x="920" y="26" class="id-txt" text-anchor="end">ID #4</text>
+</g>
+</svg>

@@ -186,7 +186,7 @@ def _run_single_mcts(
 
     root = mctx.RootFnOutput(
         prior_logits=masked_logits,
-        value=jnp.reshape(root_value, (1,)),   # guarantee shape [1] for mctx
+        value=jnp.atleast_1d(jnp.squeeze(root_value)),   # guarantee shape [B] for mctx
         embedding=root_embedding,
     )
 
@@ -249,45 +249,40 @@ def ismcts_action(
     # z: [N_samples, D], pi_logits: [N_samples, A], v: [N_samples, 1]
     z, pi_logits, v = network.apply(mz_params, jax_obs_batched)
 
-    # Préparer les masques d'option de taille [N_samples, A]
-    mask_jax_batched = jnp.stack([jnp.array(option_mask_np)] * N_samples, axis=0)
+    option_mask_jnp = jnp.array(option_mask_np)
+    mask_jax_batched = jnp.stack([option_mask_jnp] * N_samples, axis=0)
 
-    cfg_tuple = tuple(asdict(cfg.model).items())
-    static_features = network.static_features
+    # 3. Exécution MCTS nativement sur le batch de N_samples (sans vmap)
+    invalid_mask = ~mask_jax_batched
+    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
 
-    # 3. Vectoriser _run_single_mcts sur la dimension batch (axis 0)
-    # JAX va exécuter toutes les simulations MCTS en parallèle sur le GPU
-    vmapped_mcts = jax.vmap(
-        lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
-            mz_params,
-            z_item[None],
-            logits_item[None],
-            jnp.atleast_1d(v_item),   # () or [1] → always [1] for mctx
-            mask_item[None],
-            rng_item,
-            static_features,
-            cfg_tuple=cfg_tuple,
-            max_actions=int(mc.max_actions),
-            num_simulations=int(sc.num_simulations),
-            max_num_considered_actions=int(sc.max_num_considered_actions),
-        ),
-        in_axes=(0, 0, 0, 0, 0)
+    root = mctx.RootFnOutput(
+        prior_logits=masked_logits,
+        value=v,           # [N_samples]
+        embedding=z,       # [N_samples, D]
     )
 
-    # Exécution vectorisée
-    action_weights_batched, node_val_batched = vmapped_mcts(
-        z, pi_logits, v, mask_jax_batched, rng_mcts_keys
+    recurrent_fn = make_recurrent_fn(network, mz_params)
+
+    policy_output = mctx.gumbel_muzero_policy(
+        params=mz_params,
+        rng_key=rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=int(sc.num_simulations),
+        max_num_considered_actions=int(sc.max_num_considered_actions),
+        invalid_actions=invalid_mask,
     )
 
-    # 5. Moyenne sur l'axe des belief samples
-    avg_policy = jnp.mean(action_weights_batched[:, 0, :], axis=0)  # [A]
-    avg_value  = float(jnp.mean(node_val_batched[:, 0, 0]))
+    # 4. Moyenne sur l'axe des belief samples
+    avg_policy = jnp.mean(policy_output.action_weights, axis=0)  # [A]
+    avg_value  = float(jnp.mean(policy_output.search_tree.node_values[:, 0]))
 
     # Appliquer le masque d'options légales
-    avg_policy = jnp.where(
-        jnp.array(option_mask_np), avg_policy, -1e9
+    avg_policy_masked = jnp.where(
+        option_mask_jnp, avg_policy, -1e9
     )
-    best_action = int(jnp.argmax(avg_policy))
+    best_action = int(jnp.argmax(avg_policy_masked))
 
     return best_action, avg_policy, avg_value
 
@@ -373,6 +368,109 @@ def reanalyze_root(
 
 
 
+def _ismcts_action_batched_impl(
+    params: dict,
+    batched_enc_obs: dict,
+    option_masks: jnp.ndarray,
+    rng: jnp.ndarray,
+    network: Any,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_belief_samples: int,
+    max_actions: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    B = option_masks.shape[0]
+    S = num_belief_samples
+
+    mz_params = params["muzero"] if isinstance(params, dict) and "muzero" in params else params
+
+    flat_obs = {}
+    for k, v in batched_enc_obs.items():
+        shape = v.shape
+        flat_obs[k] = jnp.reshape(v, (B * S,) + shape[2:])
+
+    # GPU encoder forward pass
+    z, pi_logits, v = network.apply(mz_params, flat_obs)
+
+    mask_jax_batched = jnp.repeat(option_masks, S, axis=0)
+    invalid_mask = ~mask_jax_batched
+    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
+
+    root = mctx.RootFnOutput(
+        prior_logits=masked_logits,
+        value=v,
+        embedding=z,
+    )
+
+    recurrent_fn = make_recurrent_fn(network, mz_params)
+    rng_mcts, _ = jax.random.split(rng)
+
+    policy_output = mctx.gumbel_muzero_policy(
+        params=mz_params,
+        rng_key=rng_mcts,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        invalid_actions=invalid_mask,
+    )
+
+    action_weights_batched = policy_output.action_weights
+    node_val_batched = policy_output.search_tree.node_values[:, 0]
+
+    policies = jnp.reshape(action_weights_batched, (B, S, max_actions))
+    values = jnp.reshape(node_val_batched, (B, S))
+
+    avg_policies = jnp.mean(policies, axis=1)
+    avg_values = jnp.mean(values, axis=1)
+
+    avg_policies_masked = jnp.where(option_masks, avg_policies, -1e9)
+    best_actions = jnp.argmax(avg_policies_masked, axis=-1)
+
+    return best_actions, avg_policies, avg_values
+
+
+# A Flax module can hold JAX arrays (``static_features`` in MuZeroNetwork).
+# Consequently it is not hashable and cannot be a ``static_argname`` of a
+# jitted function.  Keep the module in the closure instead, and cache the
+# resulting compiled callable for the lifetime of the worker.
+_ISMCTS_BATCHED_JIT_CACHE = {}
+
+
+def _get_ismcts_action_batched_jit(
+    network: Any,
+    num_simulations: int,
+    max_num_considered_actions: int,
+    num_belief_samples: int,
+    max_actions: int,
+):
+    key = (
+        id(network),
+        num_simulations,
+        max_num_considered_actions,
+        num_belief_samples,
+        max_actions,
+    )
+    compiled = _ISMCTS_BATCHED_JIT_CACHE.get(key)
+    if compiled is None:
+        @jax.jit
+        def compiled(params, batched_enc_obs, option_masks, rng):
+            return _ismcts_action_batched_impl(
+                params,
+                batched_enc_obs,
+                option_masks,
+                rng,
+                network=network,
+                num_simulations=num_simulations,
+                max_num_considered_actions=max_num_considered_actions,
+                num_belief_samples=num_belief_samples,
+                max_actions=max_actions,
+            )
+
+        _ISMCTS_BATCHED_JIT_CACHE[key] = compiled
+    return compiled
+
+
 def ismcts_action_batched(
     network,
     params: dict,
@@ -383,66 +481,27 @@ def ismcts_action_batched(
 ) -> Tuple[Any, jnp.ndarray, Any]:
     """
     Runs MCTS on a batch of B games, each with S belief samples.
-    - batched_enc_obs: dict of JAX arrays, shape [B, S, ...]
-    - option_masks_np: array of shape [B, A]
+    JIT-compiled for GPU efficiency.
     """
     import numpy as np
     sc = cfg.search
     mc = cfg.model
-    B = option_masks_np.shape[0]
-    S = int(sc.num_belief_samples)
-
-    # Extraire uniquement les params MuZero (le dict complet contient aussi "probes")
-    mz_params = params["muzero"] if isinstance(params, dict) and "muzero" in params else params
-
-    flat_obs = {}
-    for k, v in batched_enc_obs.items():
-        shape = v.shape
-        flat_obs[k] = jnp.reshape(v, (B * S,) + shape[2:])
-
-    # GPU encoder forward pass — représentation pour tous les (game × belief) en une seule passe
-    z, pi_logits, v = network.apply(mz_params, flat_obs)
 
     option_masks_jnp = jnp.array(option_masks_np)
-    mask_jax_batched = jnp.repeat(option_masks_jnp, S, axis=0)
 
-    rng, rng_mcts = jax.random.split(rng)
-    rng_mcts_keys = jax.random.split(rng_mcts, B * S)
-
-    cfg_tuple = tuple(asdict(cfg.model).items())
-    static_features = network.static_features
-
-    vmapped_mcts = jax.vmap(
-        lambda z_item, logits_item, v_item, mask_item, rng_item: _run_single_mcts(
-            mz_params,
-            z_item[None],
-            logits_item[None],
-            jnp.atleast_1d(v_item),   # () or [1] → always [1] for mctx
-            mask_item[None],
-            rng_item,
-            static_features,
-            cfg_tuple=cfg_tuple,
-            max_actions=int(mc.max_actions),
-            num_simulations=int(sc.num_simulations),
-            max_num_considered_actions=int(sc.max_num_considered_actions),
-        ),
-        in_axes=(0, 0, 0, 0, 0)
+    compiled = _get_ismcts_action_batched_jit(
+        network,
+        int(sc.num_simulations),
+        int(sc.max_num_considered_actions),
+        int(sc.num_belief_samples),
+        int(mc.max_actions),
+    )
+    best_actions, avg_policies, avg_values = compiled(
+        params,
+        batched_enc_obs,
+        option_masks_jnp,
+        rng,
     )
 
-    action_weights_batched, node_val_batched = vmapped_mcts(
-        z, pi_logits, v, mask_jax_batched, rng_mcts_keys
-    )
-
-    policies = jnp.reshape(action_weights_batched[:, 0, :], (B, S, int(mc.max_actions)))
-    values = jnp.reshape(node_val_batched[:, 0, 0], (B, S))
-
-    avg_policies = jnp.mean(policies, axis=1)
-    avg_values = jnp.mean(values, axis=1)
-
-    avg_policies_masked = jnp.where(
-        option_masks_jnp, avg_policies, -1e9
-    )
-    best_actions = np.array(jnp.argmax(avg_policies_masked, axis=-1))
-
-    return best_actions, avg_policies, np.array(avg_values)
+    return np.array(best_actions), np.array(avg_policies), np.array(avg_values)
 

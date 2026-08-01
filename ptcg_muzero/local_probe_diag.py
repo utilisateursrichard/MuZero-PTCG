@@ -22,7 +22,7 @@ import pickle
 from config import Config
 from cards.encoder import CardStaticFeatures
 from models.networks import MuZeroNetwork
-from models.deck_builder import DeckBuilderNetwork, sample_deck, set_energy_ids, set_ace_spec_ids
+from models.deck_builder import DeckBuilderNetwork, sample_deck, set_basic_pokemon_ids, set_energy_ids, set_ace_spec_ids
 from interpretability.probes import ProbeHeads, probe_accuracy, probe_loss, probe_report, extract_probe_targets
 from training.trainer import make_agent_fn
 from env.wrapper import run_self_play_game
@@ -97,6 +97,11 @@ def main():
         if "Energy" in card_data._cards[cid].get("stage", "")
     ]
     set_energy_ids(energy_ids)
+    set_basic_pokemon_ids([
+        cid for cid in card_data.card_ids
+        if card_data._cards[cid].get("stage", "").strip().lower()
+        in ("basic pokémon", "basic pokemon")
+    ])
     set_ace_spec_ids(card_data.ace_spec_ids)
 
     # 4. Initialisation des réseaux Flax

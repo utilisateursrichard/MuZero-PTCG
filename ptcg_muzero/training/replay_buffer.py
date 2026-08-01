@@ -224,6 +224,10 @@ class PrioritizedReplayBuffer:
     ) -> None:
         with self._lock:
             for idx, prio in zip(indices, priorities):
+                # Never let an invalid TD error corrupt the segment trees: a
+                # single NaN there makes subsequent PER sampling undefined.
+                if not np.isfinite(prio):
+                    continue
                 prio = float(max(prio, 1e-6)) ** self._alpha
                 self._max_prio = max(self._max_prio, prio)
                 self._sum_tree.set(int(idx), prio)

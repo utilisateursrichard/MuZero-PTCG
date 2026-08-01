@@ -52,6 +52,10 @@ _BASIC_ENERGY_IDS: List[int] = []
 # Ces IDs sont remplis au démarrage par ``set_ace_spec_ids``
 _ACE_SPEC_IDS: List[int] = []
 
+# IDs of Basic Pokémon.  Filled from the card CSV at startup so sampled decks
+# always satisfy the engine's mandatory-basic-Pokémon rule.
+_BASIC_POKEMON_IDS: List[int] = []
+
 
 def set_energy_ids(ids: List[int]) -> None:
     """Appelé une fois après parsing du CSV."""
@@ -63,6 +67,12 @@ def set_ace_spec_ids(ids: List[int]) -> None:
     """Appelé une fois après parsing du CSV."""
     global _ACE_SPEC_IDS
     _ACE_SPEC_IDS = list(ids)
+
+
+def set_basic_pokemon_ids(ids: List[int]) -> None:
+    """Called once after parsing the card CSV."""
+    global _BASIC_POKEMON_IDS
+    _BASIC_POKEMON_IDS = list(ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +145,7 @@ def sample_deck(
     num_card_ids: int,
     energy_ids: List[int],
     ace_spec_ids: List[int] | None = None,
+    basic_pokemon_ids: List[int] | None = None,
     max_copies_normal: int = MAX_COPIES_NORMAL,
     temperature: float = 1.0,
 ) -> Tuple[List[int], jnp.ndarray]:
@@ -153,6 +164,7 @@ def sample_deck(
 
     energy_set   = set(energy_ids)
     ace_spec_set = set(ace_spec_ids) if ace_spec_ids else set(_ACE_SPEC_IDS)
+    basic_set = set(basic_pokemon_ids) if basic_pokemon_ids is not None else set(_BASIC_POKEMON_IDS)
     counts  = np.zeros(num_card_ids, dtype=np.int32)
     deck    = []
 
@@ -187,6 +199,19 @@ def sample_deck(
         # Si la carte choisie fait partie du set Ace Spec, on verrouille la contrainte globale
         if chosen in ace_spec_set:
             has_ace_spec = True
+
+    # battle_start rejects a deck without a Basic Pokémon.  Enforce that
+    # constraint here instead of wasting an entire self-play worker/retry.
+    if basic_set and not any(cid in basic_set for cid in deck):
+        eligible = [
+            cid for cid in basic_set
+            if 0 < cid < num_card_ids and counts[cid] < max_copies_normal
+        ]
+        if not eligible:
+            raise ValueError("No Basic Pokémon can be added to the sampled deck.")
+        chosen = max(eligible, key=lambda cid: logits_np[cid])
+        counts[deck[-1]] -= 1
+        deck[-1] = chosen
 
     return deck, jnp.array(deck, dtype=jnp.int32)
 
