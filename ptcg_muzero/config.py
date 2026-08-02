@@ -46,6 +46,12 @@ class ModelConfig:
     # ── Deck builder ──────────────────────────────────────────────────────
     num_deck_slots: int = 60
 
+    # ── Value & Reward Categorical Bins ────────────────────────────────────
+    num_value_bins: int = 51
+    value_min: float = -2.5
+    value_max: float = 2.5
+
+
 
 @dataclass
 class SearchConfig:
@@ -63,7 +69,7 @@ class SearchConfig:
 class TrainConfig:
     # ── MuZero unrolling ──────────────────────────────────────────────────
     num_unroll_steps: int = 5
-    td_steps: int = 10
+    td_steps: int = 200
     gamma: float = 0.997
 
     # ── Optimiser ─────────────────────────────────────────────────────────
@@ -81,7 +87,14 @@ class TrainConfig:
     replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
     replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 
+    # ── Representation Freezing & Auto-Unfreezing ─────────────────────────
+    freeze_representation_initially: bool = False
+    unfreeze_w: int = 500         # Fenêtre mémoire W (steps)
+    unfreeze_epsilon: float = 0.01 # Seuil de progression epsilon (1%)
+    unfreeze_s_min: int = 2_000   # Seuil de sécurité S_min (steps)
+
     # ── Training schedule ─────────────────────────────────────────────────
+
     num_total_steps: int = 500_000
     self_play_interval: int = 100    # global steps between self-play batches
     games_per_self_play: int = 8
@@ -129,6 +142,17 @@ class HFConfig:
 
 
 @dataclass
+class WandBConfig:
+    enabled: bool = True
+    project: str = "muzero"
+    entity: str | None = None
+    name: str | None = None
+    mode: str = "online"   # "online", "offline", or "disabled"
+    token_env_var: str = "WANDB_API_KEY"
+    kaggle_secret_name: str = "WANDB"
+
+
+@dataclass
 class InfraConfig:
     num_devices: int = 2         # dual-GPU via jax.pmap
     seed: int = 42
@@ -150,6 +174,7 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     hf: HFConfig = field(default_factory=HFConfig)
+    wandb: WandBConfig = field(default_factory=WandBConfig)
     infra: InfraConfig = field(default_factory=InfraConfig)
 
     # ── Serialisation ─────────────────────────────────────────────────────
@@ -164,6 +189,7 @@ class Config:
             search=SearchConfig(**d["search"]),
             train=TrainConfig(**d["train"]),
             hf=HFConfig(**d["hf"]),
+            wandb=WandBConfig(**d.get("wandb", {})),
             infra=InfraConfig(**d["infra"]),
         )
 

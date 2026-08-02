@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug",    action="store_true",    help="Désactive JIT")
     p.add_argument("--ckpt",     default=None, help="Chemin checkpoint (eval/probe-diag)")
     p.add_argument("--eval-games", type=int, default=None, help="Nb parties d'éval")
+    p.add_argument("--out-dir",  default="submission", help="Dossier de sortie pour la soumission")
+    p.add_argument("--step",     type=int, default=None, help="Numéro d'étape HF spécifique")
     return p
 
 
@@ -169,13 +171,13 @@ def cmd_train(args) -> None:
             eta_s = remaining / rate if rate > 0 else 0.0
             eta_str = format_time(eta_s)
 
-            step_str = f"Step: {tracker.current_step} | " if tracker.current_step > 0 else ""
+            step_str = f"Step: {tracker.current_step} (nouveau: {tracker.new_step}) | " if tracker.current_step > 0 else ""
             # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
             if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
-                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
-                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
+                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | h(s): %s | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
+                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.h_status, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
                 )
                 try:
                     dump_all_stacks()
@@ -183,8 +185,8 @@ def cmd_train(args) -> None:
                     logger.error("Impossible de dumper la stack trace : %s", e)
             else:
                 logger.info(
-                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
-                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
+                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | h(s): %s | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
+                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.h_status, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
                 )
             
     h_thread = threading.Thread(target=_heartbeat, daemon=True)
@@ -244,18 +246,18 @@ def cmd_eval(args) -> None:
         logger.info("Initialisation de paramètres aléatoires pour l'évaluation...")
         from training.trainer import _make_dummy_obs
         from interpretability.probes import ProbeHeads
-        
+
         dummy_obs = _make_dummy_obs(cfg.model)
         batch_obs = {k: jnp.array(v[None]) for k, v in dummy_obs.items()}
         rng, rng_mz, rng_pr, rng_dk = jax.random.split(rng, 4)
-        
+
         if not params:
             probe_heads = ProbeHeads(cfg=cfg.model)
             mz_params = network.init(rng_mz, batch_obs)
-            z_dummy  = jnp.zeros((1, cfg.model.latent_dim))
+            z_dummy = jnp.zeros((1, cfg.model.latent_dim))
             pr_params = probe_heads.init(rng_pr, z_dummy)
             params = {"muzero": mz_params, "probes": pr_params}
-            
+
         if not deck_params:
             dummy_ctx = jnp.zeros((1, cfg.model.latent_dim))
             deck_params = deck_net.init(rng_dk, context=dummy_ctx)
@@ -264,8 +266,7 @@ def cmd_eval(args) -> None:
         rng, rng_d, rng_ag = jax.random.split(rng, 3)
         deck_logits, _ = deck_net.apply(deck_params)
         deck0, _ = sample_deck(deck_logits[0], rng_d, num_card_ids, energy_ids)
-        # Agent 1 : aléatoire
-        deck1 = deck0[:]  # même deck, adversaire aléatoire
+        deck1 = deck0[:]
 
         agent = make_agent_fn(network, params, cfg, rng_ag, train_mode=False)
 
@@ -274,7 +275,6 @@ def cmd_eval(args) -> None:
             n = max(len(opts), 1)
             return [np.random.randint(0, n)], np.ones(cfg.model.max_actions) / cfg.model.max_actions, 0.0
 
-        from env.wrapper import run_self_play_game, GameHistory
         h0, h1 = run_self_play_game(
             (agent, random_agent), deck0, deck1, cfg, np.random.default_rng()
         )
@@ -287,107 +287,251 @@ def cmd_eval(args) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mode : submit  (génère agent.py pour Kaggle)
+# Mode : submit (génère le dossier de soumission Kaggle autonome)
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_submit(args) -> None:
     """
-    Génère un fichier agent_submit.py qui peut être soumis directement
-    sur la compétition Kaggle PTCG.  Il télécharge les poids depuis le Hub.
+    Génère un dossier de soumission autonome pour Kaggle (contenant main.py, deck.csv,
+    les poids safetensors téléchargés depuis HF et les dépendances du projet).
     """
+    import shutil
+    import json
+    from pathlib import Path
+
     cfg = load_config(args)
-    out = Path("agent_submit.py")
-    out.write_text(_SUBMIT_TEMPLATE.format(
-        repo_id=cfg.hf.repo_id,
-        num_card_ids=cfg.model.num_card_ids,
-        latent_dim=cfg.model.latent_dim,
-    ))
-    logger.info("Agent de soumission généré → %s", out)
-    logger.info("Assurez-vous que '%s' est public sur le Hub.", cfg.hf.repo_id)
+    out_dir = Path(getattr(args, "out_dir", None) or "submission")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Préparation du dossier de soumission → %s", out_dir.resolve())
 
+    # 1. Téléchargement ou récupération des poids safetensors (HF Hub ou local)
+    step_num = getattr(args, "step", None)
+    mz_params, dk_params = None, None
+    loaded_cfg = cfg
 
-_SUBMIT_TEMPLATE = '''"""
-PTCG MuZero — agent de soumission Kaggle.
-Générée automatiquement par main.py submit.
-"""
-import glob, sys
-# Replicate the exact path setup from the reference Kaggle notebook:
-#   sys.path.append(glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0])
-_cg_hits = glob.glob('/kaggle/input/**/cg-lib', recursive=True)
-if _cg_hits:
-    sys.path.append(_cg_hits[0])
+    from export.hub import load_from_hub, get_hf_token
+    token = get_hf_token(cfg)
 
-HF_REPO = "{repo_id}"
+    download_success = False
+    if cfg.hf.enabled:
+        logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
+        try:
+            mz_params, dk_params, loaded_cfg, step_val = load_from_hub(
+                repo_id=cfg.hf.repo_id,
+                step=step_num,
+                token=token,
+                cfg=cfg,
+            )
+            download_success = True
+            logger.info("✓ Checkpoint HF chargé avec succès (step=%s)", step_val)
+        except Exception as exc:
+            logger.warning("Impossible de charger depuis le Hub HF : %s", exc)
 
-def _load():
-    from huggingface_hub import hf_hub_download
-    from safetensors.numpy import load_file
-    import json, jax, jax.numpy as jnp
-    from export.hub import get_hf_token
+    # Si le téléchargement HF a échoué ou HF désactivé, chercher les checkpoints locaux
+    if not download_success:
+        logger.info("Recherche de checkpoints locaux dans %s...", cfg.hf.local_dir)
+        local_dir = Path(cfg.hf.local_dir)
+        if local_dir.exists():
+            step_dirs = sorted([d for d in local_dir.glob("step_*") if d.is_dir()])
+            if step_dirs:
+                target_dir = step_dirs[-1]
+                logger.info("Utilisation du checkpoint local le plus récent → %s", target_dir)
+                try:
+                    from safetensors.numpy import load_file
+                    from export.hub import _unflatten_params
+                    mz_path = target_dir / "muzero.safetensors"
+                    dk_path = target_dir / "deck_builder.safetensors"
+                    cfg_path = target_dir / "config.json"
+                    if mz_path.exists():
+                        mz_params = _unflatten_params(load_file(str(mz_path)))
+                        shutil.copy2(mz_path, out_dir / "muzero.safetensors")
+                    if dk_path.exists():
+                        dk_params = _unflatten_params(load_file(str(dk_path)))
+                        shutil.copy2(dk_path, out_dir / "deck_builder.safetensors")
+                    if cfg_path.exists():
+                        loaded_cfg = Config.from_json(cfg_path.read_text())
+                        shutil.copy2(cfg_path, out_dir / "config.json")
+                    download_success = True
+                except Exception as exc:
+                    logger.error("Erreur lors de la lecture des safetensors locaux : %s", exc)
 
-    token = get_hf_token()
+    # Si on a téléchargé depuis HF, sauvegarder/copier les safetensors dans out_dir
+    if download_success and mz_params is not None:
+        try:
+            from huggingface_hub import hf_hub_download
+            subfolder = f"step_{step_val:07d}" if step_val is not None else ""
+            def _dl(filename):
+                return hf_hub_download(
+                    repo_id=cfg.hf.repo_id,
+                    filename=f"{subfolder}/{filename}" if subfolder else filename,
+                    token=token,
+                )
+            try:
+                shutil.copy2(_dl("muzero.safetensors"), out_dir / "muzero.safetensors")
+                shutil.copy2(_dl("deck_builder.safetensors"), out_dir / "deck_builder.safetensors")
+                shutil.copy2(_dl("config.json"), out_dir / "config.json")
+                logger.info("✓ Fichiers safetensors copiés depuis le Hub vers %s", out_dir)
+            except Exception as e:
+                from safetensors.numpy import save_file
+                from export.hub import _flatten_params
+                save_file(_flatten_params(mz_params), str(out_dir / "muzero.safetensors"))
+                save_file(_flatten_params(dk_params, prefix="deck"), str(out_dir / "deck_builder.safetensors"))
+                (out_dir / "config.json").write_text(loaded_cfg.to_json())
+        except Exception as exc:
+            logger.warning("Avertissement lors de la sauvegarde locale des safetensors dans %s: %s", out_dir, exc)
 
-    mz_path  = hf_hub_download(HF_REPO, "muzero.safetensors", token=token)
-    cfg_path = hf_hub_download(HF_REPO, "config.json", token=token)
-    dk_path  = hf_hub_download(HF_REPO, "deck_builder.safetensors", token=token)
+    # 2. Génération de deck.csv
+    card_csv_candidates = [
+        "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv",
+        "/kaggle/input/cards.csv",
+        "competiton/EN_Card_Data.csv",
+        "EN_Card_Data.csv",
+    ]
+    card_csv_path = None
+    for c in card_csv_candidates:
+        if os.path.exists(c):
+            card_csv_path = c
+            break
 
-    from export.hub import _unflatten_params
-    from config import Config
-    cfg = Config.from_json(open(cfg_path).read())
+    deck_generated = False
+    if dk_params is not None and card_csv_path is not None:
+        try:
+            import jax
+            import jax.numpy as jnp
+            from cards.encoder import CardStaticFeatures
+            from models.deck_builder import (
+                DeckBuilderNetwork,
+                sample_deck,
+                set_ace_spec_ids,
+                set_basic_pokemon_ids,
+                set_energy_ids,
+            )
 
-    mz_params  = _unflatten_params(load_file(mz_path))
-    dk_params  = _unflatten_params(load_file(dk_path))
-    return mz_params, dk_params, cfg
+            card_data = CardStaticFeatures(card_csv_path)
+            num_card_ids = max(card_data.max_card_id + 1, loaded_cfg.model.num_card_ids)
+            loaded_cfg.model.num_card_ids = num_card_ids
+            static_feats = jnp.array(card_data.feature_matrix(num_card_ids))
 
-_mz_params, _dk_params, _cfg = _load()
+            energy_ids = [c for c in card_data.card_ids if "Energy" in card_data._cards[c].get("stage", "")]
+            set_energy_ids(energy_ids)
+            set_basic_pokemon_ids([
+                cid for cid in card_data.card_ids
+                if card_data._cards[cid].get("stage", "").strip().lower() in ("basic pokémon", "basic pokemon")
+            ])
+            set_ace_spec_ids(card_data.ace_spec_ids)
 
-from cards.encoder import CardStaticFeatures
-from models.networks import MuZeroNetwork
-from models.deck_builder import DeckBuilderNetwork, sample_deck, set_basic_pokemon_ids, set_energy_ids
-import jax, jax.numpy as jnp
+            deck_net = DeckBuilderNetwork(cfg=loaded_cfg.model, static_features=static_feats)
+            eval_dk_params = dk_params.get("deck", dk_params) if isinstance(dk_params, dict) and "deck" in dk_params else dk_params
+            logits, _ = deck_net.apply(eval_dk_params)
+            rng = jax.random.PRNGKey(42)
+            sampled_deck_ids, _ = sample_deck(logits[0], rng, num_card_ids, energy_ids, temperature=0.1)
 
-_card_data = CardStaticFeatures("/kaggle/input/cards.csv")
-_n = max(_card_data.max_card_id + 1, _cfg.model.num_card_ids)
-_cfg.model.num_card_ids = _n
-_static = jnp.array(_card_data.feature_matrix(_n))
-_energy_ids = [c for c in _card_data.card_ids
-               if "Energy" in _card_data._cards[c].get("stage","")]
-set_energy_ids(_energy_ids)
-set_basic_pokemon_ids([
-    cid for cid in _card_data.card_ids
-    if _card_data._cards[cid].get("stage", "").strip().lower()
-    in ("basic pokémon", "basic pokemon")
-])
+            deck_csv_file = out_dir / "deck.csv"
+            with open(deck_csv_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(str(cid) for cid in sampled_deck_ids) + "\n")
+            logger.info("✓ deck.csv généré avec succès par le DeckBuilder (%d cartes)", len(sampled_deck_ids))
+            deck_generated = True
+        except Exception as exc:
+            logger.warning("Échec de génération du deck par DeckBuilder : %s", exc)
 
-_network  = MuZeroNetwork(cfg=_cfg.model, static_features=_static)
-_deck_net = DeckBuilderNetwork(cfg=_cfg.model, static_features=_static)
+    if not deck_generated:
+        # Fallback sur le deck de référence
+        base_src = Path(__file__).resolve().parent
+        ref_deck_candidates = [
+            base_src.parent / "competiton" / "sample_submission" / "sample_submission" / "deck.csv",
+            base_src.parent / "competiton" / "sample_submission" / "deck.csv",
+            base_src.parent / "deck.csv",
+        ]
+        ref_deck = next((p for p in ref_deck_candidates if p.exists()), None)
+        if ref_deck:
+            shutil.copy2(ref_deck, out_dir / "deck.csv")
+            logger.info("✓ deck.csv copié depuis le deck de référence (%s)", ref_deck)
+        else:
+            logger.error("Aucun deck.csv de référence trouvé!")
 
-_rng = jax.random.PRNGKey(42)
-_logits, _ = _deck_net.apply(_dk_params)
-_deck, _   = sample_deck(_logits[0], _rng, _n, _energy_ids, temperature=0.1)
+    # 3. Copie des modules Python du projet vers out_dir/
+    base_src = Path(__file__).resolve().parent
+    subdirs_to_copy = ["cards", "env", "models", "search", "export"]
+    for s in subdirs_to_copy:
+        src_path = base_src / s
+        dst_path = out_dir / s
+        if src_path.exists():
+            if dst_path.exists():
+                shutil.rmtree(dst_path)
+            shutil.copytree(src_path, dst_path, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
 
-from cg.game import battle_start, battle_select, battle_finish
-from search.ismcts import ismcts_action
-from env.encoding import encode_observation
+    # Copie de config.py
+    shutil.copy2(base_src / "config.py", out_dir / "config.py")
 
-def agent(obs_dict):
-    global _rng
-    _rng, rng_act = jax.random.split(_rng)
-    select  = obs_dict.get("select") or {{}}
-    options = select.get("option", [])
-    if not options:
-        return []
-    enc = encode_observation(obs_dict, obs_dict["current"]["yourIndex"], _cfg.model)
-    mask = enc["option_mask"]
-    best, _, _ = ismcts_action(_network, _mz_params, enc, mask, rng_act, _cfg)
-    max_cnt = int(select.get("maxCount", 1))
-    import numpy as np
-    if max_cnt > 1:
-        return sorted(np.argsort(-np.where(mask, enc["option_mask"].astype(float), -1e9))[:max_cnt].tolist())
-    return [best]
+    # Copie du dossier cg/ (fourni par Kaggle, requis par cg.api)
+    cg_src_candidates = [
+        base_src.parent / "competiton" / "sample_submission" / "sample_submission" / "cg",
+        base_src.parent / "competition" / "sample_submission" / "sample_submission" / "cg",
+        base_src.parent / "cg",
+    ]
+    cg_src = next((p for p in cg_src_candidates if p.exists()), None)
+    if cg_src:
+        cg_dst = out_dir / "cg"
+        if cg_dst.exists():
+            shutil.rmtree(cg_dst)
+        shutil.copytree(cg_src, cg_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        logger.info("✓ dossier cg/ copié dans %s", out_dir)
+    else:
+        logger.warning("dossier cg/ introuvable — à copier manuellement dans %s", out_dir)
 
-def deck_builder():
-    return _deck
-'''
+    logger.info("✓ Code source du projet copié dans %s", out_dir)
+
+    # Vendor mctx (non installé sur Kaggle)
+    mctx_src_candidates = [
+        base_src / "vendor" / "mctx",
+        base_src.parent / "submission" / "mctx",
+    ]
+    mctx_src = next((p for p in mctx_src_candidates if p.is_dir()), None)
+    if mctx_src:
+        # Gère vendor/mctx et vendor/mctx/mctx (structure imbriquée)
+        if (mctx_src / "mctx" / "__init__.py").is_file() and not (mctx_src / "__init__.py").is_file():
+            mctx_src = mctx_src / "mctx"
+        mctx_dst = out_dir / "mctx"
+        if mctx_dst.exists():
+            shutil.rmtree(mctx_dst)
+        shutil.copytree(mctx_src, mctx_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
+        logger.info("✓ mctx/ vendored dans %s", out_dir)
+    else:
+        logger.warning("mctx/ introuvable — exécutez: pip download mctx && unzip dans ptcg_muzero/vendor/mctx")
+
+    # Vendor chex (dépendance obligatoire de mctx, non installé sur Kaggle)
+    chex_src_candidates = [
+        base_src / "vendor" / "chex",
+        base_src.parent / "submission" / "chex",
+    ]
+    chex_src = next((p for p in chex_src_candidates if p.is_dir()), None)
+    if chex_src:
+        # Gère vendor/chex et vendor/chex/chex (structure imbriquée)
+        if (chex_src / "chex" / "__init__.py").is_file() and not (chex_src / "__init__.py").is_file():
+            chex_src = chex_src / "chex"
+        chex_dst = out_dir / "chex"
+        if chex_dst.exists():
+            shutil.rmtree(chex_dst)
+        shutil.copytree(chex_src, chex_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"))
+        logger.info("✓ chex/ vendored dans %s", out_dir)
+    else:
+        logger.warning("chex/ introuvable — mctx en dépend, exécutez: pip download chex && unzip dans ptcg_muzero/vendor/chex")
+
+    # Création des __init__.py manquants (requis par Kaggle qui utilise exec())
+    for s in subdirs_to_copy:
+        init_file = out_dir / s / "__init__.py"
+        if not init_file.exists():
+            init_file.write_text("")
+            logger.info("  créé %s/__init__.py", s)
+
+    # 4. Génération de main.py dans out_dir
+    submit_main = Path(__file__).resolve().parent / "submit_main.py"
+    (out_dir / "main.py").write_text(submit_main.read_text(encoding="utf-8"), encoding="utf-8")
+    logger.info("✓ %s/main.py généré avec succès", out_dir)
+    logger.info("=== Prêt pour soumission Kaggle ===")
+    logger.info("1. Créez un dataset Kaggle avec TOUT le contenu de %s/", out_dir)
+    logger.info("2. Attachez ce dataset à votre notebook de soumission")
+    logger.info("3. Uploadez main.py (+ deck.csv) comme agent Kaggle")
+    logger.info("Pour archiver : tar -czvf submission.tar.gz -C %s .", out_dir)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

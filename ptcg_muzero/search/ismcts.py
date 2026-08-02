@@ -156,40 +156,34 @@ def sample_belief(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main ISMCTS entry point
 # ─────────────────────────────────────────────────────────────────────────────
-@partial(jax.jit, static_argnames=("cfg_tuple", "max_actions", "num_simulations", "max_num_considered_actions"))
-def _run_single_mcts(
+@partial(jax.jit, static_argnames=("cfg_tuple", "num_simulations", "max_num_considered_actions"))
+def _run_batched_mcts_jit(
     params: dict,
-    root_embedding: jnp.ndarray,   # [1, D]
-    prior_logits: jnp.ndarray,     # [1, A]
-    root_value: jnp.ndarray,       # [1]
-    option_mask: jnp.ndarray,      # [1, A] bool
+    z: jnp.ndarray,
+    pi_logits: jnp.ndarray,
+    v: jnp.ndarray,
+    invalid_mask: jnp.ndarray,
     rng: jnp.ndarray,
     static_features: jnp.ndarray,
     *,
     cfg_tuple: tuple,
-    max_actions: int,
     num_simulations: int,
     max_num_considered_actions: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Run Gumbel MuZero search for one determinised world.
-    Returns (policy [1,A], value [1]).
+    Exécute Gumbel MuZero MCTS compilé avec JAX JIT sur un batch de N_samples (belief samples).
+    Retourne (action_weights [N_samples, A], node_values [N_samples]).
     """
     from models.networks import MuZeroNetwork
     model_cfg = ModelConfig(**dict(cfg_tuple))
     network = MuZeroNetwork(cfg=model_cfg, static_features=static_features)
-    recurrent_fn = make_recurrent_fn(network, params)
-
-    # Mask illegal actions: set logits of invalid options to -1e9
-    invalid_mask = ~option_mask           # True where action is INVALID
-    masked_logits = jnp.where(invalid_mask, -1e9, prior_logits)
-
+    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
     root = mctx.RootFnOutput(
         prior_logits=masked_logits,
-        value=jnp.atleast_1d(jnp.squeeze(root_value)),   # guarantee shape [B] for mctx
-        embedding=root_embedding,
+        value=v,
+        embedding=z,
     )
-
+    recurrent_fn = make_recurrent_fn(network, params)
     policy_output = mctx.gumbel_muzero_policy(
         params=params,
         rng_key=rng,
@@ -199,8 +193,7 @@ def _run_single_mcts(
         max_num_considered_actions=max_num_considered_actions,
         invalid_actions=invalid_mask,
     )
-
-    return policy_output.action_weights, policy_output.search_tree.node_values[:, 0:1].T
+    return policy_output.action_weights, policy_output.search_tree.node_values[:, 0]
 
 
 def ismcts_action(
@@ -252,31 +245,26 @@ def ismcts_action(
     option_mask_jnp = jnp.array(option_mask_np)
     mask_jax_batched = jnp.stack([option_mask_jnp] * N_samples, axis=0)
 
-    # 3. Exécution MCTS nativement sur le batch de N_samples (sans vmap)
+    # 3. Exécution MCTS JIT-compilée sur le batch de N_samples
     invalid_mask = ~mask_jax_batched
-    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
+    cfg_tuple = tuple(mc.__dict__.items())
 
-    root = mctx.RootFnOutput(
-        prior_logits=masked_logits,
-        value=v,           # [N_samples]
-        embedding=z,       # [N_samples, D]
-    )
-
-    recurrent_fn = make_recurrent_fn(network, mz_params)
-
-    policy_output = mctx.gumbel_muzero_policy(
-        params=mz_params,
-        rng_key=rng,
-        root=root,
-        recurrent_fn=recurrent_fn,
+    action_weights, node_values = _run_batched_mcts_jit(
+        mz_params,
+        z,
+        pi_logits,
+        v,
+        invalid_mask,
+        rng,
+        network.static_features,
+        cfg_tuple=cfg_tuple,
         num_simulations=int(sc.num_simulations),
         max_num_considered_actions=int(sc.max_num_considered_actions),
-        invalid_actions=invalid_mask,
     )
 
     # 4. Moyenne sur l'axe des belief samples
-    avg_policy = jnp.mean(policy_output.action_weights, axis=0)  # [A]
-    avg_value  = float(jnp.mean(policy_output.search_tree.node_values[:, 0]))
+    avg_policy = jnp.mean(action_weights, axis=0)  # [A]
+    avg_value  = float(jnp.mean(node_values))
 
     # Appliquer le masque d'options légales
     avg_policy_masked = jnp.where(

@@ -48,13 +48,44 @@ OPTION_FEAT_DIM: int = OPTION_TYPE_DIM + AREA_DIM + AREA_DIM + 1 + 1  # = 45
 # ─────────────────────────────────────────────────────────────────────────────
 # Main encoding function
 # ─────────────────────────────────────────────────────────────────────────────
+def _as_dict(obj) -> dict:
+    """Normalise un objet (dict OU dataclass/namedtuple) en dict accesseur par clé.
+
+    Compatible avec les observations reçues depuis le moteur cabt (qui peuvent
+    être des dicts Python purs sur Kaggle OU des dataclasses selon l'appelant).
+    """
+    import dataclasses as _dc
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if _dc.is_dataclass(obj) and not isinstance(obj, type):
+        d = {}
+        for f in _dc.fields(obj):
+            v = getattr(obj, f.name, None)
+            if _dc.is_dataclass(v) and not isinstance(v, type):
+                d[f.name] = _as_dict(v)
+            elif isinstance(v, list):
+                d[f.name] = [
+                    _as_dict(x) if _dc.is_dataclass(x) and not isinstance(x, type) else x
+                    for x in v
+                ]
+            else:
+                d[f.name] = v
+        return d
+    try:
+        return dict(vars(obj))
+    except (TypeError, ValueError):
+        return {}
+
+
 def encode_observation(
-    obs_dict: dict,
+    obs_dict,
     my_idx: int,
     cfg: ModelConfig,
 ) -> Dict[str, np.ndarray]:
     """
-    Convert a cabt observation dict to a dict of fixed-size numpy arrays.
+    Convert a cabt observation dict OR Observation dataclass to fixed-size arrays.
 
     Keys returned
     -------------
@@ -83,10 +114,12 @@ def encode_observation(
     option_feat          float32 [max_actions, OPTION_FEAT_DIM]
     option_mask          bool    [max_actions]
     """
-    current = obs_dict.get("current") or {}
-    select  = obs_dict.get("select")  or {}
+    obs = _as_dict(obs_dict)
+    current = _as_dict(obs.get("current"))
+    select  = _as_dict(obs.get("select"))
 
-    players = current.get("players", [{}, {}])
+    players = current.get("players") or [{}, {}]
+    players = [_as_dict(p) for p in players]
     opp_idx = 1 - my_idx
     me  = players[my_idx] if my_idx < len(players) else {}
     opp = players[opp_idx] if opp_idx < len(players) else {}
@@ -342,36 +375,22 @@ def _encode_options(options: list, cfg: ModelConfig) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_step_reward(logs: list, my_idx: int) -> float:
     """
-    Scan the new logs since the last step and compute a dense reward signal.
-
-    Reward shaping:
-      +0.15  per prize card I take   (I KO'd opponent's Pokémon)
-      -0.15  per prize card opponent takes
-      +1.0   if I win
-      -1.0   if I lose
+    Sparse rewards only:
+      +1.0  if I win
+      -1.0  if I lose
+       0.0  otherwise
     """
-    reward = 0.0
     for log in logs:
         log_type = _int_from(log, "type", -1)
         # LogType.RESULT = 23
         if log_type == 23:
             result = _int_from(log, "result", 2)
             if result == my_idx:
-                reward += 1.0
+                return 1.0
             elif result != 2:      # != draw
-                reward -= 1.0
-        # LogType.MOVE_CARD = 6: prize card moved to hand → prize taken
-        # AreaType.PRIZE = 6, AreaType.HAND = 2
-        if log_type == 6:
-            from_area = _int_from(log, "fromArea", -1)
-            to_area   = _int_from(log, "toArea", -1)
-            p_idx     = _int_from(log, "playerIndex", -1)
-            if from_area == 6 and to_area == 2:   # prize → hand
-                if p_idx == my_idx:
-                    reward += 0.15    # I took a prize
-                else:
-                    reward -= 0.15    # opponent took a prize
-    return float(np.clip(reward, -1.0, 1.0))
+                return -1.0
+    return 0.0
+
 
 
 def _int_from(obj, key: str, default: int) -> int:

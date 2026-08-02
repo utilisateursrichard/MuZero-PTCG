@@ -28,6 +28,7 @@ import os
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -121,36 +122,28 @@ def make_train_step(
     def _step(
         state: train_state.TrainState,
         batch: dict,
-        rng: jnp.ndarray,                           # ← NOUVEAU : clé PRNG
+        rng: jnp.ndarray,
+        freeze_rep: jnp.ndarray,
     ) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
 
         mz_params = state.params["muzero"]
 
         # ── Reanalyze In-Pipeline GPU ───────────────────────────────────────
-        # Chaque device obtient une clé différente via fold_in.
-        # Note : reanalyze_root est appelé en-dehors de loss_fn pour que les
-        # fresh targets ne dépendent pas des params (pas de double gradient).
         rng_device = jax.random.fold_in(rng, jax.lax.axis_index("devices"))
 
         # Extraire l'observation racine (step k=0) — déjà sur le GPU
         obs0 = {k: v[:, 0] for k, v in batch["obs_seq"].items()}  # [B, ...]
 
-        # Forward pass h+f avec les params courants (stop_gradient implicite
-        # car on est hors de la fermeture loss_fn)
         z_root     = network.apply(mz_params, obs0, method=network.represent)
         pi_root, v_root = network.apply(mz_params, z_root, method=network.predict)
 
-        # Approximation du masque d'actions légales depuis les target_pol stockées :
-        # les actions avec target > 0 étaient légales lors de la self-play.
         mask_root = (batch["target_pol"][:, 0] > 0).astype(jnp.bool_)  # [B, A]
 
-        # MCTS Gumbel allégé sur le batch root entier — GPU, natif [B]
         fresh_pol, fresh_val = reanalyze_root(
             mz_params, network, z_root, pi_root, v_root, mask_root,
             rng_device, reanalyze_sims, reanalyze_consider,
         )
 
-        # Remplacement des targets k=0 dans le batch (pas dans loss_fn → pas de gradient)
         batch = {
             **batch,
             "target_pol": batch["target_pol"].at[:, 0].set(jax.lax.stop_gradient(fresh_pol)),
@@ -169,12 +162,27 @@ def make_train_step(
             loss_fn, has_aux=True
         )(state.params)
 
+        # Annulation des gradients de h(s) si gelé
+        def _zero_h_grads(g):
+            if isinstance(g, dict) and "muzero" in g:
+                mz_g = dict(g["muzero"])
+                if "h" in mz_g:
+                    mz_g["h"] = jax.tree_util.tree_map(jnp.zeros_like, mz_g["h"])
+                g = {**g, "muzero": mz_g}
+            return g
+
+        grads = jax.lax.cond(
+            freeze_rep,
+            _zero_h_grads,
+            lambda g: g,
+            grads,
+        )
+
         # Synchronise gradients across devices
         grads = jax.lax.pmean(grads, axis_name="devices")
         loss  = jax.lax.pmean(loss,  axis_name="devices")
 
-        # Never let one non-finite gradient contaminate Adam's moments and,
-        # from there, every model weight.
+        # Never let one non-finite gradient contaminate Adam's moments
         grads_finite = jax.tree_util.tree_reduce(
             lambda ok, x: ok & jnp.all(jnp.isfinite(x)), grads, initializer=True
         )
@@ -192,6 +200,7 @@ def make_train_step(
         return new_state, metrics, td_err
 
     return jax.pmap(_step, axis_name="devices", donate_argnums=(0,))
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,13 +251,48 @@ def create_muzero_train_state(
 
 
 def _merge_params(defaults, loaded):
-    """Conserve les poids restaurés et initialise les feuilles absentes."""
-    if isinstance(defaults, Mapping) and isinstance(loaded, Mapping):
-        return {
-            k: _merge_params(v, loaded[k]) if k in loaded else v
-            for k, v in defaults.items()
-        } | {k: v for k, v in loaded.items() if k not in defaults}
+    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure)."""
+    is_defaults_map = isinstance(defaults, Mapping)
+    is_loaded_map = isinstance(loaded, Mapping)
+
+    if is_defaults_map and is_loaded_map:
+        res = {}
+        for k, v in defaults.items():
+            if k in loaded:
+                res[k] = _merge_params(v, loaded[k])
+            else:
+                res[k] = v
+        for k, v in loaded.items():
+            if k not in defaults:
+                res[k] = v
+        return res
+    elif is_defaults_map != is_loaded_map:
+        logger.warning(
+            "Structure de couche/état incompatible détectée entre modèle et checkpoint ; réinitialisation de cette partie."
+        )
+        return defaults
+
+    is_defaults_seq = isinstance(defaults, (tuple, list))
+    is_loaded_seq = isinstance(loaded, (tuple, list))
+    if is_defaults_seq and is_loaded_seq:
+        if len(defaults) != len(loaded):
+            return defaults
+        merged_elems = [_merge_params(d, l) for d, l in zip(defaults, loaded)]
+        if hasattr(defaults, "_fields"):  # NamedTuple
+            return type(defaults)(*merged_elems)
+        return type(defaults)(merged_elems)
+
+    if hasattr(defaults, "shape") and hasattr(loaded, "shape"):
+        if defaults.shape != loaded.shape:
+            logger.warning(
+                "Incompatibilité de forme détectée pour la couche (modèle %s vs checkpoint %s) ; réinitialisation aléatoire de cette couche.",
+                defaults.shape, loaded.shape
+            )
+            return defaults
+        return loaded
+
     return loaded
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -646,6 +690,140 @@ def run_parallel_self_play(
 
 
 
+PROBE_NAMES = [
+    "active_in_ko_range",
+    "type_advantage",
+    "prize_lead",
+    "hand_advantage",
+    "opp_energy_ready",
+    "opp_bench_attacker_ready",
+    "gust_ko_opportunity",
+    "deck_out_risk",
+    "evolution_in_hand",
+    "ko_next_turn_probable",
+    "energy_attachment_available",
+]
+
+
+def _init_wandb(cfg: Config):
+    if not getattr(cfg, "wandb", None) or not cfg.wandb.enabled:
+        return None
+    import os
+    
+    # 1. Vérifier si un Secret Kaggle existe (nommé 'WANDB')
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        wandb_key = user_secrets.get_secret(cfg.wandb.kaggle_secret_name)
+        if wandb_key:
+            os.environ["WANDB_API_KEY"] = wandb_key
+            logger.info("[wandb] Clé API récupérée depuis le secret Kaggle '%s'", cfg.wandb.kaggle_secret_name)
+    except Exception:
+        pass
+
+    # 2. Fallback si WANDB est défini comme variable d'environnement au lieu de WANDB_API_KEY
+    if not os.environ.get("WANDB_API_KEY") and os.environ.get("WANDB"):
+        os.environ["WANDB_API_KEY"] = os.environ.get("WANDB")
+
+    if not os.environ.get("WANDB_API_KEY"):
+        logger.warning("[wandb] Aucune clé WANDB_API_KEY ou secret Kaggle '%s' trouvé. WandB sera désactivé.", cfg.wandb.kaggle_secret_name)
+        return None
+
+    try:
+        import wandb
+        run = wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.name,
+            config=asdict(cfg),
+            mode=cfg.wandb.mode,
+            reinit=True,
+        )
+        url = run.url if hasattr(run, "url") else ""
+        logger.info("[wandb] wandb.init() réussi ! (project=%s, run_id=%s, url=%s)", cfg.wandb.project, run.id, url)
+        return run
+    except Exception as e:
+        logger.warning("[wandb] Impossible d'initialiser WandB : %s", e)
+        return None
+
+
+def _log_wandb_full_metrics(
+    metrics: dict,
+    buffer,
+    batch_cpu: dict,
+    td_err_flat: np.ndarray,
+    step: int,
+    elapsed: float,
+    rep_frozen: bool,
+    cfg: Config,
+):
+    if not getattr(cfg, "wandb", None) or not cfg.wandb.enabled:
+        return
+    try:
+        import wandb
+        if wandb.run is None:
+            return
+
+        w_dict = {}
+
+        # ── 1. Losses ──────────────────────────────────────────────────────────
+        w_dict["loss/total"]       = float(metrics["loss_total"][0])
+        w_dict["loss/policy"]      = float(metrics["loss_policy"][0])
+        w_dict["loss/value"]       = float(metrics["loss_value"][0])
+        w_dict["loss/reward"]      = float(metrics["loss_reward"][0])
+        w_dict["loss/probes"]      = float(metrics["loss_probes"][0])
+        if "loss_consistency" in metrics:
+            w_dict["loss/consistency"] = float(metrics["loss_consistency"][0])
+
+        # ── 2. TD Error & Priority Stats ───────────────────────────────────────
+        if td_err_flat is not None and len(td_err_flat) > 0:
+            w_dict["td_error/mean"] = float(np.mean(td_err_flat))
+            w_dict["td_error/max"]  = float(np.max(td_err_flat))
+            w_dict["td_error/min"]  = float(np.min(td_err_flat))
+            w_dict["td_error/std"]  = float(np.std(td_err_flat))
+
+        # ── 3. Value Target Distribution Stats ─────────────────────────────────
+        if "target_val" in batch_cpu:
+            v_targets = np.array(batch_cpu["target_val"])
+            w_dict["targets/val_mean"] = float(np.mean(v_targets))
+            w_dict["targets/val_std"]  = float(np.std(v_targets))
+            w_dict["targets/val_min"]  = float(np.min(v_targets))
+            w_dict["targets/val_max"]  = float(np.max(v_targets))
+
+        # ── 4. Detailed Probe Metrics (Per Task) ──────────────────────────────
+        if "probe_per_task" in metrics:
+            p_losses = np.array(metrics["probe_per_task"][0])
+            for i, name in enumerate(PROBE_NAMES):
+                if i < len(p_losses):
+                    w_dict[f"probes_loss/{name}"] = float(p_losses[i])
+
+        if "probe_acc_per_task" in metrics:
+            p_accs = np.array(metrics["probe_acc_per_task"][0]) * 100.0
+            w_dict["probes/accuracy_mean"] = float(np.mean(p_accs))
+            for i, name in enumerate(PROBE_NAMES):
+                if i < len(p_accs):
+                    w_dict[f"probes_acc/{name}"] = float(p_accs[i])
+
+        # ── 5. Replay Buffer Stats ─────────────────────────────────────────────
+        w_dict["buffer/size"] = len(buffer)
+        if hasattr(buffer, "_sum_tree"):
+            total_prio = float(buffer._sum_tree.query_all())
+            w_dict["buffer/total_priority"] = total_prio
+            w_dict["buffer/avg_priority"]   = total_prio / max(len(buffer), 1)
+        if hasattr(buffer, "get_max_priority"):
+            w_dict["buffer/max_priority"]   = float(buffer.get_max_priority())
+
+        # ── 6. Performance & System Metrics ────────────────────────────────────
+        w_dict["perf/step_time_sec"] = elapsed
+        w_dict["perf/steps_per_sec"] = 1.0 / (elapsed + 1e-8)
+        w_dict["perf/rep_frozen"]    = 1.0 if rep_frozen else 0.0
+
+        wandb.log(w_dict, step=step)
+
+    except Exception as e:
+        logger.debug("[wandb] Erreur lors du log étendu : %s", e)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Boucle principale
 # ─────────────────────────────────────────────────────────────────────────────
@@ -656,6 +834,8 @@ def train(cfg: Config) -> None:
 
     Path(cfg.infra.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.infra.log_dir).mkdir(parents=True, exist_ok=True)
+
+    _init_wandb(cfg)
 
     # ── 1. Card data ──────────────────────────────────────────────────────
     card_data    = CardStaticFeatures(cfg.infra.card_csv)
@@ -745,7 +925,9 @@ def train(cfg: Config) -> None:
     latest_path = Path(cfg.infra.checkpoint_dir) / "ckpt_latest.pkl"
     start_step = 0
     loaded_params = None
+    loaded_opt_state = None
     loaded_deck_params = None
+    loaded_deck_opt_state = None
 
     # 1. Tenter de charger le dernier modèle depuis HF Hub si activé
     if cfg.hf.enabled and cfg.hf.repo_id:
@@ -771,7 +953,9 @@ def train(cfg: Config) -> None:
             if loaded_params is None or local_step > start_step:
                 start_step = local_step
                 loaded_params = ckpt_data["params"]
+                loaded_opt_state = ckpt_data.get("opt_state", None)
                 loaded_deck_params = ckpt_data.get("deck", {})
+                loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
                 logger.info("=== Reprise depuis le checkpoint local plus récent : %s (étape %d) ===", latest_path, start_step)
             elif loaded_params is not None:
                 logger.info("=== Checkpoint local (étape %d) <= HF Hub (étape %d). Conservation des poids HF Hub. ===", local_step, start_step)
@@ -781,9 +965,26 @@ def train(cfg: Config) -> None:
     if loaded_params is not None:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
         params_jax = jax.tree_util.tree_map(jax.device_put, loaded_params)
-        # Les anciens checkpoints n'ont pas les nouvelles têtes de sondes.
         params_jax = _merge_params(state.params, params_jax)
-        state = state.replace(params=params_jax)
+        state = state.replace(params=params_jax, step=jnp.array(start_step, dtype=jnp.int32))
+
+        fresh_opt_state = state.tx.init(params_jax)
+        if loaded_opt_state is not None:
+            try:
+                opt_state_jax = jax.tree_util.tree_map(jax.device_put, loaded_opt_state)
+                opt_state_merged = _merge_params(fresh_opt_state, opt_state_jax)
+                # Validation de compatibilité du PyTree avec les gradients du nouveau modèle
+                jax.tree.map(lambda a, b: None, fresh_opt_state, opt_state_merged)
+                state = state.replace(opt_state=opt_state_merged)
+                logger.info("=== État de l'optimiseur MuZero restauré et fusionné avec succès à l'étape %d ===", start_step)
+            except Exception as e:
+                logger.warning(
+                    "État d'optimiseur du checkpoint incompatible avec la nouvelle architecture (%s). Réinitialisation propre de l'optimiseur à l'étape %d.",
+                    e, start_step
+                )
+                state = state.replace(opt_state=fresh_opt_state)
+        else:
+            state = state.replace(opt_state=fresh_opt_state)
     else:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
 
@@ -791,7 +992,15 @@ def train(cfg: Config) -> None:
         if isinstance(loaded_deck_params, dict) and "deck" in loaded_deck_params and len(loaded_deck_params) == 1:
             loaded_deck_params = loaded_deck_params["deck"]
         deck_params = jax.tree_util.tree_map(jax.device_put, loaded_deck_params)
-        deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
+        if loaded_deck_opt_state is not None:
+            try:
+                deck_opt_state = jax.tree_util.tree_map(jax.device_put, loaded_deck_opt_state)
+                logger.info("=== État de l'optimiseur deck builder restauré avec succès ===")
+            except Exception as e:
+                logger.warning("Impossible de restaurer l'état de l'optimiseur deck builder : %s", e)
+                deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
+        else:
+            deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
         deck_baseline = 0.0
     else:
         deck_params, deck_opt_state, deck_baseline = create_deck_train_state(
@@ -813,7 +1022,7 @@ def train(cfg: Config) -> None:
     rng, rng_selfplay = jax.random.split(rng)
     _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
 
-    from training.activity import tracker
+    from training.activity import tracker, format_h_status
     tracker.attach_buffer(buffer)  # lecture en direct de len(buffer) dans le heartbeat
     tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
@@ -871,23 +1080,38 @@ def train(cfg: Config) -> None:
     logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
 
     # ── 8. Main training loop ─────────────────────────────────────────────
+    import collections
     global_step = 0
     t0 = time.time()
     total_transitions_since_last_push = 0
+    rep_frozen = getattr(cfg.train, "freeze_representation_initially", True)
+    loss_window = collections.deque(maxlen=getattr(cfg.train, "unfreeze_w", 500))
+
+    tracker.update(start_step=start_step, rep_frozen=rep_frozen)
+
+    if rep_frozen:
+        logger.info(
+            "[train] h(s) (RepresentationNetwork) gelé initialement. Dégel automatique activé "
+            "(W=%d, epsilon=%.1f%%, S_min=%d steps nouveaux).",
+            getattr(cfg.train, "unfreeze_w", 500),
+            getattr(cfg.train, "unfreeze_epsilon", 0.01) * 100.0,
+            getattr(cfg.train, "unfreeze_s_min", 2000),
+        )
 
     for step in range(start_step, cfg.train.num_total_steps):
         global_step = step
+        new_step = step - start_step
 
         # ── a. Self-play ──────────────────────────────────────────────────
         if step % cfg.train.self_play_interval == 0:
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
             
             # Enregistrer immédiatement le modèle entraîné courant pour la suite
-            _save_checkpoint(state, deck_params, cfg, step, force_latest_only=True)
+            _save_checkpoint(state, deck_params, cfg, step, force_latest_only=True, deck_opt_state=deck_opt_state)
             
             rng, rng_sp = jax.random.split(rng)
             
-            tracker.update(phase=f"Self-Play Step {step}")
+            tracker.update(phase=f"Self-Play Step {step} (nouveau: {new_step})")
 
             n_games = cfg.train.games_per_self_play
             t_sp_start = time.time()
@@ -939,9 +1163,14 @@ def train(cfg: Config) -> None:
         rng_step_replicated = jnp.broadcast_to(
             rng_step[None], (cfg.infra.num_devices,) + rng_step.shape
         )
+        rep_frozen_replicated = jnp.broadcast_to(
+            jnp.array(rep_frozen, dtype=jnp.bool_), (cfg.infra.num_devices,)
+        )
 
         t_step_start = time.time()
-        state, metrics, td_errs = train_step_fn(state, batch_sharded, rng_step_replicated)
+        state, metrics, td_errs = train_step_fn(
+            state, batch_sharded, rng_step_replicated, rep_frozen_replicated
+        )
         tracker.train_step_times.append(time.time() - t_step_start)
 
         if float(metrics["update_is_finite"][0]) == 0.0:
@@ -950,6 +1179,46 @@ def train(cfg: Config) -> None:
                 step,
             )
             continue
+
+        # ── Contrôleur de dégel automatique (Split-Window Plateau Detection) ──
+        loss_val = float(metrics["loss_total"][0])
+        loss_window.append(loss_val)
+
+        w_size = getattr(cfg.train, "unfreeze_w", 500)
+        s_min = getattr(cfg.train, "unfreeze_s_min", 2000)
+        eps = getattr(cfg.train, "unfreeze_epsilon", 0.01)
+
+        current_gain = None
+        if rep_frozen and len(loss_window) == w_size:
+            w_list = list(loss_window)
+            half_w = w_size // 2
+            m_ancien = float(np.mean(w_list[:half_w]))
+            m_recent = float(np.mean(w_list[half_w:]))
+            current_gain = (m_ancien - m_recent) / (m_ancien + 1e-8)
+
+            if new_step >= s_min and current_gain < eps:
+                rep_frozen = False
+                logger.info("=========================================================================")
+                logger.info(
+                    "[train] Plateau de loss détecté (M_ancien=%.4f, M_récent=%.4f, Gain=%.2f%% < %.1f%%) à l'étape %d (nouveau: %d).",
+                    m_ancien, m_recent, current_gain * 100.0, eps * 100.0, step, new_step
+                )
+                logger.info("[train] Dégel automatique de h(s) (RepresentationNetwork) ! Début du fine-tuning global.")
+                logger.info("=========================================================================")
+
+        h_status = format_h_status(
+            step=step,
+            start_step=start_step,
+            rep_frozen=rep_frozen,
+            loss_window_len=len(loss_window),
+            w_size=w_size,
+            s_min=s_min,
+            eps=eps,
+            current_gain=current_gain,
+            avg_step_time=tracker.avg_train_step_time,
+        )
+
+        tracker.update(step=step, rep_frozen=rep_frozen, h_status=h_status)
 
         # Update priorities (TD error basé sur les fresh targets Reanalyze)
         td_err_flat = np.array(unshard(td_errs))
@@ -960,32 +1229,38 @@ def train(cfg: Config) -> None:
             _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], state.params)["muzero"]
             _refresh_buffer_priorities(buffer, network, _params_cpu_mz, cfg)
 
-
         # ── c. Logging ────────────────────────────────────────────────────
         if step % 100 == 0:
             m = {k: float(v[0]) for k, v in metrics.items()
                  if not hasattr(v, '__len__') or v.ndim == 0 or
                  (hasattr(v, 'shape') and v.shape == (cfg.infra.num_devices,))}
             elapsed = time.time() - t0
+            prb_acc_mean = float(np.mean(metrics.get("probe_acc_per_task", [np.zeros(11)])[0])) * 100.0
             logger.info(
-                "step=%d  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
-                "prb=%.4f  buf=%d  %.1fs",
+                "step=%d (nouveau:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
+                "prb=%.4f (acc=%.1f%%)  buf=%d  h(s)=%s  %.1fs",
                 step,
+                new_step,
                 float(metrics["loss_total"][0]),
                 float(metrics["loss_policy"][0]),
                 float(metrics["loss_value"][0]),
                 float(metrics["loss_reward"][0]),
                 float(metrics["loss_probes"][0]),
+                prb_acc_mean,
                 len(buffer),
+                h_status,
                 elapsed,
             )
-            # Probe accuracy
-            _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
+            # Detailed per-probe loss and accuracy breakdown
             _log_probe_metrics(metrics, cfg)
+
+            _log_wandb_full_metrics(
+                metrics, buffer, batch_cpu, td_err_flat, step, elapsed, rep_frozen, cfg
+            )
 
         # ── d. Checkpoint & HF push ───────────────────────────────────────
         if step % cfg.train.checkpoint_every == 0 and step > 0:
-            _save_checkpoint(state, deck_params, cfg, step)
+            _save_checkpoint(state, deck_params, cfg, step, deck_opt_state=deck_opt_state)
             
             if cfg.hf.enabled:
                 _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
@@ -994,7 +1269,7 @@ def train(cfg: Config) -> None:
                     logger.error("[hf-push] Snapshot %d non confirmé sur HF.", step)
 
     # Final checkpoint
-    _save_checkpoint(state, deck_params, cfg, global_step)
+    _save_checkpoint(state, deck_params, cfg, global_step, deck_opt_state=deck_opt_state)
     if cfg.hf.enabled:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
         logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
@@ -1117,19 +1392,37 @@ def _make_dummy_obs(cfg) -> dict:
     }
 
 
-def _save_checkpoint(state, deck_params, cfg: Config, step: int, force_latest_only: bool = False):
+def _save_checkpoint(state, deck_params, cfg: Config, step: int, force_latest_only: bool = False, deck_opt_state=None):
     import pickle
     params_cpu = jax.tree_util.tree_map(lambda x: np.array(x[0]), state.params)
-    
+    opt_state_cpu = jax.tree_util.tree_map(
+        lambda x: np.array(x[0]) if hasattr(x, "__getitem__") and hasattr(x, "shape") and len(x.shape) > 0 else x,
+        state.opt_state
+    )
+    deck_opt_state_cpu = None
+    if deck_opt_state is not None:
+        deck_opt_state_cpu = jax.tree_util.tree_map(
+            lambda x: np.array(x) if isinstance(x, (np.ndarray, jax.Array)) else x,
+            deck_opt_state
+        )
+
+    ckpt_data = {
+        "step": step,
+        "params": params_cpu,
+        "opt_state": opt_state_cpu,
+        "deck": deck_params,
+        "deck_opt_state": deck_opt_state_cpu,
+    }
+
     if not force_latest_only:
         path = Path(cfg.infra.checkpoint_dir) / f"ckpt_{step:07d}.pkl"
         with open(path, "wb") as f:
-            pickle.dump({"step": step, "params": params_cpu, "deck": deck_params}, f)
+            pickle.dump(ckpt_data, f)
         logger.info("Checkpoint saved: %s", path)
         
     latest_path = Path(cfg.infra.checkpoint_dir) / "ckpt_latest.pkl"
     with open(latest_path, "wb") as f:
-        pickle.dump({"step": step, "params": params_cpu, "deck": deck_params}, f)
+        pickle.dump(ckpt_data, f)
     logger.info("Latest checkpoint updated: %s", latest_path)
 
 
@@ -1137,9 +1430,11 @@ def _log_probe_metrics(metrics: dict, cfg: Config):
     try:
         per_probe = np.array(metrics["probe_per_task"][0])
         acc_per_probe = np.array(metrics.get("probe_acc_per_task", [np.zeros_like(per_probe)])[0])
+        from interpretability.probes import PROBE_DEFS
+        logger.info("  ── Probe Accuracy Breakdown ──")
         for i, val in enumerate(per_probe):
-            from interpretability.probes import PROBE_DEFS
             acc = float(acc_per_probe[i]) if i < len(acc_per_probe) else 0.0
-            logger.info("  probe[%-30s] loss=%.4f  acc=%.1f%%", PROBE_DEFS[i]["name"], float(val), acc * 100.0)
-    except Exception:
-        pass
+            name = PROBE_DEFS[i]["name"] if i < len(PROBE_DEFS) else f"probe_{i}"
+            logger.info("    [%-30s] loss=%.4f  accuracy=%5.1f%%", name, float(val), acc * 100.0)
+    except Exception as e:
+        logger.debug("Failed to log probe metrics: %s", e)

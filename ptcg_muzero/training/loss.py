@@ -98,7 +98,7 @@ def muzero_loss(
     # ── 1. Encode root (step k=0) ─────────────────────────────────────────
     # z[:,0,:] est déjà dans z_all — pas de second encodage
     z    = z_all[:, 0, :]                                          # [B, D]
-    pi_logits, v = network.apply(mz_params, z, method=network.predict)
+    pi_logits, v_scalar_0, v_logits_0 = network.apply(mz_params, z, method=network.predict_full)
 
     total_pol_ex = jnp.zeros((B,), dtype=jnp.float32)
     total_val_ex = jnp.zeros((B,), dtype=jnp.float32)
@@ -106,7 +106,10 @@ def muzero_loss(
 
     # k=0 : policy + value (no reward at root)
     pol_loss_0 = _policy_loss_per_example(pi_logits, batch["target_pol"][:, 0, :])
-    val_loss_0 = _value_loss_per_example(v, batch["target_val"][:, 0])
+    val_loss_0 = _categorical_loss_per_example(
+        v_logits_0, batch["target_val"][:, 0],
+        cfg_model.num_value_bins, cfg_model.value_min, cfg_model.value_max,
+    )
     total_pol_ex += pol_loss_0
     total_val_ex += val_loss_0
 
@@ -120,17 +123,23 @@ def muzero_loss(
     def unroll_step(z_in, k):
         action_onehot  = batch["action_seq"][:, k, :]          # [B, A]
 
-        reward_pred, z_next = network.apply(
+        reward_pred, reward_logits, z_next = network.apply(
             mz_params, z_in, action_onehot,
-            method=network.dynamics,
+            method=network.dynamics_full,
         )
-        pi_k, v_k = network.apply(mz_params, z_next, method=network.predict)
+        pi_k, v_k_scalar, v_k_logits = network.apply(mz_params, z_next, method=network.predict_full)
 
         pol_loss_k = _policy_loss_per_example(
             pi_k, batch["target_pol"][:, k + 1, :]
         )
-        val_loss_k = _value_loss_per_example(v_k, batch["target_val"][:, k + 1])
-        rew_loss_k = _reward_loss_per_example(reward_pred, batch["reward_seq"][:, k])
+        val_loss_k = _categorical_loss_per_example(
+            v_k_logits, batch["target_val"][:, k + 1],
+            cfg_model.num_value_bins, cfg_model.value_min, cfg_model.value_max,
+        )
+        rew_loss_k = _categorical_loss_per_example(
+            reward_logits, batch["reward_seq"][:, k],
+            cfg_model.num_value_bins, cfg_model.value_min, cfg_model.value_max,
+        )
 
         # EfficientZero Consistency Loss (vectorisée) :
         # La cible est proj_all[:,k+1] — pré-calculée et stop_gradient avant le scan.
@@ -147,7 +156,7 @@ def muzero_loss(
         target_norm = target_proj / (jnp.linalg.norm(target_proj, axis=-1, keepdims=True) + eps)
         consistency_loss_k = - jnp.sum(pred_norm * target_norm, axis=-1)
 
-        return z_next, (pol_loss_k, val_loss_k, rew_loss_k, consistency_loss_k, pi_k, v_k, z_next)
+        return z_next, (pol_loss_k, val_loss_k, rew_loss_k, consistency_loss_k, pi_k, v_k_scalar, z_next)
 
     # Use lax.scan for unrolling — avoids Python-level loop in JIT
     _, (pol_losses, val_losses, rew_losses, consistency_losses, _, _, zs) = jax.lax.scan(
@@ -183,7 +192,7 @@ def muzero_loss(
     )
 
     # TD-error for priority update (absolute value error on value at root)
-    td_error = jnp.abs(v - batch["target_val"][:, 0])
+    td_error = jnp.abs(v_scalar_0 - batch["target_val"][:, 0])
 
     metrics = {
         "loss_total":  total_loss,
@@ -229,32 +238,88 @@ def _policy_loss_per_example(
     return -jnp.sum(terms, axis=-1)
 
 
-def _value_loss(
-    pred:   jnp.ndarray,   # [B]  scalar in [-1, 1] (tanh output)
-    target: jnp.ndarray,   # [B]
+def _scalar_to_categorical(
+    target: jnp.ndarray,       # [...]
+    num_bins: int = 51,
+    v_min: float = -2.5,
+    v_max: float = 2.5,
 ) -> jnp.ndarray:
-    return jnp.mean(_value_loss_per_example(pred, target))
+    """
+    Encodes continuous scalar targets into 2-hot soft probability distributions
+    over `num_bins` discrete bins via linear interpolation (HL-Gauss style).
+    """
+    v_clipped = jnp.clip(target, v_min, v_max)
+    step = (v_max - v_min) / (num_bins - 1)
+
+    idx_float = (v_clipped - v_min) / step
+    lower_idx = jnp.floor(idx_float).astype(jnp.int32)
+    lower_idx = jnp.clip(lower_idx, 0, num_bins - 2)
+    upper_idx = lower_idx + 1
+
+    weight_upper = jnp.clip(idx_float - lower_idx.astype(jnp.float32), 0.0, 1.0)
+    weight_lower = 1.0 - weight_upper
+
+    lower_onehot = jax.nn.one_hot(lower_idx, num_bins)
+    upper_onehot = jax.nn.one_hot(upper_idx, num_bins)
+
+    return lower_onehot * weight_lower[..., None] + upper_onehot * weight_upper[..., None]
+
+
+def _categorical_loss_per_example(
+    logits: jnp.ndarray,       # [..., num_bins]
+    target: jnp.ndarray,       # [...] scalar
+    num_bins: int = 51,
+    v_min: float = -2.5,
+    v_max: float = 2.5,
+) -> jnp.ndarray:
+    """
+    Cross-entropy loss between predicted categorical logits and 2-hot encoded targets.
+    """
+    labels = _scalar_to_categorical(target, num_bins, v_min, v_max)
+    log_probs = jax.nn.log_softmax(jnp.clip(logits, -1e4, 1e4), axis=-1)
+    return -jnp.sum(labels * log_probs, axis=-1)
+
+
+
+def _value_loss(
+    pred_logits: jnp.ndarray,   # [B, num_bins]
+    target: jnp.ndarray,        # [B]
+    num_bins: int = 31,
+    v_min: float = -1.2,
+    v_max: float = 1.2,
+) -> jnp.ndarray:
+    return jnp.mean(_categorical_loss_per_example(pred_logits, target, num_bins, v_min, v_max))
 
 
 def _value_loss_per_example(
-    pred:   jnp.ndarray,
+    pred_logits: jnp.ndarray,
     target: jnp.ndarray,
+    num_bins: int = 31,
+    v_min: float = -1.2,
+    v_max: float = 1.2,
 ) -> jnp.ndarray:
-    return (pred - jnp.clip(target, -1.0, 1.0)) ** 2
+    return _categorical_loss_per_example(pred_logits, target, num_bins, v_min, v_max)
 
 
 def _reward_loss(
-    pred:   jnp.ndarray,   # [B]
-    target: jnp.ndarray,   # [B]
+    pred_logits: jnp.ndarray,   # [B, num_bins]
+    target: jnp.ndarray,        # [B]
+    num_bins: int = 31,
+    v_min: float = -1.2,
+    v_max: float = 1.2,
 ) -> jnp.ndarray:
-    return jnp.mean(_reward_loss_per_example(pred, target))
+    return jnp.mean(_categorical_loss_per_example(pred_logits, target, num_bins, v_min, v_max))
 
 
 def _reward_loss_per_example(
-    pred:   jnp.ndarray,
+    pred_logits: jnp.ndarray,
     target: jnp.ndarray,
+    num_bins: int = 31,
+    v_min: float = -1.2,
+    v_max: float = 1.2,
 ) -> jnp.ndarray:
-    return (pred - jnp.clip(target, -1.0, 1.0)) ** 2
+    return _categorical_loss_per_example(pred_logits, target, num_bins, v_min, v_max)
+
 
 
 def _weighted_mean(values: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:

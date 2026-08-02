@@ -32,7 +32,7 @@ from config import ModelConfig, TrainConfig
 # Segment tree (min + sum) pour PER
 # ─────────────────────────────────────────────────────────────────────────────
 class SegmentTree:
-    """Segment tree supporting sum and min queries in O(log N)."""
+    """Segment tree supporting sum, min, and max queries in O(log N)."""
 
     def __init__(self, capacity: int, reduction: str = "sum") -> None:
         self._capacity = capacity
@@ -40,14 +40,21 @@ class SegmentTree:
         while self._size < capacity:
             self._size *= 2
         self._tree = np.zeros(2 * self._size, dtype=np.float64)
-        self._reduction = np.add if reduction == "sum" else np.minimum
-        if reduction == "min":
+        if reduction == "sum":
+            self._reduction = np.add
+        elif reduction == "min":
+            self._reduction = np.minimum
             self._tree[:] = np.inf
+        elif reduction == "max":
+            self._reduction = np.maximum
+            self._tree[:] = -np.inf
 
     def _reduce(self, a, b):
         if self._reduction is np.add:
             return a + b
-        return np.minimum(a, b)
+        elif self._reduction is np.minimum:
+            return np.minimum(a, b)
+        return np.maximum(a, b)
 
     def set(self, idx: int, value: float) -> None:
         idx += self._size
@@ -107,6 +114,7 @@ class PrioritizedReplayBuffer:
 
         self._sum_tree = SegmentTree(self._max_size, "sum")
         self._min_tree = SegmentTree(self._max_size, "min")
+        self._max_tree = SegmentTree(self._max_size, "max")
         self._max_prio = 1.0
 
         self._lock = threading.Lock()
@@ -115,6 +123,11 @@ class PrioritizedReplayBuffer:
 
     def __len__(self) -> int:
         return self._size
+
+    def get_max_priority(self) -> float:
+        if self._size == 0:
+            return 0.0
+        return float(self._max_tree.query_all())
 
     def add_game(
         self,
@@ -232,6 +245,7 @@ class PrioritizedReplayBuffer:
                 self._max_prio = max(self._max_prio, prio)
                 self._sum_tree.set(int(idx), prio)
                 self._min_tree.set(int(idx), prio)
+                self._max_tree.set(int(idx), prio)
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -242,5 +256,6 @@ class PrioritizedReplayBuffer:
             prio = self._max_prio ** self._alpha
             self._sum_tree.set(idx, prio)
             self._min_tree.set(idx, prio)
+            self._max_tree.set(idx, prio)
             self._cursor = (self._cursor + 1) % self._max_size
             self._size   = min(self._size + 1, self._max_size)

@@ -160,17 +160,18 @@ def _run_single_game_process(args_dict: dict):
 
     h0, h1 = run_self_play_game(agent_fn, deck0, deck1, cfg, np_rng)
 
-    res_obs, res_raw, res_ret, res_pidx = [], [], [], []
+    res_obs, res_raw, res_ret, res_pidx, res_step = [], [], [], [], []
     for h in (h0, h1):
         if h and len(h.observations) > 0:
             outcome = 1.0 if h.game_won is True else (-1.0 if h.game_won is False else 0.0)
-            for obs, raw in zip(h.observations, h.raw_states):
+            for step_idx, (obs, raw) in enumerate(zip(h.observations, h.raw_states)):
                 res_obs.append(obs)
                 res_raw.append(raw)
                 res_ret.append(outcome)
                 res_pidx.append(h.player_idx)
+                res_step.append(step_idx + 1)
 
-    return res_obs, res_raw, res_ret, res_pidx
+    return res_obs, res_raw, res_ret, res_pidx, res_step
 
 
 def parse_args():
@@ -208,9 +209,9 @@ def parse_args():
     parser.add_argument(
         "--method",
         type=str,
-        choices=["tsne", "pca", "umap"],
+        choices=["tsne", "pca", "umap", "phate"],
         default="tsne",
-        help="Méthode de réduction de dimensionnalité (tsne, pca, umap). Default: tsne",
+        help="Méthode de réduction de dimensionnalité (tsne, pca, umap, phate). Default: tsne",
     )
     parser.add_argument(
         "--gpu",
@@ -317,15 +318,17 @@ def main():
     collected_raw = []
     collected_returns = []
     collected_player_idx = []
+    collected_steps = []
 
     with ctx.Pool(processes=num_workers) as pool:
         results = pool.map(_run_single_game_process, work_items)
 
-    for res_obs, res_raw, res_ret, res_pidx in results:
+    for res_obs, res_raw, res_ret, res_pidx, res_step in results:
         collected_obs.extend(res_obs)
         collected_raw.extend(res_raw)
         collected_returns.extend(res_ret)
         collected_player_idx.extend(res_pidx)
+        collected_steps.extend(res_step)
 
     if not collected_obs:
         logger.error("Aucune observation n'a pu être récoltée.")
@@ -372,6 +375,7 @@ def main():
     v_pred_np = np.concatenate(v_chunks, axis=0)              # [N]
     v_real_np = np.array(collected_returns, dtype=np.float32) # [N]
     v_err_np  = np.abs(v_pred_np - v_real_np)                 # [N]
+    step_np   = np.array(collected_steps, dtype=np.int32)     # [N] (Numéro de tour)
 
     del collected_obs, z_chunks, v_chunks
     gc.collect()
@@ -402,6 +406,18 @@ def main():
             z_2d = reducer.fit_transform(z_np)
         except Exception as exc:
             logger.warning("Échec UMAP (%s). Fallback sur t-SNE.", exc)
+            from sklearn.manifold import TSNE
+            perplexity = min(30, max(5, N // 10))
+            z_2d = TSNE(n_components=2, perplexity=perplexity, random_state=args.seed).fit_transform(z_np)
+
+    elif args.method == "phate":
+        try:
+            import phate
+            logger.info("Exécution de PHATE (Potential of Heat-diffusion for Affinity-based Transition Embedding)...")
+            reducer = phate.PHATE(n_components=2, random_state=args.seed, n_jobs=-1)
+            z_2d = reducer.fit_transform(z_np)
+        except Exception as exc:
+            logger.warning("Échec ou absence du package PHATE (%s). Pour l'utiliser : 'pip install phate'. Fallback sur t-SNE.", exc)
             from sklearn.manifold import TSNE
             perplexity = min(30, max(5, N // 10))
             z_2d = TSNE(n_components=2, perplexity=perplexity, random_state=args.seed).fit_transform(z_np)
@@ -473,11 +489,15 @@ def main():
             if np.any(mask):
                 ax.scatter(z_2d[mask, 0], z_2d[mask, 1], c=colors_map[cat], label=labels_map[cat], s=20, alpha=0.85)
 
-        ax.set_title(f"{ax_target_idx}. Probe[{name}]", fontsize=11, fontweight="bold", pad=8)
-        ax.legend(loc="best", framealpha=0.75, fontsize=8)
-        ax.grid(True, linestyle="--", alpha=0.25)
+    # 14. Âge / Avancement dans la partie (Numéro de Tour)
+    ax14 = axes_flat[14]
+    sc14 = ax14.scatter(z_2d[:, 0], z_2d[:, 1], c=step_np, cmap="viridis", s=20, alpha=0.85)
+    ax14.set_title("14. Âge / Avancement dans la Partie (Numéro de Tour)", fontsize=11, fontweight="bold", pad=8)
+    cbar14 = plt.colorbar(sc14, ax=ax14)
+    cbar14.set_label("Tour / Étape de la partie (1 → Fin)", fontsize=8)
+    ax14.grid(True, linestyle="--", alpha=0.25)
 
-    for unused_idx in range(len(PROBE_DEFS) + 3, len(axes_flat)):
+    for unused_idx in range(15, len(axes_flat)):
         axes_flat[unused_idx].set_visible(False)
 
     plt.tight_layout(rect=[0, 0.02, 1, 0.96])

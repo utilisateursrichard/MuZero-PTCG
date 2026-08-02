@@ -451,6 +451,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                 step_count = 0
                 prev_logs = [[], []]
+                terminal_seen = [False, False]
                 from env.wrapper import GameHistory
                 hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
 
@@ -546,6 +547,9 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     else:
                         new_logs = logs
                     prev_logs[your_idx] = list(logs)
+                    terminal_seen[your_idx] = terminal_seen[your_idx] or any(
+                        _log_int(log, "type", -1) == 23 for log in new_logs
+                    )
 
                     reward = extract_step_reward(new_logs, your_idx)
 
