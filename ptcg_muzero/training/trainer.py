@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import flax.jax_utils
+from flax import struct
 from flax.training import train_state
 
 from cards.encoder import CardStaticFeatures, CardEmbedding, CARD_STATIC_DIM
@@ -73,10 +74,12 @@ _active_push_thread = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainState étendu (MuZero + Probes dans un arbre unifié)
+# TrainState étendu (MuZero + Target Network EMA)
 # ─────────────────────────────────────────────────────────────────────────────
+@struct.dataclass
 class MuZeroTrainState(train_state.TrainState):
-    """Étend TrainState pour stocker les métriques de step."""
+    """Étend TrainState pour stocker les paramètres du Target Network (EMA)."""
+    target_params: Any = None
     step_metrics: Dict = None
 
 
@@ -126,21 +129,22 @@ def make_train_step(
         freeze_rep: jnp.ndarray,
     ) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
 
-        mz_params = state.params["muzero"]
+        target_params = state.target_params if hasattr(state, "target_params") and state.target_params is not None else state.params
+        mz_target_params = target_params["muzero"]
 
-        # ── Reanalyze In-Pipeline GPU ───────────────────────────────────────
+        # ── Reanalyze In-Pipeline GPU (utilisant le Target Network) ───────────
         rng_device = jax.random.fold_in(rng, jax.lax.axis_index("devices"))
 
         # Extraire l'observation racine (step k=0) — déjà sur le GPU
         obs0 = {k: v[:, 0] for k, v in batch["obs_seq"].items()}  # [B, ...]
 
-        z_root     = network.apply(mz_params, obs0, method=network.represent)
-        pi_root, v_root = network.apply(mz_params, z_root, method=network.predict)
+        z_root     = network.apply(mz_target_params, obs0, method=network.represent)
+        pi_root, v_root = network.apply(mz_target_params, z_root, method=network.predict)
 
         mask_root = (batch["target_pol"][:, 0] > 0).astype(jnp.bool_)  # [B, A]
 
         fresh_pol, fresh_val = reanalyze_root(
-            mz_params, network, z_root, pi_root, v_root, mask_root,
+            mz_target_params, network, z_root, pi_root, v_root, mask_root,
             rng_device, reanalyze_sims, reanalyze_consider,
         )
 
@@ -196,6 +200,16 @@ def make_train_step(
             lambda _: state,
             operand=None,
         )
+
+        # ── Target Network Polyak EMA Update (theta^- = tau * theta^- + (1-tau) * theta) ──
+        tau = getattr(cfg.train, "target_network_tau", 0.995)
+        new_target_params = jax.tree_util.tree_map(
+            lambda tp, p: tau * tp + (1.0 - tau) * p,
+            target_params,
+            new_state.params,
+        )
+        new_state = new_state.replace(target_params=new_target_params)
+
         metrics = {**metrics, "update_is_finite": update_is_finite.astype(jnp.float32)}
         return new_state, metrics, td_err
 
@@ -243,9 +257,10 @@ def create_muzero_train_state(
         optax.adamw(lr_schedule, weight_decay=cfg.train.weight_decay),
     )
 
-    return train_state.TrainState.create(
+    return MuZeroTrainState.create(
         apply_fn=network.apply,
         params=params,
+        target_params=params,
         tx=tx,
     )
 
@@ -285,14 +300,37 @@ def _merge_params(defaults, loaded):
     if hasattr(defaults, "shape") and hasattr(loaded, "shape"):
         if defaults.shape != loaded.shape:
             logger.warning(
-                "Incompatibilité de forme détectée pour la couche (modèle %s vs checkpoint %s) ; réinitialisation aléatoire de cette couche.",
+                "Incompatibilité de forme détectée pour la couche (modèle %s vs checkpoint %s) ; adaptation/réinitialisation de cette couche.",
                 defaults.shape, loaded.shape
             )
+            # Adapt 2D kernels if input dimension expanded (e.g. option_proj: 157 -> 160)
+            if defaults.ndim == 2 and loaded.ndim == 2 and defaults.shape[1] == loaded.shape[1] and defaults.shape[0] > loaded.shape[0]:
+                logger.info("Adaptation partielle de la matrice de poids %s -> %s (conservation des poids existants).", loaded.shape, defaults.shape)
+                new_param = np.array(defaults)
+                new_param[:loaded.shape[0], :] = np.array(loaded)
+                return jnp.array(new_param)
             return defaults
-        return loaded
-
     return loaded
 
+
+def _reset_value_head_params(params: dict, fresh_params: dict) -> dict:
+    """
+    Réinitialise uniquement la tête de valeur (v_dense) et de récompense (rdet_fc2)
+    pour adapter les poids au nouvel encodage de bins [-1.2, 1.2], tout en conservant
+    100% du reste des poids entraînés (Transformer, Policy, Dynamics, etc.).
+    """
+    def _reset_layer(path, param_val):
+        keys = [getattr(p, "key", p) for p in path]
+        path_str = "/".join(str(k) for k in keys)
+        if "v_dense" in path_str or "rdet_fc2" in path_str:
+            logger.info("[checkpoint] Réinitialisation ciblée de la couche '%s' pour adaptation aux nouveaux bins [-1.2, 1.2].", path_str)
+            val = fresh_params
+            for k in keys:
+                val = val[k]
+            return val
+        return param_val
+
+    return jax.tree_util.tree_map_with_path(_reset_layer, params)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,8 +531,7 @@ def run_parallel_self_play(
     stop_event = threading.Event()
 
     # RNG séparé par GPU thread (évite tout partage de state JAX entre threads)
-    rng, _rng_gpu0, _rng_gpu1 = jax.random.split(rng, 3)
-    _gpu_thread_rngs = [_rng_gpu0, _rng_gpu1]
+    _gpu_thread_rngs = [jax.random.fold_in(rng, gidx) for gidx in range(len(accel_devices))]
 
     def _gpu_inference_worker(gpu_idx: int):
         _rng = _gpu_thread_rngs[gpu_idx]
@@ -966,7 +1003,7 @@ def train(cfg: Config) -> None:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
         params_jax = jax.tree_util.tree_map(jax.device_put, loaded_params)
         params_jax = _merge_params(state.params, params_jax)
-        state = state.replace(params=params_jax, step=jnp.array(start_step, dtype=jnp.int32))
+        state = state.replace(params=params_jax, target_params=params_jax, step=jnp.array(start_step, dtype=jnp.int32))
 
         fresh_opt_state = state.tx.init(params_jax)
         if loaded_opt_state is not None:
@@ -1008,83 +1045,160 @@ def train(cfg: Config) -> None:
         )
     deck_optimizer = optax.adam(cfg.train.deck_lr)
 
-    # ── 5. Replicate onto 2 devices ───────────────────────────────────────
-    devices = jax.devices()[:cfg.infra.num_devices]
-    state   = flax.jax_utils.replicate(state, devices)
+    # ── 5. Replicate onto available devices (1 GPU, 2 GPUs, or CPU) ─────
+    num_devs = min(len(jax.devices()), cfg.infra.num_devices)
+    devices  = jax.devices()[:num_devs]
+    state    = flax.jax_utils.replicate(state, devices)
+    logger.info("[train] TrainState répliqué sur %d device(s) : %s", num_devs, devices)
 
     train_step_fn = make_train_step(network, probes, cfg)
 
-    # ── 6. Replay buffer ──────────────────────────────────────────────────
-    buffer = PrioritizedReplayBuffer(cfg.train, cfg.model)
+    # ── 6. Replay buffer (avec tentative de restauration HF Hub & local) ──
+    from training.replay_buffer import PrioritizedReplayBuffer
+    buffer = None
+    buffer_meta = {}
+
+    # 1. Tenter de charger le buffer depuis HF Hub si activé
+    if cfg.hf.enabled and cfg.hf.repo_id:
+        try:
+            from export.hub import load_buffer_from_hub
+            logger.info("Vérification d'un Replay Buffer existant sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
+            hf_buf, hf_meta = load_buffer_from_hub(cfg.hf.repo_id, cfg.train, cfg.model, cfg=cfg)
+            if hf_buf is not None:
+                buffer = hf_buf
+                buffer_meta = hf_meta
+        except Exception as e:
+            logger.warning("[hf-buffer] Échec de restauration HF Hub : %s", e)
+
+    # 2. Vérifier si un buffer local existe (dans local_dir ou checkpoint_dir)
+    local_buf_path = Path(cfg.hf.local_dir) / "replay_buffer.pkl"
+    local_meta_path = Path(cfg.hf.local_dir) / "buffer_meta.json"
+    if not local_buf_path.exists():
+        local_buf_path = Path(cfg.infra.checkpoint_dir) / "replay_buffer.pkl"
+        local_meta_path = Path(cfg.infra.checkpoint_dir) / "buffer_meta.json"
+
+    if local_buf_path.exists():
+        try:
+            loc_buf = PrioritizedReplayBuffer.deserialize(str(local_buf_path), cfg.train, cfg.model)
+            loc_step = getattr(loc_buf, "loaded_step", 0)
+            if local_meta_path.exists():
+                try:
+                    import json
+                    loc_meta = json.loads(local_meta_path.read_text(encoding="utf-8"))
+                    loc_step = loc_meta.get("step", loc_step)
+                except Exception:
+                    pass
+
+            if buffer is None or loc_step >= buffer_meta.get("step", 0):
+                buffer = loc_buf
+                fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
+                logger.info(
+                    "=== Replay Buffer restauré depuis le stockage local (%s) : %d/%d entrées (%.1f%% rempli, étape %d) ===",
+                    local_buf_path, len(buffer), buffer._max_size, fill_pct, loc_step
+                )
+        except Exception as e:
+            logger.warning("Échec du chargement du replay buffer local (%s) : %s", local_buf_path, e)
+
+    if buffer is None:
+        buffer = PrioritizedReplayBuffer(cfg.train, cfg.model)
+        logger.info("Aucun Replay Buffer existant trouvé. Création d'un buffer vierge.")
+    else:
+        fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
+        logger.info(
+            "Replay Buffer prêt : %d/%d entrées chargées (%.1f%% rempli, min requis pour seeding: %d).",
+            len(buffer), buffer._max_size, fill_pct, cfg.train.min_replay_size
+        )
 
     # ── 7. Parallel Self-play seed games ──────────────────────────────────
-    logger.info("Seeding replay buffer (min=%d)…", cfg.train.min_replay_size)
     rng, rng_selfplay = jax.random.split(rng)
     _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
 
     from training.activity import tracker, format_h_status
     tracker.attach_buffer(buffer)  # lecture en direct de len(buffer) dans le heartbeat
-    tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
-    _start_seeding = time.time()
-    # A self-play wave has at most eight games.  More workers add no useful
-    # parallelism and make the padded MCTS GPU batch needlessly larger.
     NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
-    _deck_errors = 0
 
-    # ── Spawn persistent worker processes pool ───────────────────────────
-    import multiprocessing as mp
-    from training.worker_bootstrap import run as _worker_bootstrap
-    ctx = mp.get_context("spawn")
-    pipes = []
-    processes = []
-    logger.info("[train] Spawning %d persistent worker processes...", NUM_WORKERS)
-    for idx in range(NUM_WORKERS):
-        parent_conn, child_conn = ctx.Pipe()
-        p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
-        p.start()
-        pipes.append(parent_conn)
-        processes.append(p)
-
-    while len(buffer) < cfg.train.min_replay_size:
-        tracker.update()
-        rng, rng_sp = jax.random.split(rng)
-        
-        t_sp_start = time.time()
-        hists, _, errs = run_parallel_self_play(
-            num_games_to_play=8,
-            num_workers=NUM_WORKERS,
-            deck_net=deck_net,
-            deck_params=deck_params,
-            network=network,
-            state_params=_params_cpu,
-            cfg=cfg,
-            rng=rng_sp,
-            num_card_ids=num_card_ids,
-            energy_ids=energy_ids,
-            ace_spec_ids=ace_spec_ids,
-            pipes=pipes,
-            processes=processes,
-            is_seeding=True,
-            card_data=card_data,
+    if len(buffer) < cfg.train.min_replay_size:
+        logger.info(
+            "Seeding replay buffer (%d/%d entrées actuelles, min requis=%d)…",
+            len(buffer), buffer._max_size, cfg.train.min_replay_size
         )
-        tracker.self_play_times.append(time.time() - t_sp_start)
-        
-        _deck_errors += errs
-        tracker.update(deck_errors=_deck_errors)
-        for hist in hists:
-            t_added = _add_history_to_buffer(hist, buffer, cfg)
-            tracker.transitions_per_game_list.append(t_added)
-        tracker.update(buffer_size=len(buffer))
+        tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
 
-    logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
+        _start_seeding = time.time()
+        _deck_errors = 0
+
+        # ── Spawn persistent worker processes pool ───────────────────────────
+        import multiprocessing as mp
+        from training.worker_bootstrap import run as _worker_bootstrap
+        ctx = mp.get_context("spawn")
+        pipes = []
+        processes = []
+        logger.info("[train] Spawning %d persistent worker processes...", NUM_WORKERS)
+        for idx in range(NUM_WORKERS):
+            parent_conn, child_conn = ctx.Pipe()
+            p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+            p.start()
+            pipes.append(parent_conn)
+            processes.append(p)
+
+        while len(buffer) < cfg.train.min_replay_size:
+            tracker.update()
+            rng, rng_sp = jax.random.split(rng)
+            
+            t_sp_start = time.time()
+            hists, _, errs = run_parallel_self_play(
+                num_games_to_play=8,
+                num_workers=NUM_WORKERS,
+                deck_net=deck_net,
+                deck_params=deck_params,
+                network=network,
+                state_params=_params_cpu,
+                cfg=cfg,
+                rng=rng_sp,
+                num_card_ids=num_card_ids,
+                energy_ids=energy_ids,
+                ace_spec_ids=ace_spec_ids,
+                pipes=pipes,
+                processes=processes,
+                is_seeding=True,
+                card_data=card_data,
+            )
+            tracker.self_play_times.append(time.time() - t_sp_start)
+            
+            _deck_errors += errs
+            tracker.update(deck_errors=_deck_errors)
+            for hist in hists:
+                t_added = _add_history_to_buffer(hist, buffer, cfg)
+                tracker.transitions_per_game_list.append(t_added)
+            tracker.update(buffer_size=len(buffer))
+
+        logger.info("Buffer seeded: %d entries in %.1fs", len(buffer), time.time() - _start_seeding)
+    else:
+        fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
+        logger.info(
+            "Replay Buffer déjà suffisamment rempli (%d entrées >= min=%d, %.1f%%). Phase de seeding sautée !",
+            len(buffer), cfg.train.min_replay_size, fill_pct
+        )
+        import multiprocessing as mp
+        from training.worker_bootstrap import run as _worker_bootstrap
+        ctx = mp.get_context("spawn")
+        pipes = []
+        processes = []
+        logger.info("[train] Spawning %d persistent worker processes...", NUM_WORKERS)
+        for idx in range(NUM_WORKERS):
+            parent_conn, child_conn = ctx.Pipe()
+            p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+            p.start()
+            pipes.append(parent_conn)
+            processes.append(p)
 
     # ── 8. Main training loop ─────────────────────────────────────────────
     import collections
     global_step = 0
     t0 = time.time()
     total_transitions_since_last_push = 0
-    rep_frozen = getattr(cfg.train, "freeze_representation_initially", True)
+    rep_frozen = getattr(cfg.train, "freeze_representation_initially", False)
     loss_window = collections.deque(maxlen=getattr(cfg.train, "unfreeze_w", 500))
 
     tracker.update(start_step=start_step, rep_frozen=rep_frozen)
@@ -1104,7 +1218,8 @@ def train(cfg: Config) -> None:
 
         # ── a. Self-play ──────────────────────────────────────────────────
         if step % cfg.train.self_play_interval == 0:
-            _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
+            _tp = getattr(state, "target_params", None) or state.params
+            _params_cpu = jax.tree_util.tree_map(lambda x: x[0], _tp)
             
             # Enregistrer immédiatement le modèle entraîné courant pour la suite
             _save_checkpoint(state, deck_params, cfg, step, force_latest_only=True, deck_opt_state=deck_opt_state)
@@ -1156,15 +1271,15 @@ def train(cfg: Config) -> None:
         batch_cpu = collate_batch(
             entries, is_w, cfg.train.num_unroll_steps, cfg.model.max_actions
         )
-        batch_sharded = shard_batch(batch_cpu, cfg.infra.num_devices)
+        batch_sharded = shard_batch(batch_cpu, num_devs)
 
         # Clé PRNG pour Reanalyze — répliquée puis différenciée par device via fold_in
         rng, rng_step = jax.random.split(rng)
         rng_step_replicated = jnp.broadcast_to(
-            rng_step[None], (cfg.infra.num_devices,) + rng_step.shape
+            rng_step[None], (num_devs,) + rng_step.shape
         )
         rep_frozen_replicated = jnp.broadcast_to(
-            jnp.array(rep_frozen, dtype=jnp.bool_), (cfg.infra.num_devices,)
+            jnp.array(rep_frozen, dtype=jnp.bool_), (num_devs,)
         )
 
         t_step_start = time.time()
@@ -1226,7 +1341,8 @@ def train(cfg: Config) -> None:
 
         # ── Priority Refresh allégé (tous les N steps) ────────────────────
         if step % cfg.train.priority_refresh_every == 0 and len(buffer) > 0:
-            _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], state.params)["muzero"]
+            _tp = getattr(state, "target_params", None) or state.params
+            _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], _tp)["muzero"]
             _refresh_buffer_priorities(buffer, network, _params_cpu_mz, cfg)
 
         # ── c. Logging ────────────────────────────────────────────────────
@@ -1268,12 +1384,20 @@ def train(cfg: Config) -> None:
                 if not push_to_hub(_params_cpu, deck_params, cfg, step):
                     logger.error("[hf-push] Snapshot %d non confirmé sur HF.", step)
 
+        # ── e. Async replay buffer push to HF ─────────────────────────────
+        if step % cfg.train.buffer_push_every == 0 and step > 0 and cfg.hf.enabled:
+            from export.hub import push_buffer_to_hub_async
+            push_buffer_to_hub_async(buffer, cfg, step)
+
     # Final checkpoint
     _save_checkpoint(state, deck_params, cfg, global_step, deck_opt_state=deck_opt_state)
     if cfg.hf.enabled:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
         logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
         push_to_hub(_params_cpu, deck_params, cfg, global_step)
+        # Final buffer push (sync — wait for completion before exit)
+        from export.hub import push_buffer_to_hub_async
+        push_buffer_to_hub_async(buffer, cfg, global_step)
 
     # Clean up persistent workers pool
     logger.info("[train] Nettoyage du pool de workers persistants...")

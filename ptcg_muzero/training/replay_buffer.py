@@ -259,3 +259,90 @@ class PrioritizedReplayBuffer:
             self._max_tree.set(idx, prio)
             self._cursor = (self._cursor + 1) % self._max_size
             self._size   = min(self._size + 1, self._max_size)
+
+    # ── Serialization ─────────────────────────────────────────────────────
+
+    def get_metadata_dict(self, step: int = 0) -> dict:
+        """Return a dictionary of buffer filling & status metadata."""
+        import datetime
+        import time
+
+        with self._lock:
+            size = self._size
+            max_size = self._max_size
+        return {
+            "step":            step,
+            "size":            size,
+            "max_size":        max_size,
+            "fill_percentage": round(100.0 * size / max(max_size, 1), 2),
+            "timestamp":       time.time(),
+            "iso_date":        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+
+    def serialize(self, path: str, step: int = 0) -> None:
+        """Serialize the buffer to a pickle file at *path*.
+
+        Only the entries and cursor state are saved.  The segment trees are
+        rebuilt on ``deserialize`` because they are derived data.
+        Also exports a JSON metadata file (*buffer_meta.json*) in the same directory.
+        """
+        import json
+        import pickle
+        from pathlib import Path
+
+        meta = self.get_metadata_dict(step=step)
+
+        with self._lock:
+            data = {
+                "entries":   self._entries[:self._size],
+                "cursor":    self._cursor,
+                "size":      self._size,
+                "max_prio":  self._max_prio,
+                "max_size":  self._max_size,
+                "alpha":     self._alpha,
+                "beta":      self._beta,
+                "unroll":    self._unroll,
+                "batch_sz":  self._batch_sz,
+                "max_acts":  self._max_acts,
+                "step":      step,
+                "meta":      meta,
+            }
+
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        meta_path = Path(path).parent / "buffer_meta.json"
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
+
+    @classmethod
+    def deserialize(cls, path: str, cfg_train, cfg_model) -> "PrioritizedReplayBuffer":
+        """Rebuild a buffer from a file written by ``serialize``.
+
+        Segment trees are reconstructed from entry priorities.
+        Also sets the ``loaded_step`` attribute on the returned buffer instance.
+        """
+        import pickle
+
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+
+        buf = cls(cfg_train, cfg_model)
+        entries = data.get("entries", [])
+        buf._cursor   = data.get("cursor", 0)
+        buf._size     = data.get("size", len(entries))
+        buf._max_prio = data.get("max_prio", 1.0)
+        buf.loaded_step = data.get("step", 0)
+
+        for i, entry in enumerate(entries):
+            buf._entries[i] = entry
+            if entry is not None:
+                prio = entry.priority ** buf._alpha
+                buf._sum_tree.set(i, prio)
+                buf._min_tree.set(i, prio)
+                buf._max_tree.set(i, prio)
+
+        return buf

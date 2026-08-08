@@ -44,9 +44,13 @@ if _cg_parent is None:
     from pathlib import Path
     workspace_root = Path(__file__).parent.parent.parent
     local_paths = [
+        workspace_root / "submission",
         workspace_root / "competiton" / "sample_submission" / "sample_submission",
         workspace_root / "competiton" / "sample_submission",
         workspace_root / "competiton",
+        workspace_root.parent / "submission",
+        workspace_root.parent / "competiton" / "sample_submission" / "sample_submission",
+        workspace_root.parent / "competiton",
     ]
     for lp in local_paths:
         if (lp / "cg").is_dir():

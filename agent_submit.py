@@ -9,7 +9,7 @@ _cg_hits = glob.glob('/kaggle/input/**/cg-lib', recursive=True)
 if _cg_hits:
     sys.path.append(_cg_hits[0])
 
-HF_REPO = "richard151111/muZero"
+HF_REPO = "richard151111/muzero-V2"
 
 def _load():
     from huggingface_hub import hf_hub_download
@@ -65,17 +65,28 @@ from env.encoding import encode_observation
 def agent(obs_dict):
     global _rng
     _rng, rng_act = jax.random.split(_rng)
-    select  = obs_dict.get("select") or {}
-    options = select.get("option", [])
+    if isinstance(obs_dict, dict):
+        select = obs_dict.get("select") or {}
+    else:
+        select = getattr(obs_dict, "select", None) or {}
+
+    options = select.get("option", []) if isinstance(select, dict) else getattr(select, "option", [])
     if not options:
         return []
-    enc = encode_observation(obs_dict, obs_dict["current"]["yourIndex"], _cfg.model)
+
+    from env.encoding import encode_observation, _int_from
+    your_idx = obs_dict.get("current", {}).get("yourIndex", 0) if isinstance(obs_dict, dict) else getattr(getattr(obs_dict, "current", None), "yourIndex", 0)
+    enc = encode_observation(obs_dict, your_idx, _cfg.model)
     mask = enc["option_mask"]
-    best, _, _ = ismcts_action(_network, _mz_params, enc, mask, rng_act, _cfg)
-    max_cnt = int(select.get("maxCount", 1))
-    import numpy as np
+    best, avg_policy, _ = ismcts_action(_network, _mz_params, enc, mask, rng_act, _cfg)
+
+    policy_masked = np.where(mask, np.asarray(avg_policy), -1e9)
+    best = int(np.argmax(policy_masked))
+
+    max_cnt = int(select.get("maxCount", 1)) if isinstance(select, dict) else getattr(select, "maxCount", 1)
     if max_cnt > 1:
-        return sorted(np.argsort(-np.where(mask, enc["option_mask"].astype(float), -1e9))[:max_cnt].tolist())
+        scores = np.where(mask, np.asarray(avg_policy), -1e9)
+        return sorted(np.argsort(-scores)[:max_cnt].tolist())
     return [best]
 
 def deck_builder():

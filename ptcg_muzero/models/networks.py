@@ -282,6 +282,8 @@ class RepresentationNetwork(nn.Module):
         # ── Available options ─────────────────────────────────────────────
         opt_card = self.card_emb(obs["option_ids"])   # [B, A, card_dim]
         opt_feat = obs["option_feat"]                 # [B, A, OPTION_FEAT_DIM]
+        if opt_feat.shape[-1] > 45 and opt_card.shape[-1] == 112:
+            opt_feat = opt_feat[..., :45]
         opt_tok  = self.option_proj(
             jnp.concatenate([opt_card, opt_feat], axis=-1)
         )
@@ -342,6 +344,8 @@ class PredictionNetwork(nn.Module):
         pi_dense_logits = nn.Dense(self.cfg.max_actions, name="pi_dense")(pi_hid)
 
         opt_f = option_feat if option_feat is not None else jnp.zeros((z.shape[0], self.cfg.max_actions, OPTION_FEAT_DIM), dtype=z.dtype)
+        if opt_f.shape[-1] > 45:
+            opt_f = opt_f[..., :45]
         q = nn.Dense(64, name="pi_q")(pi_hid)                         # [B, 64]
         k = nn.Dense(64, name="pi_k")(opt_f)                          # [B, A, 64]
 
@@ -414,6 +418,8 @@ class DynamicsNetwork(nn.Module):
         a_emb_onehot = nn.Dense(D, name="a_emb")(action_onehot)
 
         act_f = action_feat if action_feat is not None else jnp.zeros((z.shape[0], OPTION_FEAT_DIM), dtype=z.dtype)
+        if act_f.shape[-1] > 45:
+            act_f = act_f[..., :45]
         a_emb_feat = nn.Dense(D, name="a_feat_emb")(act_f)
 
         if action_feat is not None:
@@ -520,7 +526,8 @@ class MuZeroNetwork(nn.Module):
     def dynamics(
         self, z: jnp.ndarray, action_onehot: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        return self.g(z, action_onehot)
+        r_scalar, z_next = self.g(z, action_onehot)
+        return z_next, r_scalar
 
     def dynamics_full(
         self, z: jnp.ndarray, action_onehot: jnp.ndarray

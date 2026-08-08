@@ -13,7 +13,10 @@
     "max_discard_size": 60,
     "max_prize_size": 6,
     "num_probe_tasks": 11,
-    "num_deck_slots": 60
+    "num_deck_slots": 60,
+    "num_value_bins": 51,
+    "value_min": -1.2,
+    "value_max": 1.2
   },
   "search": {
     "num_simulations": 25,
@@ -24,8 +27,9 @@
   },
   "train": {
     "num_unroll_steps": 5,
-    "td_steps": 10,
+    "td_steps": 20,
     "gamma": 0.997,
+    "target_network_tau": 0.995,
     "batch_size": 64,
     "learning_rate": 0.0003,
     "lr_warmup_steps": 2000,
@@ -35,6 +39,10 @@
     "min_replay_size": 10000,
     "replay_alpha": 0.5,
     "replay_beta": 0.4,
+    "freeze_representation_initially": false,
+    "unfreeze_w": 500,
+    "unfreeze_epsilon": 0.01,
+    "unfreeze_s_min": 2000,
     "num_total_steps": 500000,
     "self_play_interval": 100,
     "games_per_self_play": 8,
@@ -59,11 +67,20 @@
   },
   "hf": {
     "enabled": true,
-    "repo_id": "richard151111/muZero",
+    "repo_id": "richard151111/muzero-V2",
     "private": true,
     "token_env_var": "HF_TOKEN",
     "push_every_n_transitions": 10000,
     "local_dir": "./hf_checkpoints"
+  },
+  "wandb": {
+    "enabled": true,
+    "project": "muzero",
+    "entity": null,
+    "name": null,
+    "mode": "online",
+    "token_env_var": "WANDB_API_KEY",
+    "kaggle_secret_name": "WANDB"
   },
   "infra": {
     "num_devices": 2,

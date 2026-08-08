@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Dict
 
@@ -96,9 +97,15 @@ def save_local(
 
 
 def get_hf_token(cfg: Config | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
-    """Récupère le token HuggingFace depuis les variables d'environnement ou Kaggle Secrets."""
+    """Récupère le token HuggingFace depuis les variables d'environnement, huggingface_hub ou Kaggle Secrets."""
     env_var = cfg.hf.token_env_var if (cfg and hasattr(cfg, "hf") and hasattr(cfg.hf, "token_env_var")) else token_env_var
     token = os.environ.get(env_var, "") or os.environ.get("HF_TOKEN", "") or os.environ.get("HUGGINGFACE_TOKEN", "")
+    if not token:
+        try:
+            from huggingface_hub import get_token
+            token = get_token()
+        except Exception:
+            pass
     if not token:
         try:
             from kaggle_secrets import UserSecretsClient
@@ -202,7 +209,7 @@ def load_from_hub(
     step:    int | None = None,
     token:   str | None = None,
     cfg:     Config | None = None,
-) -> tuple[dict, dict, Config, int]:
+) -> tuple[dict | None, dict | None, Config, int]:
     """
     Télécharge les poids depuis le Hub et retourne
     (muzero_params, deck_params, cfg, step).
@@ -214,52 +221,57 @@ def load_from_hub(
         from huggingface_hub import hf_hub_download
         from safetensors.numpy import load_file
     except ImportError:
-        raise ImportError("Installez : pip install huggingface_hub safetensors")
+        logger.warning("Installez huggingface_hub et safetensors pour le téléchargement Hub.")
+        return None, None, cfg or Config(), 0
 
     if not token:
         token = get_hf_token(cfg)
 
-    if step is None:
-        try:
-            latest = hf_hub_download(repo_id=repo_id, filename="latest.json", token=token)
-            step = int(json.loads(Path(latest).read_text())["step"])
-        except Exception:
-            logger.warning("latest.json absent : fallback vers le format HF historique à la racine.")
-
-    subfolder = f"step_{step:07d}" if step is not None else ""
-
-    def _dl(filename):
-        return hf_hub_download(
-            repo_id=repo_id,
-            filename=f"{subfolder}/{filename}" if subfolder else filename,
-            token=token,
-        )
-
-    mz_path  = _dl("muzero.safetensors")
-    dk_path  = _dl("deck_builder.safetensors")
-    cfg_path = _dl("config.json")
-
-    step_val = step if step is not None else 0
     try:
-        meta_path = _dl("meta.json")
-        meta = json.loads(Path(meta_path).read_text())
-        step_val = meta.get("step", step_val)
-    except Exception:
-        pass
+        if step is None:
+            try:
+                latest = hf_hub_download(repo_id=repo_id, filename="latest.json", token=token)
+                step = int(json.loads(Path(latest).read_text())["step"])
+            except Exception:
+                pass
 
-    mz_flat  = load_file(mz_path)
-    dk_flat  = load_file(dk_path)
-    loaded_cfg = Config.from_json(Path(cfg_path).read_text())
+        subfolder = f"step_{step:07d}" if step is not None else ""
 
-    muzero_params = _unflatten_params(mz_flat)
-    deck_params   = _unflatten_params(dk_flat)
+        def _dl(filename):
+            return hf_hub_download(
+                repo_id=repo_id,
+                filename=f"{subfolder}/{filename}" if subfolder else filename,
+                token=token,
+            )
 
-    return (
-        jax.tree_util.tree_map(jax.device_put, muzero_params),
-        jax.tree_util.tree_map(jax.device_put, deck_params),
-        loaded_cfg,
-        step_val,
-    )
+        mz_path  = _dl("muzero.safetensors")
+        dk_path  = _dl("deck_builder.safetensors")
+        cfg_path = _dl("config.json")
+
+        step_val = step if step is not None else 0
+        try:
+            meta_path = _dl("meta.json")
+            meta = json.loads(Path(meta_path).read_text())
+            step_val = meta.get("step", step_val)
+        except Exception:
+            pass
+
+        mz_flat  = load_file(mz_path)
+        dk_flat  = load_file(dk_path)
+        loaded_cfg = Config.from_json(Path(cfg_path).read_text())
+
+        muzero_params = _unflatten_params(mz_flat)
+        deck_params   = _unflatten_params(dk_flat)
+
+        return (
+            jax.tree_util.tree_map(jax.device_put, muzero_params),
+            jax.tree_util.tree_map(jax.device_put, deck_params),
+            loaded_cfg,
+            step_val,
+        )
+    except Exception as exc:
+        logger.warning("[hf-hub] Impossible de télécharger le checkpoint depuis HF Hub (%s): %s", repo_id, exc)
+        return None, None, cfg or Config(), 0
 
 
 def _unflatten_params(flat: Dict[str, np.ndarray]) -> dict:
@@ -321,3 +333,158 @@ transitions.
 | `deck_builder.safetensors` | Deck builder policy weights |
 | `config.json` | Full training configuration |
 """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Async replay buffer push
+# ─────────────────────────────────────────────────────────────────────────────
+_buffer_push_thread: threading.Thread | None = None
+_buffer_push_lock = threading.Lock()
+
+
+def push_buffer_to_hub_async(
+    buffer,
+    cfg: Config,
+    step: int,
+) -> None:
+    """Serialize the replay buffer and upload it to HuggingFace Hub **asynchronously**.
+
+    The heavy work (pickle + upload) runs on a background daemon thread so the
+    training loop is never blocked.  Only one upload can be in-flight at a time:
+    if a previous push is still running the new request is silently skipped.
+    """
+    global _buffer_push_thread
+
+    if not cfg.hf.enabled or not cfg.hf.repo_id:
+        return
+
+    with _buffer_push_lock:
+        if _buffer_push_thread is not None and _buffer_push_thread.is_alive():
+            logger.info(
+                "[hf-buffer] Push précédent encore en cours — skip step %d.",
+                step,
+            )
+            return
+
+    # Serialize on the main thread (fast snapshot under the buffer lock)
+    local_dir = Path(cfg.hf.local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    buf_path = str(local_dir / "replay_buffer.pkl")
+    meta_path = str(local_dir / "buffer_meta.json")
+    try:
+        buffer.serialize(buf_path, step=step)
+    except Exception as exc:
+        logger.error("[hf-buffer] Serialize failed (step=%d): %s", step, exc)
+        return
+
+    buf_size = len(buffer)
+    max_size = getattr(buffer, "_max_size", buf_size)
+    fill_pct = round(100.0 * buf_size / max(max_size, 1), 2)
+
+    def _upload():
+        try:
+            from huggingface_hub import HfApi, create_repo
+
+            token = get_hf_token(cfg)
+            if not token:
+                logger.warning("[hf-buffer] Pas de token HF — upload buffer ignoré.")
+                return
+
+            api = HfApi(token=token)
+            try:
+                create_repo(cfg.hf.repo_id, private=cfg.hf.private,
+                            exist_ok=True, token=token)
+            except Exception:
+                pass
+
+            # Upload metadata file first
+            if os.path.exists(meta_path):
+                try:
+                    api.upload_file(
+                        path_or_fileobj=meta_path,
+                        path_in_repo="buffer_meta.json",
+                        repo_id=cfg.hf.repo_id,
+                        commit_message=f"Replay buffer metadata — step {step} ({buf_size}/{max_size} entries, {fill_pct}%)",
+                        token=token,
+                    )
+                except Exception as meta_exc:
+                    logger.debug("[hf-buffer] Failed to upload buffer_meta.json: %s", meta_exc)
+
+            # Upload main pickle buffer
+            api.upload_file(
+                path_or_fileobj=buf_path,
+                path_in_repo="replay_buffer.pkl",
+                repo_id=cfg.hf.repo_id,
+                commit_message=f"Replay buffer snapshot — step {step} ({buf_size}/{max_size} entries, {fill_pct}%)",
+                token=token,
+            )
+            logger.info(
+                "✓ Replay buffer pushed to HF Hub  repo=%s  step=%d  entries=%d/%d (%.1f%% rempli)",
+                cfg.hf.repo_id, step, buf_size, max_size, fill_pct,
+            )
+        except Exception as exc:
+            logger.error("[hf-buffer] Upload failed (step=%d): %s", step, exc)
+
+    t = threading.Thread(target=_upload, daemon=True, name="hf-buffer-push")
+    with _buffer_push_lock:
+        _buffer_push_thread = t
+    t.start()
+
+
+def load_buffer_from_hub(
+    repo_id: str,
+    cfg_train,
+    cfg_model,
+    token: str | None = None,
+    cfg: Config | None = None,
+) -> tuple[Any | None, dict]:
+    """Télécharge et restaure le replay buffer depuis HuggingFace Hub.
+
+    Returns:
+        tuple (buffer, meta_dict)
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+        from training.replay_buffer import PrioritizedReplayBuffer
+    except ImportError:
+        logger.warning("[hf-buffer] huggingface_hub / PrioritizedReplayBuffer non disponible.")
+        return None, {}
+
+    if not token:
+        token = get_hf_token(cfg)
+
+    meta = {}
+    # Tenter de télécharger le fichier de métadonnées buffer_meta.json
+    try:
+        meta_file = hf_hub_download(repo_id=repo_id, filename="buffer_meta.json", token=token)
+        meta = json.loads(Path(meta_file).read_text(encoding="utf-8"))
+        logger.info(
+            "[hf-buffer] Métadonnées buffer trouvées sur HF Hub : étape %s, %s/%s entrées (%s%% rempli)",
+            meta.get("step", "?"), meta.get("size", "?"), meta.get("max_size", "?"), meta.get("fill_percentage", "?")
+        )
+    except Exception as e:
+        logger.debug("[hf-buffer] buffer_meta.json absent sur HF Hub : %s", e)
+
+    # Télécharger le fichier pickle replay_buffer.pkl
+    try:
+        buf_file = hf_hub_download(repo_id=repo_id, filename="replay_buffer.pkl", token=token)
+        buf = PrioritizedReplayBuffer.deserialize(buf_file, cfg_train, cfg_model)
+        step_val = meta.get("step", getattr(buf, "loaded_step", 0))
+        size_val = len(buf)
+        max_size_val = buf._max_size
+        fill_pct = round(100.0 * size_val / max(max_size_val, 1), 2)
+
+        meta.setdefault("step", step_val)
+        meta.setdefault("size", size_val)
+        meta.setdefault("max_size", max_size_val)
+        meta.setdefault("fill_percentage", fill_pct)
+
+        logger.info(
+            "=== Replay Buffer restauré depuis HF Hub (%s) : %d/%d entrées (%.1f%% rempli, étape %d) ===",
+            repo_id, size_val, max_size_val, fill_pct, step_val
+        )
+        return buf, meta
+    except Exception as e:
+        logger.info("[hf-buffer] Échec du chargement du buffer depuis HF Hub (%s) : %s", repo_id, e)
+        return None, meta
+

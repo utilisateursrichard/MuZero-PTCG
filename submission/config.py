@@ -20,7 +20,7 @@ NUM_STAGES: int = 7          # Basic, S1, S2, BasicEnergy, SpecEnergy, Trainer, 
 @dataclass
 class ModelConfig:
     # ── Card representation ────────────────────────────────────────────────
-    num_card_ids: int = 600      # safe upper-bound; set to max(CSV card_id) + 1 at runtime
+    num_card_ids: int = 1268     # safe upper-bound; max(CSV card_id) + 1
     card_embed_dim: int = 64     # learnable part
     # static part = 48 (CARD_STATIC_DIM); total = 112
 
@@ -46,6 +46,12 @@ class ModelConfig:
     # ── Deck builder ──────────────────────────────────────────────────────
     num_deck_slots: int = 60
 
+    # ── Value & Reward Categorical Bins ────────────────────────────────────
+    num_value_bins: int = 51
+    value_min: float = -1.2
+    value_max: float = 1.2
+
+
 
 @dataclass
 class SearchConfig:
@@ -63,8 +69,9 @@ class SearchConfig:
 class TrainConfig:
     # ── MuZero unrolling ──────────────────────────────────────────────────
     num_unroll_steps: int = 5
-    td_steps: int = 10
+    td_steps: int = 20
     gamma: float = 0.997
+    target_network_tau: float = 0.995   # EMA decay factor for Target Network Polyak averaging
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     # 256 samples required ~19.5 GB per GPU with the current transformer and
@@ -81,7 +88,14 @@ class TrainConfig:
     replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
     replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 
+    # ── Representation Freezing & Auto-Unfreezing ─────────────────────────
+    freeze_representation_initially: bool = False
+    unfreeze_w: int = 500         # Fenêtre mémoire W (steps)
+    unfreeze_epsilon: float = 0.01 # Seuil de progression epsilon (1%)
+    unfreeze_s_min: int = 2_000   # Seuil de sécurité S_min (steps)
+
     # ── Training schedule ─────────────────────────────────────────────────
+
     num_total_steps: int = 500_000
     self_play_interval: int = 100    # global steps between self-play batches
     games_per_self_play: int = 8
@@ -90,6 +104,7 @@ class TrainConfig:
     max_game_steps: int = 2_000
 
     checkpoint_every: int = 1_000
+    buffer_push_every: int = 3_000   # async replay buffer push to HF Hub
     eval_every: int = 5_000
     eval_games: int = 20
 
@@ -119,13 +134,24 @@ class TrainConfig:
 @dataclass
 class HFConfig:
     enabled: bool = True
-    repo_id: str = "richard151111/muZero"
+    repo_id: str = "richard151111/muzero-V2"
     private: bool = True
     # Nom de la variable d'environnement contenant le token HF
     # (ex: export HF_TOKEN=hf_xxx dans le terminal Kaggle, PAS le token lui-même)
     token_env_var: str = "HF_TOKEN"
     push_every_n_transitions: int = 10_000
     local_dir: str = "./hf_checkpoints"
+
+
+@dataclass
+class WandBConfig:
+    enabled: bool = True
+    project: str = "muzero"
+    entity: str | None = None
+    name: str | None = None
+    mode: str = "online"   # "online", "offline", or "disabled"
+    token_env_var: str = "WANDB_API_KEY"
+    kaggle_secret_name: str = "WANDB"
 
 
 @dataclass
@@ -150,6 +176,7 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     hf: HFConfig = field(default_factory=HFConfig)
+    wandb: WandBConfig = field(default_factory=WandBConfig)
     infra: InfraConfig = field(default_factory=InfraConfig)
 
     # ── Serialisation ─────────────────────────────────────────────────────
@@ -164,6 +191,7 @@ class Config:
             search=SearchConfig(**d["search"]),
             train=TrainConfig(**d["train"]),
             hf=HFConfig(**d["hf"]),
+            wandb=WandBConfig(**d.get("wandb", {})),
             infra=InfraConfig(**d["infra"]),
         )
 

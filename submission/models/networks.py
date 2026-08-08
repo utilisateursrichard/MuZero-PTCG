@@ -282,6 +282,8 @@ class RepresentationNetwork(nn.Module):
         # ── Available options ─────────────────────────────────────────────
         opt_card = self.card_emb(obs["option_ids"])   # [B, A, card_dim]
         opt_feat = obs["option_feat"]                 # [B, A, OPTION_FEAT_DIM]
+        if opt_feat.shape[-1] > 45 and opt_card.shape[-1] == 112:
+            opt_feat = opt_feat[..., :45]
         opt_tok  = self.option_proj(
             jnp.concatenate([opt_card, opt_feat], axis=-1)
         )
@@ -307,29 +309,63 @@ class PredictionNetwork(nn.Module):
 
     @nn.compact
     def __call__(
-        self, z: jnp.ndarray
+        self, z: jnp.ndarray, option_feat: jnp.ndarray | None = None
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Args:
             z: latent state [B, latent_dim]
+            option_feat: optional [B, max_actions, OPTION_FEAT_DIM] for Pointer Network matching
         Returns:
             policy_logits: [B, max_actions]
-            value:         [B]            (scalar in [-1, 1] via tanh)
+            value_scalar:  [B]            (expected scalar in [v_min, v_max])
+        """
+        pi, v_scalar, _ = self.predict_full(z, option_feat=option_feat)
+        return pi, v_scalar
+
+    @nn.compact
+    def predict_full(
+        self, z: jnp.ndarray, option_feat: jnp.ndarray | None = None
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Returns:
+            policy_logits: [B, max_actions]
+            value_scalar:  [B]            (expected scalar in [v_min, v_max])
+            value_logits:  [B, num_bins]   (categorical distribution logits)
         """
         D = self.cfg.latent_dim
+        num_bins = getattr(self.cfg, "num_value_bins", 51)
+        v_min = getattr(self.cfg, "value_min", -2.5)
+        v_max = getattr(self.cfg, "value_max", 2.5)
 
-        # Policy head
-        pi = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
-        pi = LayerNorm()(pi)
-        pi = nn.Dense(self.cfg.max_actions)(pi)
+        # Policy head with Pointer Network / Cross-Attention
+        pi_hid = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
+        pi_hid = LayerNorm()(pi_hid)
 
-        # Value head
-        v  = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
-        v  = LayerNorm()(v)
-        v  = nn.Dense(1)(v)
-        v  = jnp.tanh(v)[..., 0]    # [B]
+        pi_dense_logits = nn.Dense(self.cfg.max_actions, name="pi_dense")(pi_hid)
 
-        return pi, v
+        opt_f = option_feat if option_feat is not None else jnp.zeros((z.shape[0], self.cfg.max_actions, OPTION_FEAT_DIM), dtype=z.dtype)
+        if opt_f.shape[-1] > 45:
+            opt_f = opt_f[..., :45]
+        q = nn.Dense(64, name="pi_q")(pi_hid)                         # [B, 64]
+        k = nn.Dense(64, name="pi_k")(opt_f)                          # [B, A, 64]
+
+        if option_feat is not None:
+            ptr_logits = jnp.einsum("bd,bad->ba", q, k) / (64.0 ** 0.5)     # [B, A]
+            pi_logits = pi_dense_logits + ptr_logits
+        else:
+            pi_logits = pi_dense_logits
+
+        # Value head (Categorical logits)
+        v_hid = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
+        v_hid = LayerNorm()(v_hid)
+        v_logits = nn.Dense(num_bins, name="v_dense")(v_hid)
+
+        # Decode expected value scalar for MCTS
+        v_probs = jax.nn.softmax(v_logits, axis=-1)
+        bins = jnp.linspace(v_min, v_max, num_bins)
+        v_scalar = jnp.sum(v_probs * bins, axis=-1)
+
+        return pi_logits, v_scalar, v_logits
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,14 +374,7 @@ class PredictionNetwork(nn.Module):
 class DynamicsNetwork(nn.Module):
     """
     Simulates one game step in latent space.
-
-    Action is a one-hot over max_actions.
-    The network also outputs an `is_stochastic` logit; if high, a collapsed
-    expectation over 2 chance outcomes (coin flip heads/tails) is computed:
-
-        z_next = 0.5 * z_heads + 0.5 * z_tails
-
-    This is the "collapsed chance node" approximation.
+    Receives either action_feat (45-dim semantic vector) or action_onehot.
     """
     cfg: ModelConfig
 
@@ -354,50 +383,63 @@ class DynamicsNetwork(nn.Module):
         self,
         z: jnp.ndarray,
         action_onehot: jnp.ndarray,
+        action_feat: jnp.ndarray | None = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Args:
             z:             [B, latent_dim]
             action_onehot: [B, max_actions]
+            action_feat:   optional [B, OPTION_FEAT_DIM] semantic action features
         Returns:
-            reward:  [B]
+            reward:  [B] (expected scalar)
             z_next:  [B, latent_dim]
         """
-        D = self.cfg.latent_dim
+        r_scalar, _, z_next = self.dynamics_full(z, action_onehot, action_feat=action_feat)
+        return r_scalar, z_next
 
-        # Encode action
-        a_emb = nn.Dense(D)(action_onehot)  # [B, D]
+    @nn.compact
+    def dynamics_full(
+        self,
+        z: jnp.ndarray,
+        action_onehot: jnp.ndarray,
+        action_feat: jnp.ndarray | None = None,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Returns:
+            reward_scalar: [B]            (expected scalar)
+            reward_logits: [B, num_bins]   (categorical reward logits)
+            z_next:        [B, latent_dim]
+        """
+        D = self.cfg.latent_dim
+        num_bins = getattr(self.cfg, "num_value_bins", 51)
+        v_min = getattr(self.cfg, "value_min", -2.5)
+        v_max = getattr(self.cfg, "value_max", 2.5)
+
+        a_emb_onehot = nn.Dense(D, name="a_emb")(action_onehot)
+
+        act_f = action_feat if action_feat is not None else jnp.zeros((z.shape[0], OPTION_FEAT_DIM), dtype=z.dtype)
+        if act_f.shape[-1] > 45:
+            act_f = act_f[..., :45]
+        a_emb_feat = nn.Dense(D, name="a_feat_emb")(act_f)
+
+        if action_feat is not None:
+            a_emb = a_emb_feat
+        else:
+            a_emb = a_emb_onehot
         a_emb = nn.gelu(a_emb)
 
         x = jnp.concatenate([z, a_emb], axis=-1)   # [B, 2D]
 
-        # Is this transition stochastic (coin-flip)?
-        stoch_logit = nn.Dense(1)(x)               # [B, 1]
-        stoch_prob  = jax.nn.sigmoid(stoch_logit[..., 0])  # [B]
+        # Clean deterministic transition (prevents linear vector averaging / OOD states)
+        z_next = self._transition_mlp(x, name="det")
+        r_logits = self._reward_mlp(x, name="rdet", num_bins=num_bins)
 
-        # Deterministic branch
-        z_det  = self._transition_mlp(x, name="det")
-        r_det  = self._reward_mlp(x, name="rdet")
+        r_probs = jax.nn.softmax(r_logits, axis=-1)
+        bins = jnp.linspace(v_min, v_max, num_bins)
+        r_scalar = jnp.sum(r_probs * bins, axis=-1)
 
-        # Heads branch (coin = heads → typically better outcome)
-        x_h   = jnp.concatenate([x, jnp.ones_like(a_emb[:, :1])], axis=-1)
-        z_h   = self._transition_mlp(x_h, name="heads")
-        r_h   = self._reward_mlp(x_h, name="rheads")
+        return r_scalar, r_logits, z_next
 
-        # Tails branch
-        x_t   = jnp.concatenate([x, -jnp.ones_like(a_emb[:, :1])], axis=-1)
-        z_t   = self._transition_mlp(x_t, name="tails")
-        r_t   = self._reward_mlp(x_t, name="rtails")
-
-        # Collapse: expected next state weighted by stochasticity probability
-        z_coin = 0.5 * z_h + 0.5 * z_t     # expected over coin flip
-        r_coin = 0.5 * r_h + 0.5 * r_t
-
-        p = stoch_prob[:, None]
-        z_next = (1.0 - p) * z_det + p * z_coin
-        reward = (1.0 - stoch_prob) * r_det + stoch_prob * r_coin
-
-        return reward, z_next
 
     def _transition_mlp(
         self, x: jnp.ndarray, *, name: str
@@ -410,13 +452,13 @@ class DynamicsNetwork(nn.Module):
         return h
 
     def _reward_mlp(
-        self, x: jnp.ndarray, *, name: str
+        self, x: jnp.ndarray, *, name: str, num_bins: int = 51
     ) -> jnp.ndarray:
         D = self.cfg.latent_dim
         h = nn.Dense(D // 2, name=f"{name}_fc1")(x)
         h = nn.gelu(h)
-        h = nn.Dense(1, name=f"{name}_fc2")(h)
-        return jnp.tanh(h)[..., 0]   # scalar per sample
+        return nn.Dense(num_bins, name=f"{name}_fc2")(h)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -472,14 +514,25 @@ class MuZeroNetwork(nn.Module):
         return self.h(obs, deterministic=deterministic)
 
     def predict(
-        self, z: jnp.ndarray
+        self, z: jnp.ndarray, option_feat: jnp.ndarray | None = None
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        return self.f(z)
+        return self.f(z, option_feat=option_feat)
+
+    def predict_full(
+        self, z: jnp.ndarray, option_feat: jnp.ndarray | None = None
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        return self.f.predict_full(z, option_feat=option_feat)
 
     def dynamics(
         self, z: jnp.ndarray, action_onehot: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        return self.g(z, action_onehot)
+        r_scalar, z_next = self.g(z, action_onehot)
+        return z_next, r_scalar
+
+    def dynamics_full(
+        self, z: jnp.ndarray, action_onehot: jnp.ndarray
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        return self.g.dynamics_full(z, action_onehot)
 
     def project_state(self, z: jnp.ndarray) -> jnp.ndarray:
         return self.project(z)
@@ -492,7 +545,10 @@ class MuZeroNetwork(nn.Module):
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Full forward pass for the root node: h → f."""
         z        = self.represent(obs, deterministic=deterministic)
-        pi, v    = self.predict(z)
+        opt_feat = obs.get("option_feat", None) if isinstance(obs, dict) else None
+        pi, v    = self.predict(z, option_feat=opt_feat)
+
+
         
         # Force l'initialisation des paramètres du modèle de dynamique (self.g)
         # et des têtes de projection/prédiction pendant l'init sans affecter la sortie de la racine.

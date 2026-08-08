@@ -59,7 +59,7 @@
   },
   "hf": {
     "enabled": true,
-    "repo_id": "richard151111/muZero",
+    "repo_id": "richard151111/muzero-V2",
     "private": true,
     "token_env_var": "HF_TOKEN",
     "push_every_n_transitions": 10000,

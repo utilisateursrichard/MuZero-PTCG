@@ -308,74 +308,128 @@ def cmd_submit(args) -> None:
     mz_params, dk_params = None, None
     loaded_cfg = cfg
 
-    from export.hub import load_from_hub, get_hf_token
+    from config import Config
+    from export.hub import load_from_hub, get_hf_token, _unflatten_params, _flatten_params
+    from safetensors.numpy import load_file
     token = get_hf_token(cfg)
 
     download_success = False
     if cfg.hf.enabled:
-        logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
-        try:
-            mz_params, dk_params, loaded_cfg, step_val = load_from_hub(
-                repo_id=cfg.hf.repo_id,
-                step=step_num,
-                token=token,
-                cfg=cfg,
-            )
+        if not token:
+            logger.info("HF_TOKEN non fourni. Tentative d'accès au Hub HF ou recherche des poids locaux...")
+        else:
+            logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
+
+        mz_params, dk_params, loaded_cfg, step_val = load_from_hub(
+            repo_id=cfg.hf.repo_id,
+            step=step_num,
+            token=token,
+            cfg=cfg,
+        )
+        if mz_params is not None:
             download_success = True
             logger.info("✓ Checkpoint HF chargé avec succès (step=%s)", step_val)
-        except Exception as exc:
-            logger.warning("Impossible de charger depuis le Hub HF : %s", exc)
 
-    # Si le téléchargement HF a échoué ou HF désactivé, chercher les checkpoints locaux
+    # Si le téléchargement HF a échoué ou HF désactivé/non authentifié, chercher les poids locaux
     if not download_success:
-        logger.info("Recherche de checkpoints locaux dans %s...", cfg.hf.local_dir)
-        local_dir = Path(cfg.hf.local_dir)
-        if local_dir.exists():
-            step_dirs = sorted([d for d in local_dir.glob("step_*") if d.is_dir()])
-            if step_dirs:
-                target_dir = step_dirs[-1]
-                logger.info("Utilisation du checkpoint local le plus récent → %s", target_dir)
-                try:
-                    from safetensors.numpy import load_file
-                    from export.hub import _unflatten_params
-                    mz_path = target_dir / "muzero.safetensors"
-                    dk_path = target_dir / "deck_builder.safetensors"
-                    cfg_path = target_dir / "config.json"
-                    if mz_path.exists():
-                        mz_params = _unflatten_params(load_file(str(mz_path)))
-                        shutil.copy2(mz_path, out_dir / "muzero.safetensors")
-                    if dk_path.exists():
-                        dk_params = _unflatten_params(load_file(str(dk_path)))
-                        shutil.copy2(dk_path, out_dir / "deck_builder.safetensors")
-                    if cfg_path.exists():
-                        loaded_cfg = Config.from_json(cfg_path.read_text())
-                        shutil.copy2(cfg_path, out_dir / "config.json")
-                    download_success = True
-                except Exception as exc:
-                    logger.error("Erreur lors de la lecture des safetensors locaux : %s", exc)
+        logger.info("Recherche de checkpoints et poids locaux (hf_checkpoints, checkpoints, submission, root)...")
 
-    # Si on a téléchargé depuis HF, sauvegarder/copier les safetensors dans out_dir
-    if download_success and mz_params is not None:
-        try:
-            from huggingface_hub import hf_hub_download
-            subfolder = f"step_{step_val:07d}" if step_val is not None else ""
-            def _dl(filename):
-                return hf_hub_download(
-                    repo_id=cfg.hf.repo_id,
-                    filename=f"{subfolder}/{filename}" if subfolder else filename,
-                    token=token,
-                )
+        # Option A : Fichiers safetensors déjà présents dans out_dir (submission/)
+        mz_out = out_dir / "muzero.safetensors"
+        dk_out = out_dir / "deck_builder.safetensors"
+        cfg_out = out_dir / "config.json"
+        if mz_out.exists() and dk_out.exists():
             try:
-                shutil.copy2(_dl("muzero.safetensors"), out_dir / "muzero.safetensors")
-                shutil.copy2(_dl("deck_builder.safetensors"), out_dir / "deck_builder.safetensors")
-                shutil.copy2(_dl("config.json"), out_dir / "config.json")
-                logger.info("✓ Fichiers safetensors copiés depuis le Hub vers %s", out_dir)
+                mz_params = _unflatten_params(load_file(str(mz_out)))
+                dk_params = _unflatten_params(load_file(str(dk_out)))
+                if cfg_out.exists():
+                    loaded_cfg = Config.from_json(cfg_out.read_text())
+                download_success = True
+                logger.info("✓ Safetensors locaux trouvés dans le dossier de soumission (%s)", out_dir)
             except Exception as e:
-                from safetensors.numpy import save_file
-                from export.hub import _flatten_params
-                save_file(_flatten_params(mz_params), str(out_dir / "muzero.safetensors"))
+                logger.warning("Erreur lors de la lecture des safetensors dans %s: %s", out_dir, e)
+
+        # Option B : hf_checkpoints (step_*)
+        if not download_success:
+            local_dir = Path(cfg.hf.local_dir)
+            if local_dir.exists():
+                step_dirs = sorted([d for d in local_dir.glob("step_*") if d.is_dir()])
+                if step_dirs:
+                    target_dir = step_dirs[-1]
+                    logger.info("Utilisation du checkpoint local hf_checkpoints → %s", target_dir)
+                    try:
+                        mz_path = target_dir / "muzero.safetensors"
+                        dk_path = target_dir / "deck_builder.safetensors"
+                        cfg_path = target_dir / "config.json"
+                        if mz_path.exists():
+                            mz_params = _unflatten_params(load_file(str(mz_path)))
+                            shutil.copy2(mz_path, out_dir / "muzero.safetensors")
+                        if dk_path.exists():
+                            dk_params = _unflatten_params(load_file(str(dk_path)))
+                            shutil.copy2(dk_path, out_dir / "deck_builder.safetensors")
+                        if cfg_path.exists():
+                            loaded_cfg = Config.from_json(cfg_path.read_text())
+                            shutil.copy2(cfg_path, out_dir / "config.json")
+                        download_success = True
+                    except Exception as exc:
+                        logger.error("Erreur lors de la lecture des safetensors locaux : %s", exc)
+
+        # Option C : pickle checkpoint (ckpt_latest.pkl) dans checkpoint_dir
+        if not download_success:
+            ckpt_dir = Path(cfg.infra.checkpoint_dir)
+            latest_pkl = ckpt_dir / "ckpt_latest.pkl"
+            if not latest_pkl.exists() and ckpt_dir.exists():
+                pkls = sorted(list(ckpt_dir.glob("ckpt_*.pkl")))
+                if pkls:
+                    latest_pkl = pkls[-1]
+
+            if latest_pkl.exists():
+                try:
+                    import pickle
+                    with open(latest_pkl, "rb") as f:
+                        ckpt_data = pickle.load(f)
+                    mz_params = ckpt_data.get("params", {})
+                    dk_params = ckpt_data.get("deck", {})
+                    download_success = True
+                    logger.info("✓ Poids chargés depuis le checkpoint pickle local (%s, step=%d)", latest_pkl, ckpt_data.get("step", 0))
+
+                    if mz_params:
+                        from safetensors.numpy import save_file
+                        save_file(_flatten_params(mz_params), str(out_dir / "muzero.safetensors"))
+                    if dk_params:
+                        from safetensors.numpy import save_file
+                        save_file(_flatten_params(dk_params, prefix="deck"), str(out_dir / "deck_builder.safetensors"))
+                    (out_dir / "config.json").write_text(loaded_cfg.to_json())
+                except Exception as e:
+                    logger.warning("Échec de lecture du pkl %s : %s", latest_pkl, e)
+
+        # Option D : safetensors situés dans le dossier racine ou parent
+        if not download_success:
+            for root_path in [Path("."), Path(__file__).resolve().parent.parent]:
+                mz_root = root_path / "muzero.safetensors"
+                dk_root = root_path / "deck_builder.safetensors"
+                if mz_root.exists() or dk_root.exists():
+                    try:
+                        if mz_root.exists():
+                            mz_params = _unflatten_params(load_file(str(mz_root)))
+                            shutil.copy2(mz_root, out_dir / "muzero.safetensors")
+                        if dk_root.exists():
+                            dk_params = _unflatten_params(load_file(str(dk_root)))
+                            shutil.copy2(dk_root, out_dir / "deck_builder.safetensors")
+                        download_success = True
+                        logger.info("✓ Safetensors racine (%s) copiés dans %s", root_path, out_dir)
+                        break
+                    except Exception as e:
+                        logger.warning("Erreur lecture safetensors racine %s: %s", root_path, e)
+
+    # Si téléchargé depuis HF avec succès, sauvegarder dans out_dir
+    if download_success and mz_params is not None and not (out_dir / "muzero.safetensors").exists():
+        try:
+            from safetensors.numpy import save_file
+            save_file(_flatten_params(mz_params), str(out_dir / "muzero.safetensors"))
+            if dk_params:
                 save_file(_flatten_params(dk_params, prefix="deck"), str(out_dir / "deck_builder.safetensors"))
-                (out_dir / "config.json").write_text(loaded_cfg.to_json())
+            (out_dir / "config.json").write_text(loaded_cfg.to_json())
         except Exception as exc:
             logger.warning("Avertissement lors de la sauvegarde locale des safetensors dans %s: %s", out_dir, exc)
 
@@ -605,6 +659,27 @@ def _load_checkpoint(ckpt_path: str | None, cfg: "Config") -> tuple:
             jax.tree_util.tree_map(jax.device_put, data.get("deck", {})),
         )
 
+    # 1. Vérifier si un checkpoint pickle local récent existe dans checkpoint_dir
+    ckpt_dir = Path(cfg.infra.checkpoint_dir)
+    latest_pkl = ckpt_dir / "ckpt_latest.pkl"
+    if not latest_pkl.exists() and ckpt_dir.exists():
+        pkls = sorted(list(ckpt_dir.glob("ckpt_*.pkl")))
+        if pkls:
+            latest_pkl = pkls[-1]
+
+    if latest_pkl.exists():
+        try:
+            with open(latest_pkl, "rb") as f:
+                data = pickle.load(f)
+            logger.info("Checkpoint local chargé : %s (step=%d)", latest_pkl, data.get("step", -1))
+            return (
+                jax.tree_util.tree_map(jax.device_put, data.get("params", {})),
+                jax.tree_util.tree_map(jax.device_put, data.get("deck", {})),
+            )
+        except Exception:
+            pass
+
+    # 2. Tenter le chargement depuis HF Hub si activé et token disponible
     if cfg.hf.enabled and cfg.hf.repo_id:
         try:
             from export.hub import load_from_hub
@@ -616,7 +691,25 @@ def _load_checkpoint(ckpt_path: str | None, cfg: "Config") -> tuple:
         except Exception as e:
             logger.warning("Échec du chargement depuis HuggingFace Hub : %s", e)
 
-    logger.warning("Aucun checkpoint fourni — paramètres aléatoires.")
+    # 3. Safetensors locaux dans local_dir ou submission/ ou .
+    for safetensors_dir in [Path(cfg.hf.local_dir), Path("submission"), Path(".")]:
+        mz_file = safetensors_dir / "muzero.safetensors"
+        dk_file = safetensors_dir / "deck_builder.safetensors"
+        if mz_file.exists():
+            try:
+                from safetensors.numpy import load_file
+                from export.hub import _unflatten_params
+                mz_p = _unflatten_params(load_file(str(mz_file)))
+                dk_p = _unflatten_params(load_file(str(dk_file))) if dk_file.exists() else {}
+                logger.info("Safetensors locaux chargés depuis %s", safetensors_dir)
+                return (
+                    jax.tree_util.tree_map(jax.device_put, mz_p),
+                    jax.tree_util.tree_map(jax.device_put, dk_p),
+                )
+            except Exception:
+                pass
+
+    logger.warning("Aucun checkpoint trouvé — paramètres aléatoires.")
     return {}, {}
 
 

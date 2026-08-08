@@ -181,11 +181,11 @@ def sample_deck(
         mask = np.zeros(num_card_ids, dtype=np.float32)
         mask[0] = -np.inf   # ID 0 is padding / "no card"
         for cid in range(1, num_card_ids):
-            if cid in energy_set:
-                lim = num_card_ids          # pas de limite sur les énergies de base
-            elif cid in ace_spec_set:
+            if cid in ace_spec_set:
                 # Si le deck contient déjà une carte Ace Spec, toutes les Ace Spec sont interdites
                 lim = 0 if has_ace_spec else 1
+            elif cid in energy_set:
+                lim = num_card_ids          # pas de limite sur les énergies de base
             else:
                 lim = max_copies_normal     # cartes normales : 4 max
             if counts[cid] >= lim:
@@ -200,18 +200,58 @@ def sample_deck(
         if chosen in ace_spec_set:
             has_ace_spec = True
 
-    # battle_start rejects a deck without a Basic Pokémon.  Enforce that
-    # constraint here instead of wasting an entire self-play worker/retry.
-    if basic_set and not any(cid in basic_set for cid in deck):
-        eligible = [
+    # battle_start rejects a deck without Basic Pokémon, and a deck without
+    # Energy cards cannot attach energy or attack.  Enforce strict deck balance:
+    #   - At least 8 Basic Pokémon
+    #   - At least 14 Energy cards
+    min_basic = 8
+    current_basic = sum(1 for cid in deck if cid in basic_set)
+    if basic_set and current_basic < min_basic:
+        eligible_basic = [
             cid for cid in basic_set
             if 0 < cid < num_card_ids and counts[cid] < max_copies_normal
         ]
-        if not eligible:
-            raise ValueError("No Basic Pokémon can be added to the sampled deck.")
-        chosen = max(eligible, key=lambda cid: logits_np[cid])
-        counts[deck[-1]] -= 1
-        deck[-1] = chosen
+        if eligible_basic:
+            for i in range(len(deck) - 1, -1, -1):
+                if current_basic >= min_basic:
+                    break
+                if deck[i] not in basic_set and deck[i] not in energy_set:
+                    chosen = max(eligible_basic, key=lambda cid: logits_np[cid])
+                    counts[deck[i]] -= 1
+                    counts[chosen] += 1
+                    deck[i] = chosen
+                    current_basic += 1
+
+    min_energy = 14
+    current_energy = sum(1 for cid in deck if cid in energy_set)
+    if energy_set and current_energy < min_energy:
+        eligible_energy = [
+            cid for cid in energy_set
+            if 0 < cid < num_card_ids
+        ]
+        if eligible_energy:
+            avail_energy = [cid for cid in eligible_energy if cid not in ace_spec_set or not has_ace_spec]
+            if not avail_energy:
+                avail_energy = [cid for cid in eligible_energy if cid not in ace_spec_set] or eligible_energy
+            energy_logits = logits_np[avail_energy]
+            energy_probs = _softmax_np(energy_logits)
+            for i in range(len(deck) - 1, -1, -1):
+                if current_energy >= min_energy:
+                    break
+                if deck[i] not in energy_set and (deck[i] not in basic_set or current_basic > min_basic):
+                    chosen = int(rng_np.choice(avail_energy, p=energy_probs))
+                    if chosen in ace_spec_set:
+                        has_ace_spec = True
+                        avail_energy = [cid for cid in avail_energy if cid not in ace_spec_set]
+                        if avail_energy:
+                            energy_logits = logits_np[avail_energy]
+                            energy_probs = _softmax_np(energy_logits)
+                    if deck[i] in basic_set:
+                        current_basic -= 1
+                    counts[deck[i]] -= 1
+                    counts[chosen] += 1
+                    deck[i] = chosen
+                    current_energy += 1
 
     return deck, jnp.array(deck, dtype=jnp.int32)
 

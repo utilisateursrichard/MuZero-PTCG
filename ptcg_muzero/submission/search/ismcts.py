@@ -69,7 +69,7 @@ def make_recurrent_fn(
         action_onehot = jax.nn.one_hot(action, num_actions)   # [B, A]
 
         # g: dynamics (using dynamics_fn directly with apply syntax wrapper)
-        reward, z_next = network.apply(
+        z_next, reward = network.apply(
             params, embedding, action_onehot, method=network.dynamics
         )
 

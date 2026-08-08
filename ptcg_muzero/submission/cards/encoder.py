@@ -144,6 +144,19 @@ class CardStaticFeatures:
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _load(self, path: Path) -> None:
+        if not path.exists():
+            workspace_root = Path(__file__).parent.parent.parent
+            candidates = [
+                Path("competiton/EN_Card_Data.csv"),
+                workspace_root / "competiton" / "EN_Card_Data.csv",
+                Path("/root/workspace/competiton/EN_Card_Data.csv"),
+            ]
+            for cand in candidates:
+                if cand.exists():
+                    logger.info("CardStaticFeatures: fallback path found at %s", cand)
+                    path = cand
+                    break
+
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:

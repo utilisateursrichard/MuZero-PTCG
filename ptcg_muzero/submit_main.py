@@ -153,8 +153,12 @@ def _init_agent():
     cfg_path = _resolve("config.json")
     mz_path = _resolve("muzero.safetensors")
 
-    _cfg = Config.from_json(open(cfg_path, encoding="utf-8").read()) if os.path.exists(cfg_path) else Config()
-    _mz_params = _unflatten_params(load_file(mz_path)) if os.path.exists(mz_path) else {}
+    if not cfg_path or not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"ERREUR FATALE : Le fichier de configuration 'config.json' est introuvable (résolu: {cfg_path}). Aucun fallback silencieux n'est autorisé.")
+    if not mz_path or not os.path.exists(mz_path):
+        raise FileNotFoundError(f"ERREUR FATALE : Le fichier de poids 'muzero.safetensors' est introuvable (résolu: {mz_path}). Aucun fallback silencieux vers des poids aléatoires n'est autorisé.")
+
+    _cfg = Config.from_json(open(cfg_path, encoding="utf-8").read())
 
     cards_csv = _find_cards_csv()
     if cards_csv and os.path.exists(cards_csv):
@@ -169,9 +173,12 @@ def _init_agent():
     _network = MuZeroNetwork(cfg=_cfg.model, static_features=_static)
     _rng = jax.random.PRNGKey(42)
 
+    # Chargement direct et autonome des poids (sans dépendance vers le module training)
+    loaded_raw = _unflatten_params(load_file(mz_path))
+    _mz_params = loaded_raw.get("muzero", loaded_raw)
+
     # Warmup JIT-compilation pour que la 1ère action soit quasi-instantanée
     try:
-        dummy_enc = encode_observation({}, 0, _cfg.model)
         dummy_mask = dummy_enc["option_mask"]
         _rng, rng_warmup = jax.random.split(_rng)
         ismcts_action(_network, _mz_params, dummy_enc, dummy_mask, rng_warmup, _cfg)
@@ -199,7 +206,7 @@ def agent(obs_dict) -> list[int]:
 
     import jax
     import numpy as np
-    from env.encoding import encode_observation
+    from env.encoding import encode_observation, _int_from
     from search.ismcts import ismcts_action
 
     global _rng
@@ -210,9 +217,13 @@ def agent(obs_dict) -> list[int]:
     mask = enc["option_mask"]
     best, avg_policy, _ = ismcts_action(_network, _mz_params, enc, mask, rng_act, _cfg)
 
+    policy_masked = np.where(mask, np.asarray(avg_policy), -1e9)
+    best = int(np.argmax(policy_masked))
+
     max_cnt = obs.select.maxCount if hasattr(obs.select, "maxCount") else 1
     if max_cnt > 1:
         scores = np.where(mask, np.asarray(avg_policy), -1e9)
-        sorted_idx = sorted(np.argsort(-scores)[:max_cnt].tolist())
-        return sorted_idx
+        top_k_indices = np.argsort(-scores)[:max_cnt].tolist()
+        return top_k_indices
     return [best]
+

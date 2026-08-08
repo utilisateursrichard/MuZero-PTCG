@@ -204,7 +204,7 @@ def main():
         deck_params = deck_net.init(rng_init, context=dummy_ctx)
 
     logits, _ = deck_net.apply(deck_params)
-    deck_60, _ = sample_deck(logits[0], rng, num_card_ids, energy_ids)
+    deck_60, _ = sample_deck(logits[0], rng, num_card_ids, energy_ids, ace_spec_ids=card_data.ace_spec_ids, basic_pokemon_ids=basic_ids)
 
     # 1. Export CSV
     if args.csv and args.csv.lower() != "none":

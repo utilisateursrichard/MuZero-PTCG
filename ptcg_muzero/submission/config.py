@@ -20,7 +20,7 @@ NUM_STAGES: int = 7          # Basic, S1, S2, BasicEnergy, SpecEnergy, Trainer, 
 @dataclass
 class ModelConfig:
     # ── Card representation ────────────────────────────────────────────────
-    num_card_ids: int = 600      # safe upper-bound; set to max(CSV card_id) + 1 at runtime
+    num_card_ids: int = 1268     # safe upper-bound; max(CSV card_id) + 1
     card_embed_dim: int = 64     # learnable part
     # static part = 48 (CARD_STATIC_DIM); total = 112
 
@@ -48,8 +48,8 @@ class ModelConfig:
 
     # ── Value & Reward Categorical Bins ────────────────────────────────────
     num_value_bins: int = 51
-    value_min: float = -2.5
-    value_max: float = 2.5
+    value_min: float = -1.2
+    value_max: float = 1.2
 
 
 
@@ -69,8 +69,9 @@ class SearchConfig:
 class TrainConfig:
     # ── MuZero unrolling ──────────────────────────────────────────────────
     num_unroll_steps: int = 5
-    td_steps: int = 200
+    td_steps: int = 20
     gamma: float = 0.997
+    target_network_tau: float = 0.995   # EMA decay factor for Target Network Polyak averaging
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     # 256 samples required ~19.5 GB per GPU with the current transformer and
@@ -103,6 +104,7 @@ class TrainConfig:
     max_game_steps: int = 2_000
 
     checkpoint_every: int = 1_000
+    buffer_push_every: int = 3_000   # async replay buffer push to HF Hub
     eval_every: int = 5_000
     eval_games: int = 20
 
@@ -132,7 +134,7 @@ class TrainConfig:
 @dataclass
 class HFConfig:
     enabled: bool = True
-    repo_id: str = "richard151111/muZero"
+    repo_id: str = "richard151111/muzero-V2"
     private: bool = True
     # Nom de la variable d'environnement contenant le token HF
     # (ex: export HF_TOKEN=hf_xxx dans le terminal Kaggle, PAS le token lui-même)
