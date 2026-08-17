@@ -119,7 +119,7 @@ def main():
         rng, rng_mz, rng_pr, rng_dk = jax.random.split(rng, 4)
         
         if not params:
-            mz_params = network.init(rng_mz, batch_obs)
+            mz_params = network.init(rng_mz, batch_obs, method=network.init_all)
             z_dummy = jnp.zeros((1, cfg.model.latent_dim))
             pr_params = probes.init(rng_pr, z_dummy)
             params = {"muzero": mz_params, "probes": pr_params}

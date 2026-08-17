@@ -46,6 +46,81 @@ OPTION_FEAT_DIM: int = OPTION_TYPE_DIM + AREA_DIM + AREA_DIM + 1 + 1 + 2 + 1 + 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Comptage des prizes restants
+# ─────────────────────────────────────────────────────────────────────────────
+# VÉRIFIÉ SUR LE MOTEUR (diag_prize.py) : `len(player["prize"])` est le bon
+# compteur.  Le moteur retire les prizes prises de la liste — mesuré sur une
+# partie réelle : p0 6 → 3, p1 6 → 4 → 3 → 1.  `global_feat[6]/[7]` sont donc
+# bien informatifs et le réseau voit le score.
+#
+# Deux particularités à connaître :
+#   • avant la distribution (turn 0) la liste est VIDE, donc le compteur vaut 0
+#     puis saute à 6 — ne jamais prendre la première valeur comme référence ;
+#   • toutes les entrées valent `None` (prizes face cachée), donc
+#     `my_prize_ids` / `opp_prize_ids` sont toujours nuls.  Ces features ne sont
+#     d'ailleurs pas consommées par le réseau (aucune occurrence dans
+#     models/networks.py).
+#
+# `prize_left` reste tolérant : si une version du moteur exposait un compteur
+# scalaire, il serait préféré.  `set_prize_count_key` permet de le déclarer.
+_PRIZE_COUNT_KEYS = (
+    "prizeCount", "prizeRemaining", "remainingPrize", "prizesLeft", "prizeLeft",
+    "prize_count", "prizeNum", "prizeRemain",
+)
+_PRIZE_KEY_OVERRIDE: Optional[str] = None
+
+
+MAX_PRIZES = 6
+
+
+def set_prize_count_key(key: Optional[str]) -> None:
+    """Déclare le champ scalaire exposant le nombre de prizes restants.
+
+    À renseigner une fois `diag_prize.py` exécuté.  ``None`` rétablit la
+    détection automatique.
+    """
+    global _PRIZE_KEY_OVERRIDE
+    _PRIZE_KEY_OVERRIDE = key
+
+
+def _get_field(obj, key):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def prize_left(player, default: int = MAX_PRIZES) -> int:
+    """Nombre de prizes restants à prendre pour ce joueur.
+
+    Ordre de résolution :
+      1. champ déclaré via ``set_prize_count_key``
+      2. champ scalaire connu (``prizeCount``, ``prizeRemaining``, …)
+      3. ``len(player["prize"])`` — chemin nominal, vérifié correct sur le moteur.
+
+    Renvoie 0 avant la distribution des prizes (la liste est alors vide).
+    """
+    keys = ((_PRIZE_KEY_OVERRIDE,) if _PRIZE_KEY_OVERRIDE else ()) + _PRIZE_COUNT_KEYS
+    for k in keys:
+        v = _get_field(player, k)
+        if v is None:
+            continue
+        if hasattr(v, "value"):
+            v = v.value
+        try:
+            return max(0, min(int(v), MAX_PRIZES))
+        except (TypeError, ValueError):
+            continue
+
+    prizes = _get_field(player, "prize")
+    if isinstance(prizes, (list, tuple)):
+        # Chemin nominal : vérifié comme correct sur le moteur.
+        return max(0, min(len(prizes), MAX_PRIZES))
+    return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main encoding function
 # ─────────────────────────────────────────────────────────────────────────────
 def _as_dict(obj) -> dict:
@@ -127,8 +202,8 @@ def encode_observation(
     # ── Global features ───────────────────────────────────────────────────
     turn          = current.get("turn", 0)
     # prizes remaining = total - taken; face-down prize = still in play
-    my_prizes_left  = len(me.get("prize") or [])
-    opp_prizes_left = len(opp.get("prize") or [])
+    my_prizes_left  = prize_left(me)
+    opp_prizes_left = prize_left(opp)
 
     global_feat = np.array([
         min(turn, 200) / 200.0,
@@ -319,7 +394,11 @@ def _encode_card_list(cards: Optional[list], max_len: int) -> tuple:
         return ids, mask
     for i, card in enumerate(cards[:max_len]):
         if card is not None:
-            ids[i]  = card.get("id", NO_CARD) or NO_CARD
+            if isinstance(card, (int, np.integer)):
+                cid = int(card)
+            else:
+                cid = _int_from(card, "id", NO_CARD) or NO_CARD
+            ids[i]  = cid
             mask[i] = True
     return ids, mask
 
@@ -329,7 +408,11 @@ def _encode_prize(prizes: list, max_size: int) -> np.ndarray:
     ids = np.zeros(max_size, dtype=np.int32)
     for i, p in enumerate(prizes[:max_size]):
         if p is not None:
-            ids[i] = p.get("id", NO_CARD) or NO_CARD
+            if isinstance(p, (int, np.integer)):
+                cid = int(p)
+            else:
+                cid = _int_from(p, "id", NO_CARD) or NO_CARD
+            ids[i] = cid
     return ids
 
 
@@ -433,14 +516,44 @@ def _encode_options(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reward extraction from logs
+# Reward extraction and board state helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_step_reward(logs: list, my_idx: int) -> float:
+def extract_prizes_left(obs_dict, my_idx: int) -> Tuple[int, int]:
+    """Extrait le nombre de prizes restantes (my_prizes, opp_prizes) pour le joueur my_idx."""
+    obs = _as_dict(obs_dict)
+    current = _as_dict(obs.get("current"))
+    players = current.get("players") or [{}, {}]
+    players = [_as_dict(p) for p in players]
+    opp_idx = 1 - my_idx
+    me = players[my_idx] if my_idx < len(players) else {}
+    opp = players[opp_idx] if opp_idx < len(players) else {}
+    return prize_left(me), prize_left(opp)
+
+
+def extract_deck_count(obs_dict, my_idx: int) -> int:
+    """Extrait le nombre de cartes restantes dans le deck du joueur my_idx."""
+    obs = _as_dict(obs_dict)
+    current = _as_dict(obs.get("current"))
+    players = current.get("players") or [{}, {}]
+    if my_idx < len(players):
+        p_dict = _as_dict(players[my_idx])
+        c = p_dict.get("deckCount")
+        if c is not None:
+            return int(c)
+        deck = p_dict.get("deck")
+        if isinstance(deck, (list, tuple)):
+            return len(deck)
+    return 0
+
+
+def extract_step_reward(
+    logs: list,
+    my_idx: int,
+    win_reward: float = 1.0,
+    loss_penalty: float = 1.0,
+) -> float:
     """
-    Sparse rewards only:
-      +1.0  if I win
-      -1.0  if I lose
-       0.0  otherwise
+    Extrait la récompense terminale depuis les logs si le jeu est terminé (RESULT).
     """
     for log in logs:
         log_type = _int_from(log, "type", -1)
@@ -448,9 +561,9 @@ def extract_step_reward(logs: list, my_idx: int) -> float:
         if log_type == 23:
             result = _int_from(log, "result", 2)
             if result == my_idx:
-                return 1.0
+                return float(win_reward)
             elif result != 2:      # != draw
-                return -1.0
+                return -float(loss_penalty)
     return 0.0
 
 
@@ -474,3 +587,4 @@ def _int_from(obj, key: str, default: int) -> int:
         except (ValueError, TypeError):
             pass
     return default
+

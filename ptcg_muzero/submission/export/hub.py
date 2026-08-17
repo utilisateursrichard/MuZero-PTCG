@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Dict
@@ -96,8 +97,36 @@ def save_local(
     return out_dir
 
 
-def get_hf_token(cfg: Config | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
-    """Récupère le token HuggingFace depuis les variables d'environnement, huggingface_hub ou Kaggle Secrets."""
+def verify_hf_token(token: str | None) -> bool:
+    """Vérifie si le token HuggingFace est valide auprès de l'API Hugging Face."""
+    if not token or not token.strip():
+        return False
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        api.whoami(token=token)
+        return True
+    except Exception as e:
+        err_str = str(e).lower()
+        if "401" in err_str or "unauthorized" in err_str or "invalid" in err_str or "token" in err_str:
+            logger.error("Token HF invalide ou rejeté par l'API Hugging Face : %s", e)
+            return False
+        logger.warning("Validation du token HF impossible auprès du serveur (erreur réseau ou serveur) : %s", e)
+        return True
+
+
+def get_hf_token(
+    cfg: Config | None = None,
+    token_env_var: str = "HF_TOKEN",
+    required: bool = False,
+) -> str | None:
+    """Récupère et valide le token HuggingFace depuis l'environnement, huggingface_hub ou Kaggle Secrets.
+
+    Si HF est activé (cfg.hf.enabled) ou si required=True, le script s'arrête (sys.exit(1))
+    immédiatement si le token est inconnu ou invalide.
+    """
+    should_require = required or (cfg is not None and hasattr(cfg, "hf") and getattr(cfg.hf, "enabled", False))
+
     env_var = cfg.hf.token_env_var if (cfg and hasattr(cfg, "hf") and hasattr(cfg.hf, "token_env_var")) else token_env_var
     token = os.environ.get(env_var, "") or os.environ.get("HF_TOKEN", "") or os.environ.get("HUGGINGFACE_TOKEN", "")
     if not token:
@@ -117,7 +146,27 @@ def get_hf_token(cfg: Config | None = None, token_env_var: str = "HF_TOKEN") -> 
                 logger.info("Token HF récupéré depuis Kaggle Secrets.")
         except Exception:
             pass
-    return token if token else None
+
+    if not token or not token.strip():
+        if should_require:
+            logger.error(
+                "ERREUR FATALE : Token Hugging Face inconnu (variable '%s', HF_TOKEN ou Secret Kaggle absent). Interruption du script.",
+                env_var,
+            )
+            sys.exit(1)
+        return None
+
+    token = token.strip()
+    if not verify_hf_token(token):
+        if should_require:
+            logger.error(
+                "ERREUR FATALE : Token Hugging Face invalide/inconnu (variable '%s' ou HF_TOKEN rejeté). Interruption du script.",
+                env_var,
+            )
+            sys.exit(1)
+        return None
+
+    return token
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +220,7 @@ def push_to_hub(
         except Exception as e:
             logger.debug("create_repo (peut être déjà existant) : %s", e)
 
-        # Upload de tous les fichiers du répertoire
+        # Upload de tous les fichiers du répertoire dans le snapshot immuable
         api.upload_folder(
             folder_path=str(out_dir),
             repo_id=cfg.hf.repo_id,
@@ -179,6 +228,21 @@ def push_to_hub(
             commit_message=f"Training checkpoint — step {step}",
             token=token,
         )
+
+        # Upload également des fichiers à la racine du repo pour accès direct
+        for fname in ["muzero.safetensors", "deck_builder.safetensors", "config.json", "meta.json", "README.md"]:
+            fpath = out_dir / fname
+            if fpath.exists():
+                try:
+                    api.upload_file(
+                        path_or_fileobj=str(fpath),
+                        path_in_repo=fname,
+                        repo_id=cfg.hf.repo_id,
+                        commit_message=f"Update root {fname} — step {step}",
+                        token=token,
+                    )
+                except Exception as e_root:
+                    logger.debug("Upload racine %s : %s", fname, e_root)
 
         # Publish the pointer only after the complete, immutable snapshot is
         # available on the Hub.  One file/one commit makes this atomic.
@@ -225,7 +289,11 @@ def load_from_hub(
         return None, None, cfg or Config(), 0
 
     if not token:
-        token = get_hf_token(cfg)
+        token = get_hf_token(cfg, required=cfg.hf.enabled if cfg else True)
+    else:
+        if not verify_hf_token(token):
+            logger.error("ERREUR FATALE : Le token Hugging Face fourni est invalide/inconnu. Interruption du script.")
+            sys.exit(1)
 
     try:
         if step is None:
@@ -451,7 +519,11 @@ def load_buffer_from_hub(
         return None, {}
 
     if not token:
-        token = get_hf_token(cfg)
+        token = get_hf_token(cfg, required=cfg.hf.enabled if cfg else True)
+    else:
+        if not verify_hf_token(token):
+            logger.error("ERREUR FATALE : Le token Hugging Face fourni est invalide/inconnu. Interruption du script.")
+            sys.exit(1)
 
     meta = {}
     # Tenter de télécharger le fichier de métadonnées buffer_meta.json

@@ -3,6 +3,7 @@ PTCG MuZero — agent de soumission Kaggle.
 Générée automatiquement par main.py submit.
 """
 import glob, sys
+import numpy as np
 # Replicate the exact path setup from the reference Kaggle notebook:
 #   sys.path.append(glob.glob('/kaggle/input/**/cg-lib', recursive=True)[0])
 _cg_hits = glob.glob('/kaggle/input/**/cg-lib', recursive=True)
@@ -17,7 +18,7 @@ def _load():
     import json, jax, jax.numpy as jnp
     from export.hub import get_hf_token
 
-    token = get_hf_token()
+    token = get_hf_token(required=True)
 
     mz_path  = hf_hub_download(HF_REPO, "muzero.safetensors", token=token)
     cfg_path = hf_hub_download(HF_REPO, "config.json", token=token)

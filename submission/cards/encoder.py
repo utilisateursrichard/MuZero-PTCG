@@ -19,6 +19,7 @@ CSV expected columns (order may vary):
 from __future__ import annotations
 
 import csv
+import glob
 import logging
 from pathlib import Path
 from typing import Dict, List
@@ -36,20 +37,32 @@ _ENERGY_SYM: Dict[str, int] = {
     "{C}": 0, "{G}": 1, "{R}": 2, "{W}": 3, "{L}": 4,
     "{P}": 5, "{F}": 6, "{D}": 7, "{M}": 8, "{N}": 9,
     "{Y}": 10,
+    "竜": 9,
+    "{A}": 0, "{A}{A}": 0,
+    "{C}{C}": 0, "{C}{C}{C}": 0,
+    "{Team Rocket}": 0, "{Team Rocket}{Team Rocket}": 0,
 }
 NUM_ENERGY_TYPES = 11   # indices 0-10; -1 means "none / n/a"
 
 _STAGE_MAP: Dict[str, int] = {
-    "basic":          0,
-    "stage 1":        1,
-    "stage 2":        2,
-    "basic energy":   3,
-    "special energy": 4,
-    "item":           5,
-    "supporter":      5,
-    "stadium":        5,
-    "tool":           5,
-    "trainer":        5,
+    "basic":                 0,
+    "basic pokémon":         0,
+    "basic pokemon":         0,
+    "stage 1":               1,
+    "stage 1 pokémon":       1,
+    "stage 1 pokemon":       1,
+    "stage 2":               2,
+    "stage 2 pokémon":       2,
+    "stage 2 pokemon":       2,
+    "basic energy":          3,
+    "special energy":        4,
+    "item":                  5,
+    "supporter":             5,
+    "stadium":               5,
+    "tool":                  5,
+    "pokémon tool":          5,
+    "pokemon tool":          5,
+    "trainer":               5,
 }
 NUM_STAGES = 6    # 0-5; 5 = generic trainer/unknown
 
@@ -73,8 +86,18 @@ def _one_hot(idx: int, size: int) -> np.ndarray:
 
 
 def _parse_energy_sym(s: str) -> int:
-    """Return energy index for a symbol like '{G}', or -1 if absent."""
-    return _ENERGY_SYM.get(s.strip(), -1)
+    """Return energy index for a symbol like '{G}', '竜', or -1 if absent."""
+    if not s or s.strip().lower() in ("n/a", "none", ""):
+        return -1
+    st = s.strip()
+    if st in _ENERGY_SYM:
+        return _ENERGY_SYM[st]
+    if "竜" in st or "{N}" in st:
+        return 9
+    for sym, idx in _ENERGY_SYM.items():
+        if sym in st:
+            return idx
+    return -1
 
 
 def _parse_float(s: str, default: float = 0.0) -> float:
@@ -145,10 +168,20 @@ class CardStaticFeatures:
 
     def _load(self, path: Path) -> None:
         if not path.exists():
-            workspace_root = Path(__file__).parent.parent.parent
+            workspace_root = Path(__file__).resolve().parent.parent.parent
             candidates = [
+                Path("/kaggle/input/competitions/pokemon-tcg-ai-battle/EN Card Data.csv"),
+                Path("/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv"),
+                Path("competiton/EN Card Data.csv"),
                 Path("competiton/EN_Card_Data.csv"),
+                Path("competition/EN Card Data.csv"),
+                Path("competition/EN_Card_Data.csv"),
+                workspace_root / "competiton" / "EN Card Data.csv",
                 workspace_root / "competiton" / "EN_Card_Data.csv",
+                workspace_root / "competition" / "EN Card Data.csv",
+                workspace_root / "competition" / "EN_Card_Data.csv",
+                workspace_root / "ptcg_muzero" / "data" / "EN Card Data.csv",
+                workspace_root / "ptcg_muzero" / "data" / "EN_Card_Data.csv",
                 Path("/root/workspace/competiton/EN_Card_Data.csv"),
             ]
             for cand in candidates:
@@ -156,6 +189,12 @@ class CardStaticFeatures:
                     logger.info("CardStaticFeatures: fallback path found at %s", cand)
                     path = cand
                     break
+
+            if not path.exists():
+                kaggle_matches = glob.glob("/kaggle/input/**/EN*Card*Data.csv", recursive=True) + glob.glob("/kaggle/input/**/*Card*Data*.csv", recursive=True)
+                if kaggle_matches:
+                    logger.info("CardStaticFeatures: fallback path found via Kaggle glob at %s", kaggle_matches[0])
+                    path = Path(kaggle_matches[0])
 
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)

@@ -35,7 +35,13 @@ from env.cabt_api import (
     battle_start,
     to_observation_class,
 )
-from env.encoding import encode_observation, extract_step_reward
+from env.encoding import (
+    _as_dict,
+    encode_observation,
+    extract_deck_count,
+    extract_prizes_left,
+    extract_step_reward,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,12 @@ class GameHistory:
     # Per-step decoded select context (for probing target extraction)
     select_types: List[int]                    = field(default_factory=list)
     raw_states:   List[dict]                   = field(default_factory=list)
+    # AUDIT §3.6 — type réel (OptionType) de chaque option jouée, relevé côté
+    # worker ; sert à la distribution d'actions du heartbeat côté coordinateur.
+    action_types: List[int]                    = field(default_factory=list)
+    # AUDIT §3.8 — cibles de sonde pré-calculées dans le worker : évite de faire
+    # transiter `raw_states` (plusieurs Mo par partie) dans le pipe.
+    probe_targets: List[np.ndarray]            = field(default_factory=list)
 
     # Computed after the game ends
     returns:  Optional[np.ndarray] = None   # TD-n bootstrapped returns [T]
@@ -140,6 +152,9 @@ class CabtEnv:
         Returns:
             obs_dict, done
         """
+        if self._battle_started:
+            self.close()
+
         obs_raw, start_data = battle_start(deck0, deck1)
 
         # ── Deck validation (copied verbatim from reference notebook) ──────
@@ -156,6 +171,14 @@ class CabtEnv:
                 error = "There are no Basic Pokémon in the deck."
             elif start_data.errorType == 4:
                 error = "You can include only one Ace Spec card in the deck."
+            # AUDIT §2.6 — `battle_start()` a déjà été exécuté : sans
+            # `battle_finish()`, le singleton moteur (cg.game) reste dans un état
+            # sale jusqu'au prochain démarrage réussi.  `_battle_started` valant
+            # False, `close()` ne l'aurait jamais libéré.
+            try:
+                battle_finish()
+            except Exception:
+                pass
             raise DeckError(error)
 
         self._battle_started = True
@@ -239,6 +262,7 @@ def run_self_play_game(
     env  = CabtEnv()
     hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
     prev_logs: List[list] = [[], []]
+    prev_prizes: List[Optional[Tuple[int, int]]] = [None, None]
     terminal_seen = [False, False]
 
     try:
@@ -257,13 +281,13 @@ def run_self_play_game(
             your_idx = obs_dict.get("current", {}).get("yourIndex", 0)
             select   = obs_dict.get("select")
             
-            # Diagnostic log
-            from training.trainer import logger as t_logger
-            t_logger.info(
+            # Diagnostic log (AUDIT §3.5 : passé en DEBUG — une ligne INFO par
+            # étape moteur noyait complètement les logs d'entraînement)
+            logger.debug(
                 "[game step %d] your_idx=%d select_is_none=%s options_count=%d",
                 step_count, your_idx, select is None, 0 if select is None else len(select.get("option", []))
             )
-            
+
             from training.activity import tracker
             tracker.update(current_game_steps=step_count)
             
@@ -278,6 +302,22 @@ def run_self_play_game(
                 # No options available – auto-pass (engine may still advance)
                 obs_dict, done = env.step([])
                 continue
+
+            # ── Intermediate prize reward shaping ──────────────────────────
+            my_prizes, opp_prizes = extract_prizes_left(obs_dict, your_idx)
+            shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+            if shaping_enabled:
+                if prev_prizes[your_idx] is not None and hist[your_idx].rewards:
+                    prev_my, prev_opp = prev_prizes[your_idx]
+                    if prev_my > 0:
+                        delta_my = max(0, prev_my - my_prizes)
+                        delta_opp = max(0, prev_opp - opp_prizes)
+                        prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                        prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+                        if delta_my > 0 or delta_opp > 0:
+                            hist[your_idx].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+                if my_prizes > 0 or prev_prizes[your_idx] is not None:
+                    prev_prizes[your_idx] = (my_prizes, opp_prizes)
 
             # ── Encode observation ──────────────────────────────────────────
             enc_obs = encode_observation(obs_dict, your_idx, cfg.model)
@@ -313,6 +353,13 @@ def run_self_play_game(
                     valid_action_indices.append(fallback_idx)
             action_indices = valid_action_indices
 
+            # ── Enregistrement des types d'actions pour télémétrie ─────────
+            for idx in action_indices:
+                if 0 <= idx < len(options) and options[idx] is not None:
+                    opt_obj = options[idx]
+                    opt_type = int(opt_obj.get("type", 0) if isinstance(opt_obj, dict) else getattr(opt_obj, "type", 0))
+                    tracker.record_action(opt_type)
+
             # ── Reward from logs ───────────────────────────────────────────
             logs = obs_dict.get("logs", [])
             if len(logs) >= len(prev_logs[your_idx]):
@@ -323,7 +370,9 @@ def run_self_play_game(
             terminal_seen[your_idx] = terminal_seen[your_idx] or any(
                 _log_int(log, "type", -1) == 23 for log in new_logs
             )
-            reward = extract_step_reward(new_logs, your_idx)
+            win_r = float(getattr(cfg.train, "win_reward", 1.0))
+            loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+            reward = extract_step_reward(new_logs, your_idx, win_reward=win_r, loss_penalty=loss_p)
 
             # ── Store step in history ──────────────────────────────────────
             action_vec = np.zeros(cfg.model.max_actions, dtype=np.float32)
@@ -342,15 +391,37 @@ def run_self_play_game(
 
         # ── Terminal reward adjustment ─────────────────────────────────────
         result = env.result
+        final_obs = _as_dict(obs_dict)
+        shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+        win_r = float(getattr(cfg.train, "win_reward", 1.0))
+        loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+        deck_pen = float(getattr(cfg.train, "deck_out_penalty", 0.1))
+        prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+        prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+
         for p in range(2):
             if hist[p].rewards:
+                # Écart final de prizes sur la transition menant au résultat
+                if shaping_enabled and prev_prizes[p] is not None:
+                    prev_my, prev_opp = prev_prizes[p]
+                    curr_my, curr_opp = extract_prizes_left(final_obs, p)
+                    if prev_my > 0:
+                        delta_my = max(0, prev_my - curr_my)
+                        delta_opp = max(0, prev_opp - curr_opp)
+                        if delta_my > 0 or delta_opp > 0:
+                            hist[p].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+
+                is_deck_out = (extract_deck_count(final_obs, p) <= 0)
+
                 if result == p:
                     if not terminal_seen[p]:
-                        hist[p].rewards[-1] += 1.0
+                        hist[p].rewards[-1] += win_r if shaping_enabled else 1.0
                     hist[p].game_won = True
                 elif result == 1 - p:
                     if not terminal_seen[p]:
-                        hist[p].rewards[-1] -= 1.0
+                        hist[p].rewards[-1] -= loss_p if shaping_enabled else 1.0
+                    if shaping_enabled and is_deck_out:
+                        hist[p].rewards[-1] -= deck_pen
                     hist[p].game_won = False
                 else:
                     hist[p].game_won = None   # draw
@@ -398,6 +469,54 @@ def _is_done(obs_dict: dict) -> bool:
     return int(result) >= 0
 
 
+class _TurnCounter:
+    """Compteur de tours robuste pour la planification de température.
+
+    AUDIT §1.2 — le code lisait ``current["turnNumber"]``, clé qui n'existe pas
+    (le moteur expose ``turn``, cf. ``env/encoding.py``).  Le fallback
+    ``step_count // 4 + 1`` était donc TOUJOURS utilisé alors qu'il compte des
+    *étapes moteur* (chaque sous-décision : piocher, cibler, attacher…), soit
+    10 à 20 par tour réel.  Résultat : ``tau`` atteignait son minimum en 2-3
+    tours au lieu de 11 → self-play quasi déterministe dès le début de partie,
+    buffer redondant, policy collapse.
+
+    Stratégie : utiliser ``current.turn`` s'il est exposé, sinon compter les
+    alternances de joueur — au PTCG le tour appartient à un seul joueur, donc
+    chaque alternance ouvre un nouveau tour (+1). Jamais ``step_count``, qui
+    compte les sous-décisions.
+    """
+
+    __slots__ = ("_fallback_turn", "_last_player")
+
+    def __init__(self) -> None:
+        self._fallback_turn = 1
+        self._last_player = None
+
+    def update(self, obs_dict: dict, your_idx: int) -> int:
+        current = obs_dict.get("current") or {}
+        engine_turn = current.get("turn", None)
+        try:
+            engine_turn = int(engine_turn) if engine_turn is not None else None
+        except (TypeError, ValueError):
+            engine_turn = None
+
+        if self._last_player is not None and your_idx != self._last_player:
+            self._fallback_turn += 1
+        self._last_player = your_idx
+
+        if engine_turn is not None and engine_turn > 0:
+            return engine_turn
+        return self._fallback_turn
+
+
+def compute_temperature(turn_num: int, search_cfg) -> float:
+    """tau(turn) = max(tau_min, tau_init · decay^(turn-1)) — cf. AUDIT §1.2."""
+    t_init = float(getattr(search_cfg, "temperature_init", 0.8))
+    t_min = float(getattr(search_cfg, "temperature_min", 0.15))
+    t_decay = float(getattr(search_cfg, "temperature_decay", 0.85))
+    return max(t_min, t_init * (t_decay ** max(0, int(turn_num) - 1)))
+
+
 def _log_int(obj, key: str, default: int) -> int:
     if isinstance(obj, dict):
         v = obj.get(key, default)
@@ -427,7 +546,19 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
     from env.wrapper import CabtEnv, DeckError
     from env.encoding import encode_observation, extract_step_reward
-    from search.ismcts import sample_belief
+    from search.ismcts import sample_belief, set_belief_deck
+
+    # AUDIT §2.1 — la déterminisation de la main adverse doit puiser dans le deck
+    # réellement joué (les deux joueurs utilisent DEFAULT_COMPETITIVE_DECK), pas
+    # dans les 1268 IDs du pool complet.
+    try:
+        from models.deck_builder import DEFAULT_COMPETITIVE_DECK
+        set_belief_deck(
+            DEFAULT_COMPETITIVE_DECK
+            if getattr(cfg.search, "belief_from_known_deck", True) else None
+        )
+    except Exception as _be:
+        logger.warning("[worker-%s] set_belief_deck indisponible : %s", worker_id, _be)
 
     env = CabtEnv()
 
@@ -451,9 +582,12 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                 step_count = 0
                 prev_logs = [[], []]
+                prev_prizes: List[Optional[Tuple[int, int]]] = [None, None]
                 terminal_seen = [False, False]
-                from env.wrapper import GameHistory
+                from env.wrapper import GameHistory, _TurnCounter, compute_temperature
+                from interpretability.probes import extract_probe_targets
                 hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
+                turn_counter = _TurnCounter()
 
                 while not done:
                     step_count += 1
@@ -474,6 +608,22 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     if not options:
                         obs_dict, done = env.step([])
                         continue
+
+                    # ── Intermediate prize reward shaping ──────────────────────────
+                    my_prizes, opp_prizes = extract_prizes_left(obs_dict, your_idx)
+                    shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+                    if shaping_enabled:
+                        if prev_prizes[your_idx] is not None and hist[your_idx].rewards:
+                            prev_my, prev_opp = prev_prizes[your_idx]
+                            if prev_my > 0:
+                                delta_my = max(0, prev_my - my_prizes)
+                                delta_opp = max(0, prev_opp - opp_prizes)
+                                prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                                prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+                                if delta_my > 0 or delta_opp > 0:
+                                    hist[your_idx].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+                        if my_prizes > 0 or prev_prizes[your_idx] is not None:
+                            prev_prizes[your_idx] = (my_prizes, opp_prizes)
 
                     mc = cfg.model
                     N_samples = int(num_belief_samples)
@@ -510,8 +660,33 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     # Receive action from GPU coordinator
                     action_msg = pipe.recv()
                     best_action = action_msg["action_indices"][0]
-                    search_pol = action_msg["search_pol"]
+                    search_pol = np.array(action_msg["search_pol"])
                     search_val = action_msg["search_val"]
+
+                    # Temperature scheduling during self-play (Boltzmann sampling exact P_i^(1/tau))
+                    valid_opt_indices = np.where(option_mask)[0]
+                    if len(valid_opt_indices) > 0 and hasattr(cfg, "search"):
+                        # ── AUDIT §1.2 : tour de jeu RÉEL (moteur ou alternance
+                        # de joueur), plus jamais dérivé de step_count ──────────
+                        turn_num = turn_counter.update(obs_dict, your_idx)
+                        tau = compute_temperature(turn_num, cfg.search)
+
+                        if tau > 0.05:
+                            legal_scores = np.maximum(search_pol[valid_opt_indices], 1e-8)
+                            log_p = np.log(legal_scores)
+                            scaled = log_p / max(tau, 0.01)
+                            scaled -= np.max(scaled)
+                            exp_p = np.exp(np.clip(scaled, -20.0, 20.0))
+                            sum_p = np.sum(exp_p)
+                            if sum_p > 0 and not np.isnan(sum_p):
+                                p_dist = exp_p / sum_p
+                                best_action = int(np.random.choice(valid_opt_indices, p=p_dist))
+                            else:
+                                best_action = int(valid_opt_indices[np.argmax(legal_scores)])
+                        else:
+                            best_action = int(valid_opt_indices[np.argmax(search_pol[valid_opt_indices])])
+                    else:
+                        best_action = int(action_msg["action_indices"][0])
 
                     # Déterminer les indices réels en gérant maxCount > 1 (sélection top-k par politique MCTS)
                     max_count = int(select.get("maxCount", 1))
@@ -539,7 +714,25 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                             valid_action_indices.append(fallback_idx)
                     action_indices = valid_action_indices
 
-                    hist[your_idx].raw_states.append(obs_dict)
+                    # AUDIT §3.8 — cibles de sonde calculées ici (le moteur et sa
+                    # card_db sont disponibles dans le worker) ; `raw_states`
+                    # n'est plus conservé et ne transite donc plus par le pipe.
+                    try:
+                        hist[your_idx].probe_targets.append(
+                            extract_probe_targets(obs_dict, your_idx)
+                        )
+                    except Exception as _pe:
+                        logger.debug("[worker-%s] extract_probe_targets a échoué : %s", worker_id, _pe)
+                        hist[your_idx].probe_targets.append(np.full(11, -1, dtype=np.int32))
+
+                    # AUDIT §3.6 — relever le type RÉEL de chaque option jouée.
+                    for _idx in action_indices:
+                        _opt = options[_idx] if 0 <= _idx < len(options) else None
+                        if _opt is not None:
+                            hist[your_idx].action_types.append(
+                                int(_opt.get("type", 0) if isinstance(_opt, dict)
+                                    else getattr(_opt, "type", 0))
+                            )
 
                     logs = obs_dict.get("logs", [])
                     if len(logs) >= len(prev_logs[your_idx]):
@@ -551,7 +744,9 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         _log_int(log, "type", -1) == 23 for log in new_logs
                     )
 
-                    reward = extract_step_reward(new_logs, your_idx)
+                    win_r = float(getattr(cfg.train, "win_reward", 1.0))
+                    loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+                    reward = extract_step_reward(new_logs, your_idx, win_reward=win_r, loss_penalty=loss_p)
 
                     action_vec = np.zeros(mc.max_actions, dtype=np.float32)
                     for idx in action_indices:
@@ -568,25 +763,52 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     obs_dict, done = env.step(action_indices)
 
                 result = env.result
+                final_obs = _as_dict(obs_dict)
+                shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+                win_r = float(getattr(cfg.train, "win_reward", 1.0))
+                loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+                deck_pen = float(getattr(cfg.train, "deck_out_penalty", 0.1))
+                prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+
                 for p in range(2):
                     if hist[p].rewards:
+                        # Écart final de prizes sur la transition menant au résultat
+                        if shaping_enabled and prev_prizes[p] is not None:
+                            prev_my, prev_opp = prev_prizes[p]
+                            curr_my, curr_opp = extract_prizes_left(final_obs, p)
+                            if prev_my > 0:
+                                delta_my = max(0, prev_my - curr_my)
+                                delta_opp = max(0, prev_opp - curr_opp)
+                                if delta_my > 0 or delta_opp > 0:
+                                    hist[p].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+
+                        is_deck_out = (extract_deck_count(final_obs, p) <= 0)
+
                         if result == p:
-                            hist[p].rewards[-1] += 1.0
+                            if not terminal_seen[p]:
+                                hist[p].rewards[-1] += win_r if shaping_enabled else 1.0
                             hist[p].game_won = True
                         elif result == 1 - p:
-                            hist[p].rewards[-1] -= 1.0
+                            if not terminal_seen[p]:
+                                hist[p].rewards[-1] -= loss_p if shaping_enabled else 1.0
+                            if shaping_enabled and is_deck_out:
+                                hist[p].rewards[-1] -= deck_pen
                             hist[p].game_won = False
                         else:
                             hist[p].game_won = None
 
                 for p in range(2):
                     hist[p].compute_returns(cfg.train.gamma, cfg.train.td_steps)
+                    # AUDIT §3.8 — ne pas sérialiser les observations brutes.
+                    hist[p].raw_states = []
 
                 pipe.send({
                     "status": "game_over",
                     "hist0": hist[0],
                     "hist1": hist[1]
                 })
+                env.close()
 
         except Exception as e:
             import traceback

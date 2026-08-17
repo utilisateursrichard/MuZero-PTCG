@@ -60,19 +60,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "mode",
-        choices=["train", "eval", "submit", "probe-diag"],
+        choices=["train", "eval", "test", "submit", "probe-diag"],
         help="Mode d'exécution.",
     )
+
+    # ── Arguments globaux (train, test, eval, submit) ────────────────────────
+    p.add_argument("-s", "--safetensors", default=None,
+                   help="Poids ou checkpoint à charger : chemin .safetensors/.pkl, ou une référence HuggingFace — "
+                        "'HF' (dernier checkpoint de cfg.hf.repo_id), 'hf@120000' (étape précise), "
+                        "'hf:owner/repo', 'hf:owner/repo@120000'.")
+    p.add_argument("--step",     type=int, default=None, help="Numéro d'étape HF spécifique à charger (ex: --step 135000)")
+    p.add_argument("--ckpt",     default=None, help="Chemin checkpoint local explicite (.pkl/.safetensors)")
+
+    # ── Mode test : mesurer la FORCE du modèle contre un étalon extérieur ────
+    # En self-play le taux de victoire vaut 50 % par construction (même réseau,
+    # même deck des deux côtés) : aucune courbe d'entraînement ne dit si l'agent
+    # joue mieux.  Ce mode fournit le signal manquant.
+    t = p.add_argument_group("mode test")
+    t.add_argument("-o", "--opponent", default="greedy",
+                   choices=["greedy", "random", "self", "checkpoint"],
+                   help="Adversaire. 'greedy' = heuristique par type d'option (étalon stable), "
+                        "'random' = plancher, 'self' = miroir du modèle testé, "
+                        "'checkpoint' = autres poids via --opponent-weights.")
+    t.add_argument("--opponent-weights", default=None,
+                   help="Poids de l'adversaire quand --opponent=checkpoint. Accepte les mêmes "
+                        "références HF que -s : par ex. 'hf@120000' pour affronter une étape "
+                        "antérieure du même dépôt (progression relative façon AlphaZero).")
+    t.add_argument("-e", "--epsilon", type=float, default=0.0,
+                   help="Molette de difficulté de l'adversaire greedy : 0.0 = pleine force, "
+                        "1.0 = strictement équivalent à random. Monter jusqu'à revenir à 50 %% "
+                        "situe la force du réseau.")
+    t.add_argument("-n", "--games", type=int, default=20, help="Nombre de parties.")
+    t.add_argument("--sims", type=int, default=None,
+                   help="Simulations MCTS (surcharge la config ; baisser accélère le test).")
+    t.add_argument("--belief", type=int, default=None, help="Échantillons de croyance ISMCTS.")
+    t.add_argument("--no-swap", action="store_true",
+                   help="Ne pas alterner les côtés. Par défaut on alterne pour neutraliser "
+                        "l'avantage du premier joueur.")
+    t.add_argument("--deck", default=None, help="deck.csv à utiliser (défaut : DEFAULT_COMPETITIVE_DECK).")
+    t.add_argument("--json-out", default=None, help="Écrit le rapport en JSON à ce chemin.")
     p.add_argument("--config",   default=None,  help="Chemin vers config.json")
     p.add_argument("--hf-repo",  default=None,  help="Surcharge HFConfig.repo_id")
     p.add_argument("--no-hf",    action="store_true", help="Désactive le push HF")
     p.add_argument("--devices",  type=int, default=None, help="Nombre de GPUs")
     p.add_argument("--seed",     type=int, default=None, help="Graine aléatoire")
+    p.add_argument("--hot-fix", "--hot_fix", action="store_true", help="Mode Hot-Fix : réinitialise f (policy/val), g (dynamique 50D), Adam et Replay Buffer tout en conservant h(s) à 94%%.")
+    p.add_argument("--reset-policy", action="store_true", help="Réinitialise la tête de policy/value (f) en entier")
+    p.add_argument("--reset-value-head", action="store_true",
+                   help="Reset chirurgical : v_dense + rdet_fc2 uniquement (conserve h, la politique et la transition g). "
+                        "À utiliser avec --fresh-buffer après les correctifs de cible de valeur.")
+    p.add_argument("--fresh-buffer", action="store_true", help="Démarre avec un Replay Buffer vide (ignore les anciennes parties passives)")
+    p.add_argument("--freeze-h-steps", type=int, default=None, help="Nombre de steps avec h(s) gelé à 100%%")
+    p.add_argument("--unfreeze-ramp-steps", type=int, default=None, help="Nombre de steps de transition pour le dégel progressif de h(s)")
+    p.add_argument("--no-reward-shaping", action="store_true", help="Désactive le reward shaping (revient aux récompenses sparse ±1.0)")
     p.add_argument("--debug",    action="store_true",    help="Désactive JIT")
-    p.add_argument("--ckpt",     default=None, help="Chemin checkpoint (eval/probe-diag)")
     p.add_argument("--eval-games", type=int, default=None, help="Nb parties d'éval")
     p.add_argument("--out-dir",  default="submission", help="Dossier de sortie pour la soumission")
-    p.add_argument("--step",     type=int, default=None, help="Numéro d'étape HF spécifique")
     return p
 
 
@@ -88,7 +131,47 @@ def load_config(args) -> "Config":
         cfg = Config()
         logger.info("Config par défaut")
 
+    # Surcharges de checkpoint et reprise
+    if getattr(args, "safetensors", None):
+        parsed = _parse_hf_spec(args.safetensors)
+        if parsed is not None:
+            repo, step = parsed
+            if repo:
+                cfg.hf.repo_id = repo
+            if step is not None:
+                cfg.train.resume_step = step
+        else:
+            cfg.train.resume_ckpt = args.safetensors
+    if getattr(args, "step", None) is not None:
+        cfg.train.resume_step = args.step
+    if getattr(args, "ckpt", None) is not None:
+        cfg.train.resume_ckpt = args.ckpt
+
     # Surcharges CLI
+    if getattr(args, "hot_fix", False):
+        cfg.train.hot_fix = True
+        logger.info(">>> MODE HOT-FIX ACTIVÉ : f, g, Adam et Replay Buffer seront réinitialisés, h(s) sera conservé avec dégel progressif <<<")
+    if getattr(args, "reset_policy", False):
+        cfg.train.reset_policy_head = True
+    if getattr(args, "reset_value_head", False):
+        cfg.train.reset_value_head = True
+        logger.info(">>> RESET CHIRURGICAL : seules v_dense et rdet_fc2 sont réinitialisées "
+                    "(h, politique et transition g conservés) <<<")
+        if not getattr(args, "fresh_buffer", False):
+            logger.warning(
+                "--reset-value-head sans --fresh-buffer : le buffer existant contient des "
+                "target_pol issues du MCTS contaminé et des observations à mains adverses "
+                "hallucinées. Ajoutez --fresh-buffer sauf raison précise."
+            )
+    if getattr(args, "fresh_buffer", False):
+        cfg.train.fresh_buffer = True
+    if getattr(args, "freeze_h_steps", None) is not None:
+        cfg.train.freeze_representation_steps = args.freeze_h_steps
+    if getattr(args, "unfreeze_ramp_steps", None) is not None:
+        cfg.train.unfreeze_ramp_steps = args.unfreeze_ramp_steps
+    if getattr(args, "no_reward_shaping", False):
+        cfg.train.enable_reward_shaping = False
+        logger.info("Reward shaping désactivé (mode sparse ±1.0)")
     if args.hf_repo:
         cfg.hf.repo_id = args.hf_repo
     if args.no_hf:
@@ -109,6 +192,9 @@ def load_config(args) -> "Config":
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_train(args) -> None:
     cfg = load_config(args)
+    if cfg.hf.enabled:
+        from export.hub import get_hf_token
+        get_hf_token(cfg, required=True)
     _check_devices(cfg)
 
     # Sauvegarde config pour reproductibilité
@@ -172,12 +258,17 @@ def cmd_train(args) -> None:
             eta_str = format_time(eta_s)
 
             step_str = f"Step: {tracker.current_step} (nouveau: {tracker.new_step}) | " if tracker.current_step > 0 else ""
+            act = tracker.get_action_percentages()
+            act_str = f"Actions: ATK={act.get('attack',0):.0f}% ATT={act.get('attach',0):.0f}% END={act.get('end',0):.0f}% | " if tracker.total_actions_tracked > 0 else ""
+            pol_str = f"H_norm: {tracker.policy_entropy_norm:.2f} (p_max: {tracker.policy_p_max:.2f}) | " if tracker.policy_entropy_norm > 0 else ""
+            h_str = f"h_scale: {tracker.h_grad_scale:.2f} | " if tracker.h_grad_scale < 1.0 else ""
+
             # Détection de freeze (aucune mise à jour d'activité depuis plus de 240s)
             if inactive_dur > 240.0:
                 freeze_warning = " ⚠️ ATTENTION : Activité suspecte, possible freeze !"
                 logger.warning(
-                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | h(s): %s | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
-                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.h_status, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
+                    "[heartbeat] %s%s%s%sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs%s",
+                    step_str, pol_str, act_str, h_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur, freeze_warning
                 )
                 try:
                     dump_all_stacks()
@@ -185,8 +276,8 @@ def cmd_train(args) -> None:
                     logger.error("Impossible de dumper la stack trace : %s", e)
             else:
                 logger.info(
-                    "[heartbeat] %sPhase: %s | Buffer: %d/%d | h(s): %s | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
-                    step_str, tracker.phase, tracker.buffer_size, target_size, tracker.h_status, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
+                    "[heartbeat] %s%s%s%sPhase: %s | Buffer: %d/%d | Erreurs Deck: %d | Étape jeu: %d | Sec/partie: %.1fs | ETA (%dk): %s | Inactif depuis: %.1fs",
+                    step_str, pol_str, act_str, h_str, tracker.phase, tracker.buffer_size, target_size, tracker.deck_errors, tracker.current_game_steps, sec_per_game, milestone_k, eta_str, inactive_dur
                 )
             
     h_thread = threading.Thread(target=_heartbeat, daemon=True)
@@ -205,6 +296,9 @@ def cmd_eval(args) -> None:
     import numpy as np
 
     cfg = load_config(args)
+    if cfg.hf.enabled:
+        from export.hub import get_hf_token
+        get_hf_token(cfg, required=True)
     if args.eval_games:
         cfg.train.eval_games = args.eval_games
 
@@ -222,9 +316,13 @@ def cmd_eval(args) -> None:
     cfg.model.num_card_ids = num_card_ids
     static_jax = jnp.array(card_data.feature_matrix(num_card_ids))
 
+    # AUDIT §3.10 — même définition qu'à l'entraînement (trainer.py) : seules les
+    # Basic Energy sont illimitées.  L'ancien filtre `"Energy" in stage` incluait
+    # aussi les Special Energy, produisant deux jeux d'IDs différents entre
+    # entraînement et évaluation.
     energy_ids = [
         cid for cid in card_data.card_ids
-        if "Energy" in card_data._cards[cid].get("stage", "")
+        if card_data._cards[cid].get("stage", "").strip().lower() == "basic energy"
     ]
     set_energy_ids(energy_ids)
     set_basic_pokemon_ids([
@@ -253,20 +351,17 @@ def cmd_eval(args) -> None:
 
         if not params:
             probe_heads = ProbeHeads(cfg=cfg.model)
-            mz_params = network.init(rng_mz, batch_obs)
+            mz_params = network.init(rng_mz, batch_obs, method=network.init_all)
             z_dummy = jnp.zeros((1, cfg.model.latent_dim))
             pr_params = probe_heads.init(rng_pr, z_dummy)
             params = {"muzero": mz_params, "probes": pr_params}
 
-        if not deck_params:
-            dummy_ctx = jnp.zeros((1, cfg.model.latent_dim))
-            deck_params = deck_net.init(rng_dk, context=dummy_ctx)
+    from models.deck_builder import DEFAULT_COMPETITIVE_DECK
 
     for g in range(total):
-        rng, rng_d, rng_ag = jax.random.split(rng, 3)
-        deck_logits, _ = deck_net.apply(deck_params)
-        deck0, _ = sample_deck(deck_logits[0], rng_d, num_card_ids, energy_ids)
-        deck1 = deck0[:]
+        rng, rng_ag = jax.random.split(rng)
+        deck0 = list(DEFAULT_COMPETITIVE_DECK)
+        deck1 = list(DEFAULT_COMPETITIVE_DECK)
 
         agent = make_agent_fn(network, params, cfg, rng_ag, train_mode=False)
 
@@ -284,6 +379,352 @@ def cmd_eval(args) -> None:
 
     wr = wins / total
     logger.info("=== Eval result : %d/%d  win_rate=%.2f ===", wins, total, wr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode : test — force du modèle contre un étalon extérieur
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_hf_spec(spec):
+    """Reconnaît une référence HuggingFace passée à ``-s`` / ``--opponent-weights``.
+
+    Formes acceptées (insensible à la casse) ::
+
+        HF                       → dernier checkpoint de cfg.hf.repo_id
+        hf@120000                → étape précise de cfg.hf.repo_id
+        hf:owner/repo            → dernier checkpoint d'un autre dépôt
+        hf:owner/repo@120000     → étape précise d'un autre dépôt
+
+    Retourne ``(repo_id | None, step | None)`` ou ``None`` si ce n'est pas une
+    référence HF.
+    """
+    if spec is None:
+        return None
+    s = str(spec).strip()
+    low = s.lower()
+    if low != "hf" and not (low.startswith("hf:") or low.startswith("hf@")):
+        return None
+    body = s[2:]
+    if body.startswith(":"):
+        body = body[1:]
+    step = None
+    if "@" in body:
+        body, _, raw_step = body.rpartition("@")
+        raw_step = raw_step.strip()
+        if raw_step.isdigit():
+            step = int(raw_step)
+        elif raw_step:
+            raise ValueError(f"Étape HF invalide dans -s {spec!r} : {raw_step!r} n'est pas un entier.")
+    body = body.strip()
+    return (body or None, step)
+
+
+_HF_CACHE: dict = {}
+
+
+def _fetch_hf_weights(spec, cfg):
+    """Télécharge un checkpoint depuis HuggingFace Hub.
+
+    Retourne ``(params_bruts, cfg_du_checkpoint, step)``.  Le résultat est mis en
+    cache : tester le modèle courant contre une étape antérieure du même dépôt
+    ne déclenche qu'un téléchargement par référence.
+    """
+    parsed = _parse_hf_spec(spec)
+    if parsed is None:
+        return None
+    repo, step = parsed
+    repo = repo or cfg.hf.repo_id
+    if not repo:
+        raise ValueError("Aucun dépôt HF : renseignez cfg.hf.repo_id ou utilisez -s hf:owner/repo")
+
+    key = (repo, step)
+    if key in _HF_CACHE:
+        return _HF_CACHE[key]
+
+    from export.hub import get_hf_token, load_from_hub
+
+    token = get_hf_token(cfg, required=False)
+    if not token:
+        raise RuntimeError(
+            f"Token HuggingFace introuvable — impossible de lire {repo} (dépôt privé).\n"
+            f"  export {cfg.hf.token_env_var}=hf_xxx   ou   secret Kaggle '{cfg.hf.token_env_var}'."
+        )
+
+    logger.info("[hf] Récupération de %s (%s)...", repo,
+                f"étape {step}" if step is not None else "dernier checkpoint via latest.json")
+    mz, _dk, ckpt_cfg, step_val = load_from_hub(repo, step=step, token=token, cfg=cfg)
+    if mz is None:
+        raise RuntimeError(
+            f"Aucun checkpoint récupéré depuis {repo}. Vérifiez le nom du dépôt, "
+            "le token, et la présence de latest.json / muzero.safetensors."
+        )
+    logger.info("[hf] Checkpoint chargé : %s @ étape %s", repo, step_val)
+    _HF_CACHE[key] = (mz, ckpt_cfg, step_val)
+    return _HF_CACHE[key]
+
+
+def _reconcile_model_cfg(cfg, ckpt_cfg) -> None:
+    """Aligne cfg.model sur celui du checkpoint.
+
+    Sans ça, un checkpoint entraîné avec d'autres dimensions serait chargé sur un
+    réseau construit aux dimensions locales : ``_merge_params`` écarterait
+    silencieusement toutes les couches incompatibles et on testerait un modèle
+    quasi aléatoire en croyant tester le modèle entraîné.
+    """
+    if ckpt_cfg is None or not hasattr(ckpt_cfg, "model"):
+        return
+    import dataclasses
+    changed = []
+    for f in dataclasses.fields(cfg.model):
+        local, remote = getattr(cfg.model, f.name), getattr(ckpt_cfg.model, f.name, None)
+        if remote is not None and local != remote:
+            changed.append(f"{f.name}: {local} → {remote}")
+            setattr(cfg.model, f.name, remote)
+    if changed:
+        logger.warning(
+            "[hf] Architecture locale différente du checkpoint — alignement sur le checkpoint : %s",
+            "; ".join(changed),
+        )
+
+
+def _load_muzero_weights(path, network, cfg, rng):
+    """Charge des poids depuis HF, .safetensors ou .pkl, fusionnés sur une init fraîche."""
+    import jax
+    import jax.numpy as jnp
+    from training.trainer import _merge_params, _make_dummy_obs
+
+    dummy = _make_dummy_obs(cfg.model)
+    batch = {k: jnp.array(v[None]) for k, v in dummy.items()}
+    fresh = network.init(rng, batch, method=network.init_all)
+    if path is None:
+        logger.warning("Aucun poids fourni — le modèle testé est ALÉATOIRE.")
+        return fresh
+
+    # ── Référence HuggingFace ────────────────────────────────────────────────
+    hf = _fetch_hf_weights(path, cfg)
+    if hf is not None:
+        raw, _ckpt_cfg, _step = hf
+        raw = raw.get("muzero", raw) if isinstance(raw, dict) else raw
+        merged = _merge_params(fresh, jax.tree_util.tree_map(jax.device_put, raw))
+        _warn_if_mostly_fresh(merged, fresh)
+        return merged
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Poids introuvables : {p}")
+    if p.suffix == ".pkl":
+        import pickle
+        with open(p, "rb") as f:
+            raw = pickle.load(f).get("params", {})
+    else:
+        from safetensors.numpy import load_file
+        from export.hub import _unflatten_params
+        raw = _unflatten_params(load_file(str(p)))
+    raw = raw.get("muzero", raw) if isinstance(raw, dict) else raw
+    merged = _merge_params(fresh, jax.tree_util.tree_map(jax.device_put, raw))
+    logger.info("Poids chargés : %s", p)
+    _warn_if_mostly_fresh(merged, fresh)
+    return merged
+
+
+def _warn_if_mostly_fresh(merged, fresh) -> None:
+    """Alerte si la fusion a conservé surtout des poids frais.
+
+    Un checkpoint dont l'architecture ne correspond pas se charge « avec succès »
+    mais laisse la quasi-totalité des couches à leur initialisation aléatoire.
+    Sans ce contrôle on teste un modèle vierge en croyant tester le modèle
+    entraîné — et on conclut que l'entraînement ne sert à rien.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    m = jax.tree_util.tree_leaves(merged)
+    f = jax.tree_util.tree_leaves(fresh)
+    if not m or len(m) != len(f):
+        return
+    same = sum(1 for a, b in zip(m, f)
+               if a.shape == b.shape and bool(jnp.array_equal(a, b)))
+    pct = 100.0 * same / len(m)
+    if pct > 50.0:
+        logger.error(
+            "⚠ %.0f %% des couches (%d/%d) sont restées à l'initialisation ALÉATOIRE : "
+            "le checkpoint ne correspond pas à l'architecture courante. Les résultats "
+            "ne reflètent PAS le modèle entraîné.", pct, same, len(m),
+        )
+    elif pct > 10.0:
+        logger.warning(
+            "%.0f %% des couches (%d/%d) n'ont pas été reprises du checkpoint "
+            "(couches supprimées ou de forme différente).", pct, same, len(m),
+        )
+
+
+def cmd_test(args) -> None:
+    """Fait jouer le modèle contre un adversaire de référence et rapporte sa force.
+
+    C'est le signal absent des courbes d'entraînement : `p_max`, l'entropie et la
+    distribution d'actions décrivent COMMENT l'agent joue, jamais s'il joue MIEUX.
+    """
+    import json
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    cfg = load_config(args)
+    # HF n'est activé que si l'utilisateur demande explicitement des poids du Hub
+    # (-s hf ...) : un test doit rester hors-ligne par défaut.
+    uses_hf = (_parse_hf_spec(args.safetensors) is not None
+               or _parse_hf_spec(args.opponent_weights) is not None)
+    if not uses_hf:
+        cfg.hf.enabled = False
+    if args.sims:
+        cfg.search.num_simulations = args.sims
+    if args.belief:
+        cfg.search.num_belief_samples = args.belief
+
+    from cards.encoder import CardStaticFeatures
+    from models.networks import MuZeroNetwork
+    from training.trainer import make_agent_fn
+    from env.wrapper import run_self_play_game, DeckError
+    from env.baselines import make_baseline_agent
+    from models.deck_builder import (
+        DEFAULT_COMPETITIVE_DECK, set_ace_spec_ids, set_basic_pokemon_ids,
+        set_card_names, set_energy_ids,
+    )
+    from evaluation import analyse_history, aggregate, format_report
+
+    # ── Poids HF : télécharger AVANT de construire le réseau ─────────────────
+    # L'architecture doit être alignée sur le checkpoint, sinon le réseau est
+    # construit aux dimensions locales et toutes les couches incompatibles sont
+    # écartées en silence par _merge_params.
+    weights_path = args.safetensors or args.ckpt
+    for spec in (weights_path, args.opponent_weights):
+        hf = _fetch_hf_weights(spec, cfg)
+        if hf is not None:
+            _reconcile_model_cfg(cfg, hf[1])
+
+    # ── Cartes ───────────────────────────────────────────────────────────────
+    card_data = CardStaticFeatures(cfg.infra.card_csv)
+    n_ids = max(card_data.max_card_id + 1, cfg.model.num_card_ids)
+    cfg.model.num_card_ids = n_ids
+    static = jnp.array(card_data.feature_matrix(n_ids))
+    set_energy_ids([c for c in card_data.card_ids
+                    if card_data._cards[c].get("stage", "").strip().lower() == "basic energy"])
+    set_basic_pokemon_ids([c for c in card_data.card_ids
+                           if card_data._cards[c].get("stage", "").strip().lower()
+                           in ("basic pokémon", "basic pokemon")])
+    set_card_names({c: card_data.card_name(c) for c in card_data.card_ids})
+    set_ace_spec_ids(card_data.ace_spec_ids)
+
+    # ── Deck ─────────────────────────────────────────────────────────────────
+    if args.deck and Path(args.deck).exists():
+        deck = [int(x) for x in Path(args.deck).read_text().split() if x.strip().isdigit()][:60]
+        logger.info("Deck chargé depuis %s (%d cartes)", args.deck, len(deck))
+    else:
+        deck = list(DEFAULT_COMPETITIVE_DECK)
+    if len(deck) != 60:
+        raise ValueError(f"Le deck doit contenir exactement 60 cartes (reçu {len(deck)}).")
+
+    # La déterminisation ISMCTS doit puiser dans le deck réellement joué.
+    from search.ismcts import set_belief_deck
+    set_belief_deck(deck)
+
+    network = MuZeroNetwork(cfg=cfg.model, static_features=static)
+    rng = jax.random.PRNGKey(cfg.infra.seed)
+    rng, r_w, r_o, r_a = jax.random.split(rng, 4)
+
+    my_step = None
+    hf_my = _fetch_hf_weights(weights_path, cfg) if weights_path else None
+    if hf_my is not None:
+        my_step = hf_my[2]
+    mz = _load_muzero_weights(weights_path, network, cfg, r_w)
+    params = {"muzero": mz}
+
+    # ── Adversaire ───────────────────────────────────────────────────────────
+    if args.opponent in ("greedy", "random"):
+        opp_agent = make_baseline_agent(args.opponent, cfg, epsilon=args.epsilon,
+                                        seed=cfg.infra.seed)
+        opp_label = (f"greedy(ε={args.epsilon:.2f})" if args.opponent == "greedy" else "random")
+    elif args.opponent == "self":
+        opp_agent = make_agent_fn(network, params, cfg, r_o, train_mode=False)
+        opp_label = "self (miroir)"
+    else:
+        if not args.opponent_weights:
+            raise ValueError("--opponent=checkpoint exige --opponent-weights.")
+        opp_step = None
+        hf_opp = _fetch_hf_weights(args.opponent_weights, cfg)
+        if hf_opp is not None:
+            opp_step = hf_opp[2]
+        opp_mz = _load_muzero_weights(args.opponent_weights, network, cfg, r_o)
+        opp_agent = make_agent_fn(network, {"muzero": opp_mz}, cfg, r_o, train_mode=False)
+        if opp_step is not None:
+            opp_label = f"checkpoint(HF@{opp_step})"
+        else:
+            opp_label = f"checkpoint({Path(args.opponent_weights).name})"
+
+    my_title = f"step {my_step}" if my_step is not None else "Modèle"
+
+    logger.info(
+        "=== TEST : %d parties | adversaire=%s | sims=%d | belief=%d | alternance=%s ===",
+        args.games, opp_label, cfg.search.num_simulations,
+        cfg.search.num_belief_samples, not args.no_swap,
+    )
+
+    # ── Parties ──────────────────────────────────────────────────────────────
+    stats, errors = [], 0
+    for g in range(args.games):
+        rng, r_g = jax.random.split(rng)
+        me = make_agent_fn(network, params, cfg, r_g, train_mode=False)
+        # Alterner les côtés : sans ça, tout l'écart mesuré peut n'être que
+        # l'avantage (ou le désavantage) structurel du premier joueur.
+        my_idx = 0 if (args.no_swap or g % 2 == 0) else 1
+        pair = (me, opp_agent) if my_idx == 0 else (opp_agent, me)
+        try:
+            h0, h1 = run_self_play_game(pair, deck, deck, cfg, np.random.default_rng(g))
+        except DeckError as e:
+            logger.error("Deck refusé par le moteur : %s", e)
+            raise
+        except Exception as e:
+            errors += 1
+            logger.warning("Partie %d abandonnée : %s", g + 1, e)
+            continue
+        mine = h0 if my_idx == 0 else h1
+        st = analyse_history(mine)
+        stats.append(st)
+        logger.info("  partie %d/%d — côté %d — %s (%d décisions, %.0f prizes)",
+                    g + 1, args.games, my_idx,
+                    {True: "VICTOIRE", False: "défaite"}.get(st.won, "nul"),
+                    st.decisions, st.prizes_taken)
+
+    agg = aggregate(stats)
+    agg["opponent"] = opp_label
+    agg["weights"] = str(weights_path)
+    agg["num_simulations"] = cfg.search.num_simulations
+    agg["aborted_games"] = errors
+
+    print()
+    print(format_report(f"{my_title} vs {opp_label}", agg))
+    print()
+    if agg.get("games"):
+        wr = agg["win_rate_pct"]
+        lo, hi = agg["win_rate_ci95_pct"]
+        if not agg["conclusive"]:
+            # Ne jamais conclure sur un intervalle qui contient 50 % : c'est
+            # exactement ainsi qu'on prend du bruit pour un résultat.
+            print(f"  → NON CONCLUSIF : {wr:.0f} % mais IC95 [{lo:.0f} %, {hi:.0f} %] "
+                  f"contient 50 %. Relancez avec -n plus grand avant d'interpréter.")
+        elif args.opponent == "random" and hi < 80:
+            print("  ⚠ Significativement sous 80 % contre l'agent ALÉATOIRE : "
+                  "le modèle ne joue pas.")
+        elif lo > 50:
+            print(f"  → Bat {opp_label} de façon significative. Monter --epsilon "
+                  "jusqu'à revenir vers 50 % pour situer sa force.")
+        else:
+            print(f"  → Perd significativement contre {opp_label}. "
+                  "Baisser --epsilon pour trouver le palier atteint.")
+
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(agg, indent=2, ensure_ascii=False),
+                                       encoding="utf-8")
+        logger.info("Rapport JSON écrit : %s", args.json_out)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,14 +752,11 @@ def cmd_submit(args) -> None:
     from config import Config
     from export.hub import load_from_hub, get_hf_token, _unflatten_params, _flatten_params
     from safetensors.numpy import load_file
-    token = get_hf_token(cfg)
 
     download_success = False
     if cfg.hf.enabled:
-        if not token:
-            logger.info("HF_TOKEN non fourni. Tentative d'accès au Hub HF ou recherche des poids locaux...")
-        else:
-            logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
+        token = get_hf_token(cfg, required=True)
+        logger.info("Tentative de chargement depuis HuggingFace Hub (%s)...", cfg.hf.repo_id)
 
         mz_params, dk_params, loaded_cfg, step_val = load_from_hub(
             repo_id=cfg.hf.repo_id,
@@ -423,21 +861,32 @@ def cmd_submit(args) -> None:
                         logger.warning("Erreur lecture safetensors racine %s: %s", root_path, e)
 
     # Si téléchargé depuis HF avec succès, sauvegarder dans out_dir
-    if download_success and mz_params is not None and not (out_dir / "muzero.safetensors").exists():
+    if download_success and mz_params is not None:
         try:
             from safetensors.numpy import save_file
             save_file(_flatten_params(mz_params), str(out_dir / "muzero.safetensors"))
             if dk_params:
-                save_file(_flatten_params(dk_params, prefix="deck"), str(out_dir / "deck_builder.safetensors"))
+                clean_dk = dk_params.get("deck", dk_params) if (isinstance(dk_params, dict) and "deck" in dk_params and "params" not in dk_params) else dk_params
+                save_file(_flatten_params(clean_dk, prefix="deck"), str(out_dir / "deck_builder.safetensors"))
             (out_dir / "config.json").write_text(loaded_cfg.to_json())
         except Exception as exc:
             logger.warning("Avertissement lors de la sauvegarde locale des safetensors dans %s: %s", out_dir, exc)
 
     # 2. Génération de deck.csv
+    base_src = Path(__file__).resolve().parent
     card_csv_candidates = [
+        "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN Card Data.csv",
         "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv",
         "/kaggle/input/cards.csv",
+        str(base_src.parent / "competiton" / "EN Card Data.csv"),
+        str(base_src.parent / "competiton" / "EN_Card_Data.csv"),
+        str(base_src.parent / "competition" / "EN Card Data.csv"),
+        str(base_src.parent / "competition" / "EN_Card_Data.csv"),
+        str(base_src / "EN Card Data.csv"),
+        str(base_src / "EN_Card_Data.csv"),
+        "competiton/EN Card Data.csv",
         "competiton/EN_Card_Data.csv",
+        "EN Card Data.csv",
         "EN_Card_Data.csv",
     ]
     card_csv_path = None
@@ -446,61 +895,11 @@ def cmd_submit(args) -> None:
             card_csv_path = c
             break
 
-    deck_generated = False
-    if dk_params is not None and card_csv_path is not None:
-        try:
-            import jax
-            import jax.numpy as jnp
-            from cards.encoder import CardStaticFeatures
-            from models.deck_builder import (
-                DeckBuilderNetwork,
-                sample_deck,
-                set_ace_spec_ids,
-                set_basic_pokemon_ids,
-                set_energy_ids,
-            )
-
-            card_data = CardStaticFeatures(card_csv_path)
-            num_card_ids = max(card_data.max_card_id + 1, loaded_cfg.model.num_card_ids)
-            loaded_cfg.model.num_card_ids = num_card_ids
-            static_feats = jnp.array(card_data.feature_matrix(num_card_ids))
-
-            energy_ids = [c for c in card_data.card_ids if "Energy" in card_data._cards[c].get("stage", "")]
-            set_energy_ids(energy_ids)
-            set_basic_pokemon_ids([
-                cid for cid in card_data.card_ids
-                if card_data._cards[cid].get("stage", "").strip().lower() in ("basic pokémon", "basic pokemon")
-            ])
-            set_ace_spec_ids(card_data.ace_spec_ids)
-
-            deck_net = DeckBuilderNetwork(cfg=loaded_cfg.model, static_features=static_feats)
-            eval_dk_params = dk_params.get("deck", dk_params) if isinstance(dk_params, dict) and "deck" in dk_params else dk_params
-            logits, _ = deck_net.apply(eval_dk_params)
-            rng = jax.random.PRNGKey(42)
-            sampled_deck_ids, _ = sample_deck(logits[0], rng, num_card_ids, energy_ids, temperature=0.1)
-
-            deck_csv_file = out_dir / "deck.csv"
-            with open(deck_csv_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(str(cid) for cid in sampled_deck_ids) + "\n")
-            logger.info("✓ deck.csv généré avec succès par le DeckBuilder (%d cartes)", len(sampled_deck_ids))
-            deck_generated = True
-        except Exception as exc:
-            logger.warning("Échec de génération du deck par DeckBuilder : %s", exc)
-
-    if not deck_generated:
-        # Fallback sur le deck de référence
-        base_src = Path(__file__).resolve().parent
-        ref_deck_candidates = [
-            base_src.parent / "competiton" / "sample_submission" / "sample_submission" / "deck.csv",
-            base_src.parent / "competiton" / "sample_submission" / "deck.csv",
-            base_src.parent / "deck.csv",
-        ]
-        ref_deck = next((p for p in ref_deck_candidates if p.exists()), None)
-        if ref_deck:
-            shutil.copy2(ref_deck, out_dir / "deck.csv")
-            logger.info("✓ deck.csv copié depuis le deck de référence (%s)", ref_deck)
-        else:
-            logger.error("Aucun deck.csv de référence trouvé!")
+    from models.deck_builder import DEFAULT_COMPETITIVE_DECK
+    deck_csv_file = out_dir / "deck.csv"
+    with open(deck_csv_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(str(cid) for cid in DEFAULT_COMPETITIVE_DECK) + "\n")
+    logger.info("✓ deck.csv exporté avec succès (deck de référence Ogerpon ex, %d cartes)", len(DEFAULT_COMPETITIVE_DECK))
 
     # 3. Copie des modules Python du projet vers out_dir/
     base_src = Path(__file__).resolve().parent
@@ -723,6 +1122,7 @@ def main() -> None:
     dispatch = {
         "train":      cmd_train,
         "eval":       cmd_eval,
+        "test":       cmd_test,
         "submit":     cmd_submit,
         "probe-diag": cmd_probe_diag,
     }
@@ -730,4 +1130,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     main()

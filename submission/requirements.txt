@@ -1,0 +1,33 @@
+# ptcg_muzero/requirements.txt
+# ================================
+# Installation :
+#   pip install -r requirements.txt
+#
+# JAX avec support GPU (CUDA 12) :
+#   pip install -U "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+
+# ── Core JAX ──────────────────────────────────────────────────────────────────
+jax>=0.4.25
+jaxlib>=0.4.25
+flax>=0.8.1
+optax>=0.2.2
+
+# ── Recherche arborescente ────────────────────────────────────────────────────
+mctx>=0.0.5
+
+# ── Data / serialisation ─────────────────────────────────────────────────────
+numpy>=1.26
+safetensors>=0.4.3
+
+# ── HuggingFace Hub ───────────────────────────────────────────────────────────
+huggingface_hub>=0.22.0
+
+# ── Environnement Kaggle PTCG ─────────────────────────────────────────────────
+# cabt est installé via kaggle_environments sur la plateforme.
+# Pour développement local :
+# kaggle-environments>=1.14.0
+# cabt  # selon la doc de la compétition
+
+# ── Utilitaires ──────────────────────────────────────────────────────────────
+tqdm>=4.66
+wandb>=0.17.0

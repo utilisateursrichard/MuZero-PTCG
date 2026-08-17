@@ -13,7 +13,9 @@ from pathlib import Path
 
 # ── Fixed game constants ──────────────────────────────────────────────────────
 NUM_ENERGY_TYPES: int = 11   # C G R W L P F D M N Y (no "none" here)
-NUM_STAGES: int = 7          # Basic, S1, S2, BasicEnergy, SpecEnergy, Trainer, Unknown
+# AUDIT §3.5 : la valeur faisant autorité est celle de cards/encoder.py (= 6).
+# Basic, Stage1, Stage2, BasicEnergy, SpecialEnergy, Trainer/inconnu.
+NUM_STAGES: int = 6
 # CARD_STATIC_DIM is defined in cards/encoder.py and equals 48
 
 
@@ -48,8 +50,8 @@ class ModelConfig:
 
     # ── Value & Reward Categorical Bins ────────────────────────────────────
     num_value_bins: int = 51
-    value_min: float = -1.2
-    value_max: float = 1.2
+    value_min: float = -1.8
+    value_max: float = 1.8
 
 
 
@@ -63,6 +65,18 @@ class SearchConfig:
     # Dirichlet noise at root (self-play exploration)
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
+    # Temperature scheduling for self-play action selection
+    temperature_init: float = 0.8        # Température initiale (tours de setup 1-2)
+    temperature_min: float = 0.15        # Température minimale en milieu/fin de partie (maintient l'exploration résiduelle)
+    temperature_decay: float = 0.85      # Décroissance par tour : tau(turn) = max(tau_min, tau_init * decay^(turn-1))
+    # AUDIT §1.2 — le compteur de tours doit provenir du moteur (`current.turn`).
+    # Si le moteur ne l'expose pas, on compte les alternances de joueur, JAMAIS
+    # le nombre d'étapes moteur (qui inclut chaque sous-décision).
+    temperature_min_turn_estimate: bool = True
+
+    # AUDIT §2.1 — échantillonner la main adverse dans le deck réellement joué
+    # plutôt que dans les 1268 IDs du pool complet.
+    belief_from_known_deck: bool = True
 
 
 @dataclass
@@ -70,7 +84,7 @@ class TrainConfig:
     # ── MuZero unrolling ──────────────────────────────────────────────────
     num_unroll_steps: int = 5
     td_steps: int = 20
-    gamma: float = 0.997
+    gamma: float = 1.0
     target_network_tau: float = 0.995   # EMA decay factor for Target Network Polyak averaging
 
     # ── Optimiser ─────────────────────────────────────────────────────────
@@ -88,11 +102,9 @@ class TrainConfig:
     replay_alpha: float = 0.5    # priority exponent (0 = uniform, 1 = full priority)
     replay_beta: float = 0.4     # IS correction exponent (annealed toward 1 during training)
 
-    # ── Representation Freezing & Auto-Unfreezing ─────────────────────────
-    freeze_representation_initially: bool = False
-    unfreeze_w: int = 500         # Fenêtre mémoire W (steps)
-    unfreeze_epsilon: float = 0.01 # Seuil de progression epsilon (1%)
-    unfreeze_s_min: int = 2_000   # Seuil de sécurité S_min (steps)
+    # ── Early Plateau unfreezing (h(s)) ───────────────────────────────────
+    plateau_window: int = 500
+    plateau_threshold: float = 0.005
 
     # ── Training schedule ─────────────────────────────────────────────────
 
@@ -109,7 +121,7 @@ class TrainConfig:
     eval_games: int = 20
 
     # ── Reanalyze (In-Pipeline GPU) ────────────────────────────────────────
-    reanalyze_num_simulations: int = 10   # MCTS allégé pour Reanalyze (vs 25 en self-play)
+    reanalyze_num_simulations: int = 25   # Budget complet pour Sequential Halving (vs 10 précédemment)
 
     # ── Priority Refresh ───────────────────────────────────────────────────
     priority_refresh_every: int = 500     # steps between refreshes
@@ -121,11 +133,36 @@ class TrainConfig:
     value_loss_weight: float = 0.25
     reward_loss_weight: float = 1.0
     policy_loss_weight: float = 1.0
+    policy_entropy_weight: float = 0.02   # Bonus d'entropie étendu pour maintenir l'exploration active
     probe_loss_weight: float = 0.05
     deck_loss_weight: float = 0.1
     consistency_loss_weight: float = 2.0
 
+    # ── Reward Shaping ────────────────────────────────────────────────────
+    enable_reward_shaping: bool = True
+    prize_reward: float = 1.0 / 12.0     # ~ +0.0833 par prize prise (+0.50 pour 6 prizes)
+    prize_penalty: float = 1.0 / 12.0    # ~ -0.0833 par prize concédée (-0.50 pour 6 prizes)
+    win_reward: float = 1.0              # Récompense terminale en cas de victoire
+    loss_penalty: float = 1.0            # Pénalité terminale en cas de défaite
+    deck_out_penalty: float = 0.1        # Malus additionnel si défaite par épuisement du deck
+
+    # ── Hot-fix Reset & Dégel Progressif de h(s) ──────────────────────────
+    hot_fix: bool = False                 # Active le reset chirurgical complet (f, g, Adam, fresh buffer)
+    reset_policy_head: bool = False       # Réinitialise uniquement la tête de prédiction f (policy + value)
+    reset_value_head: bool = False        # Réinit. chirurgicale de v_dense + rdet_fc2 UNIQUEMENT
+    reset_dynamics_head: bool = False    # Réinitialise la tête de dynamique g (transitions + 50D action emb)
+    fresh_buffer: bool = False            # Démarre avec un buffer vide (ignore les anciennes parties passives)
+    freeze_representation_steps: int = 2000  # Nombre de steps avec h(s) gelé à 100% (gradient scale 0.0)
+    unfreeze_ramp_steps: int = 5000          # Steps de transition pour dégel progressif (gradient scale 0.0 -> 1.0)
+    resume_step: Optional[int] = None        # Étape précise à charger (HF ou local)
+    resume_ckpt: Optional[str] = None        # Chemin précis d'un checkpoint à charger
+
     # ── Deck builder ──────────────────────────────────────────────────────
+    # AUDIT §2.4 — tant que la self-play utilise DEFAULT_COMPETITIVE_DECK (deck
+    # figé, identique pour les deux joueurs), REINFORCE reçoit un `deck_ids`
+    # constant et des récompenses opposées : les gradients ne portent aucune
+    # information et font dériver les logits.  Désactivé par défaut.
+    deck_builder_enabled: bool = False
     deck_lr: float = 1e-3
     deck_entropy_coef: float = 0.01
     deck_baseline_ema: float = 0.99    # exponential moving average for REINFORCE baseline
@@ -186,13 +223,20 @@ class Config:
     @classmethod
     def from_json(cls, s: str) -> "Config":
         d = json.loads(s)
+        def _filter_dc(target_cls, data):
+            if not isinstance(data, dict):
+                return target_cls()
+            import dataclasses
+            valid = {f.name for f in dataclasses.fields(target_cls)}
+            return target_cls(**{k: v for k, v in data.items() if k in valid})
+
         return cls(
-            model=ModelConfig(**d["model"]),
-            search=SearchConfig(**d["search"]),
-            train=TrainConfig(**d["train"]),
-            hf=HFConfig(**d["hf"]),
-            wandb=WandBConfig(**d.get("wandb", {})),
-            infra=InfraConfig(**d["infra"]),
+            model=_filter_dc(ModelConfig, d.get("model", {})),
+            search=_filter_dc(SearchConfig, d.get("search", {})),
+            train=_filter_dc(TrainConfig, d.get("train", {})),
+            hf=_filter_dc(HFConfig, d.get("hf", {})),
+            wandb=_filter_dc(WandBConfig, d.get("wandb", {})),
+            infra=_filter_dc(InfraConfig, d.get("infra", {})),
         )
 
     def save(self, path: str | Path) -> None:

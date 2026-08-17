@@ -56,6 +56,41 @@ _ACE_SPEC_IDS: List[int] = []
 # always satisfy the engine's mandatory-basic-Pokémon rule.
 _BASIC_POKEMON_IDS: List[int] = []
 
+# Map of Card ID to Name string to enforce 4-copy limit per name
+_CARD_ID_TO_NAME: Dict[int, str] = {}
+
+# Deck de compétition de référence (Ogerpon Masque Turquoise-ex + Méganium + Arboliva-ex)
+DEFAULT_COMPETITIVE_DECK: List[int] = [
+    # Pokémon (21)
+    96, 96, 96, 96,      # 4x Teal Mask Ogerpon ex
+    402, 402,            # 2x Smoliv
+    403, 403,            # 2x Dolliv
+    404, 404,            # 2x Arboliva ex
+    708, 708,            # 2x Chikorita
+    709, 709,            # 2x Bayleef
+    710, 710,            # 2x Meganium (Wild Growth)
+    140,                 # 1x Fezandipiti ex
+    1071,                # 1x Meowth ex
+    235,                 # 1x Budew
+    172,                 # 1x Hoothoot
+    173,                 # 1x Noctowl
+    # Dresseurs (28)
+    1227, 1227, 1227, 1227,  # 4x Lillie's Determination
+    1231, 1231,              # 2x Dawn
+    1182, 1182,              # 2x Boss's Orders
+    1184,                    # 1x Lana's Aid
+    1201,                    # 1x Briar
+    1094, 1094, 1094, 1094,  # 4x Bug Catching Set
+    1121, 1121, 1121, 1121,  # 4x Ultra Ball
+    1152, 1152, 1152,        # 3x Poké Pad
+    1097,                    # 1x Night Stretcher
+    1116,                    # 1x Energy Switch
+    1080,                    # 1x Unfair Stamp (ACE SPEC)
+    1261, 1261, 1261, 1261,  # 4x Forest of Vitality
+    # Énergies (11)
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  # 11x Basic Grass Energy
+]
+
 
 def set_energy_ids(ids: List[int]) -> None:
     """Appelé une fois après parsing du CSV."""
@@ -73,6 +108,12 @@ def set_basic_pokemon_ids(ids: List[int]) -> None:
     """Called once after parsing the card CSV."""
     global _BASIC_POKEMON_IDS
     _BASIC_POKEMON_IDS = list(ids)
+
+
+def set_card_names(id_to_name: Dict[int, str]) -> None:
+    """Called once after parsing the card CSV to map IDs to Card Names."""
+    global _CARD_ID_TO_NAME
+    _CARD_ID_TO_NAME = dict(id_to_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,7 +194,7 @@ def sample_deck(
     Sample DECK_SIZE card IDs respecting PTCG rules:
       - Basic Energy cards: unlimited copies
       - Ace Spec cards: max 1 copy
-      - All other cards: max ``max_copies_normal`` copies (default 4)
+      - All other cards: max ``max_copies_normal`` copies (default 4) per CARD NAME
     Uses sequential sampling with count-based masking (numpy, outside JIT).
 
     Returns:
@@ -161,12 +202,14 @@ def sample_deck(
         deck_ids  : jnp.ndarray [DECK_SIZE]  — chosen card IDs for REINFORCE
     """
     import numpy as np
+    import collections
 
     energy_set   = set(energy_ids)
     ace_spec_set = set(ace_spec_ids) if ace_spec_ids else set(_ACE_SPEC_IDS)
     basic_set = set(basic_pokemon_ids) if basic_pokemon_ids is not None else set(_BASIC_POKEMON_IDS)
-    counts  = np.zeros(num_card_ids, dtype=np.int32)
-    deck    = []
+    counts       = collections.defaultdict(int)
+    name_counts  = collections.defaultdict(int)
+    deck         = []
 
     scaled_logits = logits / max(temperature, 1e-6)
     logits_np     = np.array(scaled_logits)
@@ -181,19 +224,24 @@ def sample_deck(
         mask = np.zeros(num_card_ids, dtype=np.float32)
         mask[0] = -np.inf   # ID 0 is padding / "no card"
         for cid in range(1, num_card_ids):
+            cname = _CARD_ID_TO_NAME.get(cid, str(cid))
             if cid in ace_spec_set:
-                # Si le deck contient déjà une carte Ace Spec, toutes les Ace Spec sont interdites
                 lim = 0 if has_ace_spec else 1
+                curr = name_counts[cname]
             elif cid in energy_set:
                 lim = num_card_ids          # pas de limite sur les énergies de base
+                curr = counts[cid]
             else:
-                lim = max_copies_normal     # cartes normales : 4 max
-            if counts[cid] >= lim:
+                lim = max_copies_normal     # 4 max par NOM DE CARTE
+                curr = name_counts[cname]
+            if curr >= lim or counts[cid] >= max_copies_normal:
                 mask[cid] = -np.inf
 
         probs = _softmax_np(logits_np + mask)
         chosen = int(rng_np.choice(num_card_ids, p=probs))
         counts[chosen] += 1
+        cname = _CARD_ID_TO_NAME.get(chosen, str(chosen))
+        name_counts[cname] += 1
         deck.append(chosen)
         
         # Si la carte choisie fait partie du set Ace Spec, on verrouille la contrainte globale
@@ -207,51 +255,64 @@ def sample_deck(
     min_basic = 8
     current_basic = sum(1 for cid in deck if cid in basic_set)
     if basic_set and current_basic < min_basic:
-        eligible_basic = [
-            cid for cid in basic_set
-            if 0 < cid < num_card_ids and counts[cid] < max_copies_normal
-        ]
-        if eligible_basic:
-            for i in range(len(deck) - 1, -1, -1):
-                if current_basic >= min_basic:
+        for i in range(len(deck) - 1, -1, -1):
+            if current_basic >= min_basic:
+                break
+            if deck[i] not in basic_set and deck[i] not in energy_set:
+                eligible_basic = [
+                    cid for cid in basic_set
+                    if 0 < cid < num_card_ids
+                    and counts[cid] < max_copies_normal
+                    and name_counts[_CARD_ID_TO_NAME.get(cid, str(cid))] < max_copies_normal
+                ]
+                if not eligible_basic:
                     break
-                if deck[i] not in basic_set and deck[i] not in energy_set:
-                    chosen = max(eligible_basic, key=lambda cid: logits_np[cid])
-                    counts[deck[i]] -= 1
-                    counts[chosen] += 1
-                    deck[i] = chosen
-                    current_basic += 1
+                chosen = max(eligible_basic, key=lambda cid: logits_np[cid])
+                old_cid = deck[i]
+                old_name = _CARD_ID_TO_NAME.get(old_cid, str(old_cid))
+                new_name = _CARD_ID_TO_NAME.get(chosen, str(chosen))
+
+                counts[old_cid] -= 1
+                name_counts[old_name] -= 1
+                counts[chosen] += 1
+                name_counts[new_name] += 1
+                deck[i] = chosen
+                current_basic += 1
 
     min_energy = 14
     current_energy = sum(1 for cid in deck if cid in energy_set)
     if energy_set and current_energy < min_energy:
-        eligible_energy = [
-            cid for cid in energy_set
-            if 0 < cid < num_card_ids
-        ]
-        if eligible_energy:
-            avail_energy = [cid for cid in eligible_energy if cid not in ace_spec_set or not has_ace_spec]
-            if not avail_energy:
-                avail_energy = [cid for cid in eligible_energy if cid not in ace_spec_set] or eligible_energy
-            energy_logits = logits_np[avail_energy]
-            energy_probs = _softmax_np(energy_logits)
-            for i in range(len(deck) - 1, -1, -1):
-                if current_energy >= min_energy:
+        for i in range(len(deck) - 1, -1, -1):
+            if current_energy >= min_energy:
+                break
+            if deck[i] not in energy_set and (deck[i] not in basic_set or current_basic > min_basic):
+                eligible_energy = [
+                    cid for cid in energy_set
+                    if 0 < cid < num_card_ids
+                    and (counts[cid] < max_copies_normal or cid in energy_ids)
+                    and (name_counts[_CARD_ID_TO_NAME.get(cid, str(cid))] < max_copies_normal or cid in energy_ids)
+                    and (cid not in ace_spec_set or not has_ace_spec)
+                ]
+                if not eligible_energy:
                     break
-                if deck[i] not in energy_set and (deck[i] not in basic_set or current_basic > min_basic):
-                    chosen = int(rng_np.choice(avail_energy, p=energy_probs))
-                    if chosen in ace_spec_set:
-                        has_ace_spec = True
-                        avail_energy = [cid for cid in avail_energy if cid not in ace_spec_set]
-                        if avail_energy:
-                            energy_logits = logits_np[avail_energy]
-                            energy_probs = _softmax_np(energy_logits)
-                    if deck[i] in basic_set:
-                        current_basic -= 1
-                    counts[deck[i]] -= 1
-                    counts[chosen] += 1
-                    deck[i] = chosen
-                    current_energy += 1
+                energy_logits = logits_np[eligible_energy]
+                energy_probs = _softmax_np(energy_logits)
+                chosen = int(rng_np.choice(eligible_energy, p=energy_probs))
+                if chosen in ace_spec_set:
+                    has_ace_spec = True
+
+                old_cid = deck[i]
+                old_name = _CARD_ID_TO_NAME.get(old_cid, str(old_cid))
+                new_name = _CARD_ID_TO_NAME.get(chosen, str(chosen))
+
+                if old_cid in basic_set:
+                    current_basic -= 1
+                counts[old_cid] -= 1
+                name_counts[old_name] -= 1
+                counts[chosen] += 1
+                name_counts[new_name] += 1
+                deck[i] = chosen
+                current_energy += 1
 
     return deck, jnp.array(deck, dtype=jnp.int32)
 

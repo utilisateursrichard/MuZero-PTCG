@@ -319,7 +319,11 @@ def _encode_card_list(cards: Optional[list], max_len: int) -> tuple:
         return ids, mask
     for i, card in enumerate(cards[:max_len]):
         if card is not None:
-            ids[i]  = card.get("id", NO_CARD) or NO_CARD
+            if isinstance(card, (int, np.integer)):
+                cid = int(card)
+            else:
+                cid = _int_from(card, "id", NO_CARD) or NO_CARD
+            ids[i]  = cid
             mask[i] = True
     return ids, mask
 
@@ -329,7 +333,11 @@ def _encode_prize(prizes: list, max_size: int) -> np.ndarray:
     ids = np.zeros(max_size, dtype=np.int32)
     for i, p in enumerate(prizes[:max_size]):
         if p is not None:
-            ids[i] = p.get("id", NO_CARD) or NO_CARD
+            if isinstance(p, (int, np.integer)):
+                cid = int(p)
+            else:
+                cid = _int_from(p, "id", NO_CARD) or NO_CARD
+            ids[i] = cid
     return ids
 
 

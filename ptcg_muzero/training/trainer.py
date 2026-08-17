@@ -61,10 +61,12 @@ from models.deck_builder import (
     sample_deck,
     set_ace_spec_ids,
     set_basic_pokemon_ids,
+    set_card_names,
     set_energy_ids,
 )
 from models.networks import MuZeroNetwork
-from search.ismcts import add_exploration_noise, ismcts_action, ismcts_action_batched, reanalyze_root
+from search.ismcts import ismcts_action, ismcts_action_batched, reanalyze_root
+from training.activity import tracker
 from training.loss import collate_batch, muzero_loss
 from training.replay_buffer import PrioritizedReplayBuffer
 
@@ -86,28 +88,16 @@ class MuZeroTrainState(train_state.TrainState):
 # ─────────────────────────────────────────────────────────────────────────────
 # pmap'd train step
 # ─────────────────────────────────────────────────────────────────────────────
-@functools.partial(jax.pmap, axis_name="devices", donate_argnums=(0,))
-def _train_step(
-    state: train_state.TrainState,
-    batch: dict,
-    # Les modules passés via closure (static) : voir make_train_step
-) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
-    """
-    Un pas de gradient sur un shard du batch.
-    Retourne (new_state, metrics, td_errors).
-
-    Note : ``network`` et ``probe_heads`` sont dans la fermeture via
-    ``make_train_step``; on ne les passe pas comme argument pour éviter
-    les recompilations.
-    """
-    # ← Défini dynamiquement par make_train_step
-    raise NotImplementedError("Use make_train_step() to build this function.")
+# AUDIT §3.5 — le stub `_train_step` (décoré `jax.pmap` puis levant
+# NotImplementedError) a été supprimé : seul `make_train_step()` construit la
+# fonction réellement utilisée.
 
 
 def make_train_step(
     network: MuZeroNetwork,
     probe_heads: ProbeHeads,
     cfg: Config,
+    start_step: int = 0,
 ):
     """
     Fabrique le train_step pmappé, en fermant sur ``network`` et ``probe_heads``.
@@ -121,12 +111,14 @@ def make_train_step(
     """
     reanalyze_sims     = cfg.train.reanalyze_num_simulations
     reanalyze_consider = cfg.search.max_num_considered_actions
+    K_unroll           = int(cfg.train.num_unroll_steps)
+    gamma              = float(cfg.train.gamma)
+    max_actions        = int(cfg.model.max_actions)
 
     def _step(
         state: train_state.TrainState,
         batch: dict,
         rng: jnp.ndarray,
-        freeze_rep: jnp.ndarray,
     ) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
 
         target_params = state.target_params if hasattr(state, "target_params") and state.target_params is not None else state.params
@@ -135,23 +127,70 @@ def make_train_step(
         # ── Reanalyze In-Pipeline GPU (utilisant le Target Network) ───────────
         rng_device = jax.random.fold_in(rng, jax.lax.axis_index("devices"))
 
-        # Extraire l'observation racine (step k=0) — déjà sur le GPU
-        obs0 = {k: v[:, 0] for k, v in batch["obs_seq"].items()}  # [B, ...]
+        B = batch["action_seq"].shape[0]
+        valid_seq = batch["valid_seq"].astype(jnp.float32)        # [B, K+1]
 
-        z_root     = network.apply(mz_target_params, obs0, method=network.represent)
-        pi_root, v_root = network.apply(mz_target_params, z_root, method=network.predict)
+        # AUDIT §1.3 — Reanalyze n-step correct.
+        # Ancien comportement : `target_val[:,0]` était écrasé par la valeur
+        # racine du MCTS, produite intégralement par le réseau cible, sans
+        # AUCUNE récompense réelle.  La tête de valeur n'était donc jamais
+        # ancrée dans le résultat des parties (récompenses sparses ±1 au
+        # terminal) → point fixe arbitraire, dérive puis effondrement, et une
+        # priorité PER qui ne mesurait que le désaccord online/target.
+        #
+        # Nouveau comportement (MuZero Reanalyze standard) :
+        #     V(s_0) = Σ_{k<K} γ^k · r_k · valid_k  +  γ^K · v_MCTS(s_K) · valid_K
+        # NB : `reward_seq[k]` est la récompense perçue AU pas k (cf. add_game :
+        # rew_window = rewards[t:end], obs_window = obs_list[t:end+1]).  Sa
+        # validité est donc `valid_seq[:, k]`.  Le masque `valid_seq[:, 1:]`
+        # utilisé initialement décalait d'un cran et annulait la récompense
+        # terminale ±1 de toute fenêtre tronquée par la fin de partie : comme
+        # c'est la seule récompense non nulle du jeu, `partial_ret` valait
+        # toujours 0 et la cible redevenait un pur auto-bootstrap.
+        # Les deux MCTS (racine et état de bootstrap) sont exécutés en UN SEUL
+        # appel mctx sur un batch concaténé : le coût supplémentaire est un
+        # forward de h() sur B exemples, l'arbre lui-même restant en latent.
+        obs0 = {k: v[:, 0]        for k, v in batch["obs_seq"].items()}   # [B, ...]
+        obsK = {k: v[:, K_unroll] for k, v in batch["obs_seq"].items()}   # [B, ...]
+        obs_cat = {k: jnp.concatenate([obs0[k], obsK[k]], axis=0) for k in obs0}
 
-        mask_root = (batch["target_pol"][:, 0] > 0).astype(jnp.bool_)  # [B, A]
+        z_cat = network.apply(mz_target_params, obs_cat, method=network.represent)
+        pi_cat, v_cat = network.apply(mz_target_params, z_cat, method=network.predict)
 
-        fresh_pol, fresh_val = reanalyze_root(
-            mz_target_params, network, z_root, pi_root, v_root, mask_root,
+        mask_cat = obs_cat["option_mask"].astype(jnp.bool_)               # [2B, A]
+        # Les lignes paddées (fin de partie) ont un masque entièrement faux :
+        # mctx produirait des NaN.  On leur donne une action légale factice ;
+        # leur contribution est de toute façon annulée par `valid_seq[:, K]`.
+        any_legal = jnp.any(mask_cat, axis=-1, keepdims=True)
+        fallback  = (jnp.arange(max_actions)[None, :] == 0)
+        mask_cat  = jnp.where(any_legal, mask_cat, fallback)
+
+        fresh_pol_cat, fresh_val_cat = reanalyze_root(
+            mz_target_params, network, z_cat, pi_cat, v_cat, mask_cat,
             rng_device, reanalyze_sims, reanalyze_consider,
         )
+
+        fresh_pol = fresh_pol_cat[:B]                                     # [B, A]
+        v_mcts_K  = fresh_val_cat[B:]                                     # [B]
+
+        discounts   = gamma ** jnp.arange(K_unroll, dtype=jnp.float32)    # [K]
+        rewards_ok  = batch["reward_seq"] * valid_seq[:, :K_unroll]       # [B, K]
+        partial_ret = jnp.sum(rewards_ok * discounts[None, :], axis=-1)   # [B]
+        bootstrap   = (gamma ** K_unroll) * v_mcts_K * valid_seq[:, K_unroll]
+        fresh_val   = partial_ret + bootstrap                             # [B]
+
+        # MuZero Reanalyze v2 standard : combiner le retour empirique stocké
+        # (portant le vrai signal ±1 de victoire/défaite calculé avec td_steps=20)
+        # avec la valeur fraîche MCTS (fresh_val).
+        # Évite le découplage de la valeur en récompense sparse et harmonise k=0
+        # avec k=1..K.
+        stored_val  = batch["target_val"][:, 0]
+        blended_val = 0.5 * stored_val + 0.5 * fresh_val
 
         batch = {
             **batch,
             "target_pol": batch["target_pol"].at[:, 0].set(jax.lax.stop_gradient(fresh_pol)),
-            "target_val": batch["target_val"].at[:, 0].set(jax.lax.stop_gradient(fresh_val)),
+            "target_val": batch["target_val"].at[:, 0].set(jax.lax.stop_gradient(blended_val)),
         }
 
         # ── Gradient step ──────────────────────────────────────────────────────
@@ -166,25 +205,24 @@ def make_train_step(
             loss_fn, has_aux=True
         )(state.params)
 
-        # Annulation des gradients de h(s) si gelé
-        def _zero_h_grads(g):
-            if isinstance(g, dict) and "muzero" in g:
-                mz_g = dict(g["muzero"])
-                if "h" in mz_g:
-                    mz_g["h"] = jax.tree_util.tree_map(jnp.zeros_like, mz_g["h"])
-                g = {**g, "muzero": mz_g}
-            return g
-
-        grads = jax.lax.cond(
-            freeze_rep,
-            _zero_h_grads,
-            lambda g: g,
-            grads,
-        )
-
         # Synchronise gradients across devices
         grads = jax.lax.pmean(grads, axis_name="devices")
         loss  = jax.lax.pmean(loss,  axis_name="devices")
+
+        # ── Dégel progressif de h(s) (Actif UNIQUEMENT en mode hot_fix) ──────
+        is_hot_fix = bool(getattr(cfg.train, "hot_fix", False))
+        step_val = jnp.maximum(state.step - start_step, 0)
+        freeze_steps = getattr(cfg.train, "freeze_representation_steps", 0)
+        ramp_steps = getattr(cfg.train, "unfreeze_ramp_steps", 1)
+        h_scale = jnp.where(
+            is_hot_fix & ((freeze_steps > 0) | (ramp_steps > 0)),
+            jnp.clip((step_val - freeze_steps) / jnp.maximum(ramp_steps, 1), 0.0, 1.0),
+            1.0
+        )
+        if "muzero" in grads:
+            mz_g = grads["muzero"]["params"] if "params" in grads["muzero"] else grads["muzero"]
+            if "h" in mz_g:
+                mz_g["h"] = jax.tree_util.tree_map(lambda g: g * h_scale, mz_g["h"])
 
         # Never let one non-finite gradient contaminate Adam's moments
         grads_finite = jax.tree_util.tree_reduce(
@@ -200,6 +238,8 @@ def make_train_step(
             lambda _: state,
             operand=None,
         )
+
+        metrics = {**metrics, "h_grad_scale": h_scale}
 
         # ── Target Network Polyak EMA Update (theta^- = tau * theta^- + (1-tau) * theta) ──
         tau = getattr(cfg.train, "target_network_tau", 0.995)
@@ -235,7 +275,7 @@ def create_muzero_train_state(
 
     # Init MuZero
     batch_obs = {k: v[None] for k, v in dummy_obs.items()}  # add batch dim
-    mz_params = network.init(rng_mz, batch_obs)
+    mz_params = network.init(rng_mz, batch_obs, method=network.init_all)
 
     # Init ProbeHeads
     z_dummy  = jnp.zeros((1, cfg.model.latent_dim))
@@ -266,7 +306,14 @@ def create_muzero_train_state(
 
 
 def _merge_params(defaults, loaded):
-    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure)."""
+    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure).
+
+    AUDIT §1.1/§3.5 — les clés présentes dans le checkpoint mais ABSENTES de
+    l'architecture courante sont désormais écartées (ex. `pi_q`, `pi_k`,
+    `a_feat_emb` supprimés).  Auparavant elles étaient réinjectées dans l'arbre
+    de paramètres : Adam maintenait des moments pour des poids morts et le
+    checkpoint suivant les propageait indéfiniment.
+    """
     is_defaults_map = isinstance(defaults, Mapping)
     is_loaded_map = isinstance(loaded, Mapping)
 
@@ -277,9 +324,12 @@ def _merge_params(defaults, loaded):
                 res[k] = _merge_params(v, loaded[k])
             else:
                 res[k] = v
-        for k, v in loaded.items():
-            if k not in defaults:
-                res[k] = v
+        dropped = [k for k in loaded if k not in defaults]
+        if dropped:
+            logger.info(
+                "[checkpoint] Clés obsolètes ignorées (absentes de l'architecture courante) : %s",
+                ", ".join(str(k) for k in dropped),
+            )
         return res
     elif is_defaults_map != is_loaded_map:
         logger.warning(
@@ -313,24 +363,87 @@ def _merge_params(defaults, loaded):
     return loaded
 
 
-def _reset_value_head_params(params: dict, fresh_params: dict) -> dict:
-    """
-    Réinitialise uniquement la tête de valeur (v_dense) et de récompense (rdet_fc2)
-    pour adapter les poids au nouvel encodage de bins [-1.2, 1.2], tout en conservant
-    100% du reste des poids entraînés (Transformer, Policy, Dynamics, etc.).
-    """
-    def _reset_layer(path, param_val):
-        keys = [getattr(p, "key", p) for p in path]
-        path_str = "/".join(str(k) for k in keys)
-        if "v_dense" in path_str or "rdet_fc2" in path_str:
-            logger.info("[checkpoint] Réinitialisation ciblée de la couche '%s' pour adaptation aux nouveaux bins [-1.2, 1.2].", path_str)
-            val = fresh_params
-            for k in keys:
-                val = val[k]
-            return val
-        return param_val
+# ─────────────────────────────────────────────────────────────────────────────
+# Reset chirurgical de la tête de valeur / récompense
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE : cette fonction avait été classée « code mort » en §3.5 puis supprimée.
+# C'était une erreur d'appréciation : elle est exactement l'outil nécessaire pour
+# repartir après les correctifs §1.3 / §2.2 / §2.3, qui n'ont abîmé QUE la tête
+# de valeur (cible auto-référentielle + padding tiré vers 0 + saturation ±2) et
+# la couche de sortie de la tête de récompense.  Le tronc Transformer h, la tête
+# de politique et la fonction de transition de g restent valides et coûtent
+# beaucoup plus cher à réapprendre.
+DEFAULT_VALUE_HEAD_FRAGMENTS = ("v_dense", "rdet_fc2")
 
-    return jax.tree_util.tree_map_with_path(_reset_layer, params)
+
+def _matches_fragment(path, fragments) -> bool:
+    keys = [getattr(p, "key", p) for p in path]
+    path_str = "/".join(str(k) for k in keys)
+    return any(f in path_str for f in fragments)
+
+
+def _reset_value_head_params(params: dict, fresh_params: dict, fragments=None) -> dict:
+    """Réinitialise les couches dont le chemin contient l'un de ``fragments``.
+
+    Par défaut : ``v_dense`` (tête de valeur catégorielle) et ``rdet_fc2``
+    (couche de sortie de la tête de récompense).  Tout le reste — h, pi_dense,
+    det_fc1/det_fc2, projecteurs, embeddings de cartes, sondes — est conservé
+    bit pour bit.
+    """
+    frags = tuple(fragments or DEFAULT_VALUE_HEAD_FRAGMENTS)
+    reset_paths: list[str] = []
+
+    def _reset_leaf(path, param_val):
+        if not _matches_fragment(path, frags):
+            return param_val
+        keys = [getattr(p, "key", p) for p in path]
+        reset_paths.append("/".join(str(k) for k in keys))
+        val = fresh_params
+        for k in keys:
+            val = val[k]
+        return val
+
+    out = jax.tree_util.tree_map_with_path(_reset_leaf, params)
+    if reset_paths:
+        logger.info(
+            "[reset-value-head] %d couche(s) réinitialisée(s) : %s",
+            len(reset_paths), ", ".join(reset_paths),
+        )
+    else:
+        logger.warning(
+            "[reset-value-head] Aucune couche ne correspond à %s — rien réinitialisé !", frags
+        )
+    return out
+
+
+def _zero_adam_moments(opt_state, params, fragments=None):
+    """Remet à zéro les moments Adam (mu / nu) des seules couches réinitialisées.
+
+    Indispensable : conserver des moments accumulés sur d'anciens poids en face
+    de poids fraîchement initialisés produit un premier pas de gradient énorme,
+    qui détruirait la couche neuve.  Les moments des couches CONSERVÉES (h, g,
+    politique) restent intacts — on ne repaie pas la reconstruction de l'inertie
+    d'Adam pour tout le réseau.
+    """
+    frags = tuple(fragments or DEFAULT_VALUE_HEAD_FRAGMENTS)
+    mask = jax.tree_util.tree_map_with_path(
+        lambda path, _leaf: _matches_fragment(path, frags), params
+    )
+
+    def _zero(tree):
+        return jax.tree_util.tree_map(
+            lambda hit, arr: jnp.zeros_like(arr) if hit else arr, mask, tree
+        )
+
+    def _walk(node):
+        if hasattr(node, "mu") and hasattr(node, "nu"):
+            return node._replace(mu=_zero(node.mu), nu=_zero(node.nu))
+        if isinstance(node, tuple):
+            rebuilt = tuple(_walk(x) for x in node)
+            return type(node)(*rebuilt) if hasattr(node, "_fields") else rebuilt
+        return node
+
+    return _walk(opt_state)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,16 +475,13 @@ def make_agent_fn(
         enc_obs     = encode_observation(obs_dict, player_idx, cfg.model)
         option_mask = enc_obs["option_mask"]
 
-        best_action, avg_policy, avg_value = ismcts_action(
-            network, params_cpu["muzero"], enc_obs, option_mask, rng_act, cfg
-        )
+        dir_eps = float(cfg.search.dirichlet_epsilon) if train_mode else 0.0
+        dir_alp = float(cfg.search.dirichlet_alpha) if train_mode else 0.3
 
-        if train_mode:
-            avg_policy = np.array(add_exploration_noise(
-                jnp.array(avg_policy), jnp.array(option_mask),
-                rng_noise, cfg.search.dirichlet_alpha,
-                cfg.search.dirichlet_epsilon,
-            ))
+        best_action, avg_policy, avg_value = ismcts_action(
+            network, params_cpu["muzero"], enc_obs, option_mask, rng_act, cfg,
+            dirichlet_epsilon=dir_eps, dirichlet_alpha=dir_alp,
+        )
 
         # maxCount > 1 : top-k par logit
         max_count = int(select.get("maxCount", 1))
@@ -449,6 +559,14 @@ def run_parallel_self_play(
     accel_devices = [d for d in devices if d.platform in ("gpu", "tpu")]
     if not accel_devices:
         accel_devices = devices  # fallback CPU
+    logger.info(
+        "[self-play] Launching parallel self-play: %d workers, sims=%d, belief_samples=%d, dirichlet_eps=%.3f, dirichlet_alpha=%.3f",
+        num_workers,
+        cfg.search.num_simulations,
+        cfg.search.num_belief_samples,
+        cfg.search.dirichlet_epsilon,
+        cfg.search.dirichlet_alpha,
+    )
     logger.info("[self-play] Accelerators (%s) pour MCTS : %s", accel_devices[0].platform, accel_devices)
     _gpu_params = [
         jax.device_put(state_params, dev) for dev in accel_devices
@@ -463,33 +581,46 @@ def run_parallel_self_play(
     deck_builder_updates = []
     deck_errors_count = 0
 
-    from models.deck_builder import sample_deck
+    from models.deck_builder import sample_deck, DEFAULT_COMPETITIVE_DECK
     deck_logits, _ = deck_net.apply(deck_params)
 
     pipe_meta = [{} for _ in range(num_workers)]
     worker_steps = [0] * num_workers
     last_msg_time = [time.time()] * num_workers
 
+    # AUDIT §3.1 — Les threads d'inférence écrivent dans `pipes[i]` pendant que le
+    # thread principal peut fermer et remplacer ce même pipe (worker gelé ou
+    # relancé).  Un verrou par pipe sérialise ces accès, et un compteur d'« époque »
+    # permet de jeter les résultats calculés pour une instance de worker désormais
+    # morte (sinon une action est envoyée à un worker qui attend un `start`).
+    pipe_locks = [threading.Lock() for _ in range(num_workers)]
+    pipe_epoch = [0] * num_workers
+
     def start_game_on_worker(pipe_idx, local_rng):
         nonlocal games_started
         worker_steps[pipe_idx] = 0
         local_rng, r_d0, r_d1 = jax.random.split(local_rng, 3)
-        deck0, ids0 = sample_deck(deck_logits[0], r_d0, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
-        deck1, ids1 = sample_deck(deck_logits[0], r_d1, num_card_ids, energy_ids, ace_spec_ids=ace_spec_ids)
+        # Utilisation du deck compétitif de référence pour le self-play
+        deck0 = list(DEFAULT_COMPETITIVE_DECK)
+        deck1 = list(DEFAULT_COMPETITIVE_DECK)
+        ids0 = np.array(deck0, dtype=np.int32)
+        ids1 = np.array(deck1, dtype=np.int32)
         
         # Réanimation robuste du worker s'il s'est arrêté (ex. suite à une exception)
         p = processes[pipe_idx]
         if not p.is_alive():
             logger.info(f"[coordinateur] Relance du worker {pipe_idx} qui s'était arrêté...")
-            try:
-                pipes[pipe_idx].close()
-            except Exception:
-                pass
-            parent_conn, child_conn = ctx.Pipe()
-            new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, pipe_idx, cfg), daemon=True)
-            new_p.start()
-            pipes[pipe_idx] = parent_conn
-            processes[pipe_idx] = new_p
+            with pipe_locks[pipe_idx]:
+                try:
+                    pipes[pipe_idx].close()
+                except Exception:
+                    pass
+                parent_conn, child_conn = ctx.Pipe()
+                new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, pipe_idx, cfg), daemon=True)
+                new_p.start()
+                pipes[pipe_idx] = parent_conn
+                processes[pipe_idx] = new_p
+                pipe_epoch[pipe_idx] += 1
 
         pipe_meta[pipe_idx] = {
             "ids0": ids0,
@@ -498,12 +629,13 @@ def run_parallel_self_play(
         }
         last_msg_time[pipe_idx] = time.time()
         try:
-            pipes[pipe_idx].send({
-                "cmd": "start",
-                "deck0": list(deck0),
-                "deck1": list(deck1),
-                "num_belief_samples": int(cfg.search.num_belief_samples)
-            })
+            with pipe_locks[pipe_idx]:
+                pipes[pipe_idx].send({
+                    "cmd": "start",
+                    "deck0": list(deck0),
+                    "deck1": list(deck1),
+                    "num_belief_samples": int(cfg.search.num_belief_samples)
+                })
             games_started += 1
         except Exception as e:
             logger.error(f"[coordinateur] Échec d'envoi au worker {pipe_idx} relancé : {e}")
@@ -524,8 +656,11 @@ def run_parallel_self_play(
     #                       lance l'inférence, envoie les résultats
     # Les deux GPUs fonctionnent totalement en parallèle sans se bloquer.
     # ──────────────────────────────────────────────────────────────────────
+    # NB : ne PAS refaire `import threading` ici.  Le module est déjà importé en
+    # tête de fichier ; un import local en fait une variable locale pour TOUTE la
+    # fonction, y compris la ligne `pipe_locks = [threading.Lock() ...]` qui la
+    # précède → UnboundLocalError au premier appel.
     import queue as _pyqueue
-    import threading
 
     work_queue: "_pyqueue.Queue" = _pyqueue.Queue()
     stop_event = threading.Event()
@@ -544,18 +679,25 @@ def run_parallel_self_play(
 
             items = [first]
 
-            # ── Collecte rapide (max 2ms) : agréger tous les workers déjà prêts ──
+            # ── Collecte : agréger tous les workers déjà prêts ────────────────
+            # AUDIT §3.4 — le batch est de toute façon paddé à `num_workers`
+            # (forme fixe imposée par le JIT).  Une fenêtre de 2 ms ne laissait
+            # quasiment jamais le temps aux autres workers d'arriver : jusqu'à
+            # 87 % des simulations MCTS étaient calculées sur du padding.
+            # 15 ms est négligeable devant le coût d'un batch MCTS et remplit
+            # le batch dans la grande majorité des cas.
             _t0 = time.time()
-            while time.time() - _t0 < 0.002:
+            while len(items) < num_workers and time.time() - _t0 < 0.015:
                 try:
-                    items.append(work_queue.get_nowait())
+                    items.append(work_queue.get(timeout=0.002))
                 except _pyqueue.Empty:
-                    break
+                    continue
 
             # ── Build batch padded à num_workers (taille fixe → pas de recompilation JAX) ──
             na_indices  = [it[0] for it in items]
             na_encs     = [it[1] for it in items]
             na_masks    = [it[2] for it in items]
+            na_epochs   = [it[3] for it in items]
 
             _pe = list(na_encs)
             _pm = list(na_masks)
@@ -585,14 +727,23 @@ def run_parallel_self_play(
                 ap_np = np.zeros((_n, int(cfg.model.max_actions)), dtype=np.float32)
                 av_np = np.zeros(_n, dtype=np.float32)
 
-            # ── Envoyer les résultats aux workers (chaque pipe est écrit par ce thread uniquement) ──
+            # ── Envoyer les résultats aux workers ────────────────────────────
+            # AUDIT §3.1 : verrou par pipe + contrôle d'époque (un worker relancé
+            # entre-temps ne doit pas recevoir la réponse de l'ancienne instance).
             for _i, _pidx in enumerate(na_indices):
                 try:
-                    pipes[_pidx].send({
-                        "action_indices": [int(ba_np[_i])],
-                        "search_pol":     ap_np[_i],
-                        "search_val":     float(av_np[_i]),
-                    })
+                    with pipe_locks[_pidx]:
+                        if pipe_epoch[_pidx] != na_epochs[_i]:
+                            logger.debug(
+                                "[Acc%d] Résultat obsolète ignoré pour le worker %d (époque %d != %d).",
+                                gpu_idx, _pidx, na_epochs[_i], pipe_epoch[_pidx],
+                            )
+                            continue
+                        pipes[_pidx].send({
+                            "action_indices": [int(ba_np[_i])],
+                            "search_pol":     ap_np[_i],
+                            "search_val":     float(av_np[_i]),
+                        })
                 except Exception as _e:
                     logger.error("[Acc%d] Erreur envoi action worker %d : %s", gpu_idx, _pidx, _e)
 
@@ -635,7 +786,7 @@ def run_parallel_self_play(
                 worker_steps[pipe_idx] = msg.get("step_count", 0)
                 tracker.update(current_game_steps=int(np.max(worker_steps)))
                 # → GPU thread se charge de l'inférence et de l'envoi du résultat
-                work_queue.put((pipe_idx, msg["batched_enc"], msg["option_mask"]))
+                work_queue.put((pipe_idx, msg["batched_enc"], msg["option_mask"], pipe_epoch[pipe_idx]))
 
             else:
                 tracker.update()
@@ -700,15 +851,17 @@ def run_parallel_self_play(
                         processes[idx].kill()
                 except Exception as e:
                     logger.error(f"[coordinateur] Erreur lors de la coupure du worker {idx} : {e}")
-                try:
-                    pipes[idx].close()
-                except Exception:
-                    pass
-                parent_conn, child_conn = ctx.Pipe()
-                new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
-                new_p.start()
-                pipes[idx] = parent_conn
-                processes[idx] = new_p
+                with pipe_locks[idx]:
+                    try:
+                        pipes[idx].close()
+                    except Exception:
+                        pass
+                    parent_conn, child_conn = ctx.Pipe()
+                    new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+                    new_p.start()
+                    pipes[idx] = parent_conn
+                    processes[idx] = new_p
+                    pipe_epoch[idx] += 1
                 pipe_meta[idx] = {"game_active": False}
                 last_msg_time[idx] = now
                 worker_steps[idx] = 0
@@ -791,7 +944,6 @@ def _log_wandb_full_metrics(
     td_err_flat: np.ndarray,
     step: int,
     elapsed: float,
-    rep_frozen: bool,
     cfg: Config,
 ):
     if not getattr(cfg, "wandb", None) or not cfg.wandb.enabled:
@@ -801,16 +953,27 @@ def _log_wandb_full_metrics(
         if wandb.run is None:
             return
 
+        def _get_scalar(k, default=0.0):
+            if k not in metrics:
+                return default
+            val = metrics[k]
+            try:
+                if hasattr(val, "ndim") and val.ndim > 0:
+                    return float(val[0])
+                return float(val)
+            except Exception:
+                return default
+
         w_dict = {}
 
         # ── 1. Losses ──────────────────────────────────────────────────────────
-        w_dict["loss/total"]       = float(metrics["loss_total"][0])
-        w_dict["loss/policy"]      = float(metrics["loss_policy"][0])
-        w_dict["loss/value"]       = float(metrics["loss_value"][0])
-        w_dict["loss/reward"]      = float(metrics["loss_reward"][0])
-        w_dict["loss/probes"]      = float(metrics["loss_probes"][0])
+        w_dict["loss/total"]       = _get_scalar("loss_total")
+        w_dict["loss/policy"]      = _get_scalar("loss_policy")
+        w_dict["loss/value"]       = _get_scalar("loss_value")
+        w_dict["loss/reward"]      = _get_scalar("loss_reward")
+        w_dict["loss/probes"]      = _get_scalar("loss_probes")
         if "loss_consistency" in metrics:
-            w_dict["loss/consistency"] = float(metrics["loss_consistency"][0])
+            w_dict["loss/consistency"] = _get_scalar("loss_consistency")
 
         # ── 2. TD Error & Priority Stats ───────────────────────────────────────
         if td_err_flat is not None and len(td_err_flat) > 0:
@@ -829,19 +992,47 @@ def _log_wandb_full_metrics(
 
         # ── 4. Detailed Probe Metrics (Per Task) ──────────────────────────────
         if "probe_per_task" in metrics:
-            p_losses = np.array(metrics["probe_per_task"][0])
+            p_losses = np.array(metrics["probe_per_task"])
+            if p_losses.ndim > 1:
+                p_losses = p_losses[0]
             for i, name in enumerate(PROBE_NAMES):
                 if i < len(p_losses):
                     w_dict[f"probes_loss/{name}"] = float(p_losses[i])
 
         if "probe_acc_per_task" in metrics:
-            p_accs = np.array(metrics["probe_acc_per_task"][0]) * 100.0
+            p_accs = np.array(metrics["probe_acc_per_task"]) * 100.0
+            if p_accs.ndim > 1:
+                p_accs = p_accs[0]
             w_dict["probes/accuracy_mean"] = float(np.mean(p_accs))
             for i, name in enumerate(PROBE_NAMES):
                 if i < len(p_accs):
                     w_dict[f"probes_acc/{name}"] = float(p_accs[i])
 
-        # ── 5. Replay Buffer Stats ─────────────────────────────────────────────
+        # ── 5. Policy & Value Telemetry ───────────────────────────────────────
+        if "policy_entropy_norm" in metrics:
+            w_dict["policy/entropy_norm"] = _get_scalar("policy_entropy_norm")
+        if "policy_entropy_net" in metrics:
+            w_dict["policy/entropy_net"]  = _get_scalar("policy_entropy_net")
+        if "policy_entropy_mcts" in metrics:
+            w_dict["policy/entropy_mcts"] = _get_scalar("policy_entropy_mcts")
+        if "policy_p_max_mean" in metrics:
+            w_dict["policy/p_max_mean"]   = _get_scalar("policy_p_max_mean")
+        if "h_grad_scale" in metrics:
+            w_dict["policy/h_grad_scale"] = _get_scalar("h_grad_scale")
+        if "value_mean" in metrics:
+            w_dict["value/mean"]          = _get_scalar("value_mean")
+        if "value_abs_mean" in metrics:
+            w_dict["value/abs_mean"]      = _get_scalar("value_abs_mean")
+        if "value_saturation_pct" in metrics:
+            w_dict["value/saturation_pct"] = _get_scalar("value_saturation_pct")
+
+        # ── 6. Action Distribution & Game Flow ────────────────────────────────
+        w_dict["game/avg_episode_length"] = float(tracker.avg_transitions_per_game)
+        act_dist = tracker.get_action_percentages()
+        for k, v in act_dist.items():
+            w_dict[f"action_dist/{k}_pct"] = float(v)
+
+        # ── 7. Replay Buffer Stats ─────────────────────────────────────────────
         w_dict["buffer/size"] = len(buffer)
         if hasattr(buffer, "_sum_tree"):
             total_prio = float(buffer._sum_tree.query_all())
@@ -850,15 +1041,14 @@ def _log_wandb_full_metrics(
         if hasattr(buffer, "get_max_priority"):
             w_dict["buffer/max_priority"]   = float(buffer.get_max_priority())
 
-        # ── 6. Performance & System Metrics ────────────────────────────────────
+        # ── 8. Performance & System Metrics ────────────────────────────────────
         w_dict["perf/step_time_sec"] = elapsed
         w_dict["perf/steps_per_sec"] = 1.0 / (elapsed + 1e-8)
-        w_dict["perf/rep_frozen"]    = 1.0 if rep_frozen else 0.0
 
         wandb.log(w_dict, step=step)
 
     except Exception as e:
-        logger.debug("[wandb] Erreur lors du log étendu : %s", e)
+        logger.warning("[wandb] Erreur lors du log étendu : %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -868,6 +1058,16 @@ def train(cfg: Config) -> None:
     """Point d'entrée principal d'entraînement."""
     logger.info("=== PTCG MuZero training start ===")
     logger.info("Devices: %s", jax.devices())
+    logger.info(
+        "[search-config] MCTS self-play: sims=%d, belief_samples=%d, max_considered=%d, dirichlet_eps=%.3f, dirichlet_alpha=%.3f, temp_init=%.2f, temp_min=%.2f",
+        cfg.search.num_simulations,
+        cfg.search.num_belief_samples,
+        cfg.search.max_num_considered_actions,
+        cfg.search.dirichlet_epsilon,
+        cfg.search.dirichlet_alpha,
+        cfg.search.temperature_init,
+        cfg.search.temperature_min,
+    )
 
     Path(cfg.infra.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.infra.log_dir).mkdir(parents=True, exist_ok=True)
@@ -882,10 +1082,10 @@ def train(cfg: Config) -> None:
     static_np    = card_data.feature_matrix(num_card_ids)
     static_jax   = jnp.array(static_np)   # frozen, never in params
 
-    # Mark basic energy IDs
+    # Mark basic energy IDs (only Basic Energy cards are unlimited, Special Energies have max 4 copies)
     energy_ids = [
         cid for cid in card_data.card_ids
-        if "Energy" in card_data._cards[cid].get("stage", "")
+        if card_data._cards[cid].get("stage", "").strip().lower() == "basic energy"
     ]
     set_energy_ids(energy_ids)
     basic_pokemon_ids = [
@@ -894,6 +1094,8 @@ def train(cfg: Config) -> None:
         in ("basic pokémon", "basic pokemon")
     ]
     set_basic_pokemon_ids(basic_pokemon_ids)
+    id_to_name = {cid: card_data.card_name(cid) for cid in card_data.card_ids}
+    set_card_names(id_to_name)
 
     # ── Détection des cartes Ace Spec ─────────────────────────────────────
     # Only explicit card metadata is trustworthy here.  A card appearing once
@@ -966,22 +1168,40 @@ def train(cfg: Config) -> None:
     loaded_deck_params = None
     loaded_deck_opt_state = None
 
-    # 1. Tenter de charger le dernier modèle depuis HF Hub si activé
-    if cfg.hf.enabled and cfg.hf.repo_id:
+    target_step = getattr(cfg.train, "resume_step", None)
+    target_ckpt = getattr(cfg.train, "resume_ckpt", None)
+
+    # 1. Tenter de charger depuis un chemin explicite si spécifié (--ckpt ou -s chemin.pkl)
+    if target_ckpt and Path(target_ckpt).exists():
+        try:
+            import pickle
+            with open(target_ckpt, "rb") as f:
+                ckpt_data = pickle.load(f)
+            loaded_params = ckpt_data["params"]
+            loaded_opt_state = ckpt_data.get("opt_state", None)
+            loaded_deck_params = ckpt_data.get("deck", {})
+            loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
+            start_step = ckpt_data.get("step", 0)
+            logger.info("=== Checkpoint local explicite chargé : %s (étape %d) ===", target_ckpt, start_step)
+        except Exception as e:
+            logger.warning("Échec du chargement du checkpoint explicite %s : %s", target_ckpt, e)
+
+    # 2. Tenter de charger depuis HF Hub si activé (avec target_step si spécifié)
+    if loaded_params is None and cfg.hf.enabled and cfg.hf.repo_id:
         try:
             from export.hub import load_from_hub
-            logger.info("Vérification du modèle le plus récent sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
-            hf_mz, hf_dk, hf_cfg, hf_step = load_from_hub(cfg.hf.repo_id, cfg=cfg)
+            logger.info("Vérification du modèle sur HuggingFace Hub (%s, step=%s)...", cfg.hf.repo_id, target_step)
+            hf_mz, hf_dk, hf_cfg, hf_step = load_from_hub(cfg.hf.repo_id, step=target_step, cfg=cfg)
             if hf_mz:
                 loaded_params = hf_mz
                 loaded_deck_params = hf_dk
                 start_step = hf_step
-                logger.info("=== Modèle le plus récent chargé depuis HF Hub : %s (étape %d) ===", cfg.hf.repo_id, start_step)
+                logger.info("=== Modèle chargé depuis HF Hub : %s (étape %d) ===", cfg.hf.repo_id, start_step)
         except Exception as e:
             logger.info("Aucun modèle HuggingFace Hub téléchargé ou échec de vérification (%s) : %s", cfg.hf.repo_id, e)
 
-    # 2. Vérifier le checkpoint local et conserver le plus avancé (HF vs local)
-    if latest_path.exists():
+    # 3. Vérifier le checkpoint local UNIQUEMENT si aucun step/ckpt explicite n'a été demandé
+    if target_step is None and target_ckpt is None and latest_path.exists():
         try:
             import pickle
             with open(latest_path, "rb") as f:
@@ -1003,15 +1223,68 @@ def train(cfg: Config) -> None:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
         params_jax = jax.tree_util.tree_map(jax.device_put, loaded_params)
         params_jax = _merge_params(state.params, params_jax)
+
+        # ── HOT-FIX SURGERY / RESET PARTIEL ──────────────────────────────────
+        is_hot_fix = getattr(cfg.train, "hot_fix", False)
+        reset_f = is_hot_fix or getattr(cfg.train, "reset_policy_head", False)
+        reset_g = is_hot_fix or getattr(cfg.train, "reset_dynamics_head", False)
+
+        def _get_mz_dict(p_dict):
+            if "muzero" in p_dict:
+                if isinstance(p_dict["muzero"], dict) and "params" in p_dict["muzero"]:
+                    return p_dict["muzero"]["params"]
+                return p_dict["muzero"]
+            return p_dict
+
+        target_mz = _get_mz_dict(params_jax)
+        fresh_mz = _get_mz_dict(state.params)
+
+        if reset_f:
+            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Prediction Network f (policy π & value V) ===")
+            if "f" in fresh_mz:
+                target_mz["f"] = fresh_mz["f"]
+        if reset_g:
+            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Dynamics Network g (50-dim transitions) et têtes de consistance ===")
+            if "g" in fresh_mz:
+                target_mz["g"] = fresh_mz["g"]
+            if "project" in fresh_mz:
+                target_mz["project"] = fresh_mz["project"]
+            if "predict_next" in fresh_mz:
+                target_mz["predict_next"] = fresh_mz["predict_next"]
+
+        # ── Reset chirurgical de la tête de valeur (option la moins destructrice) ──
+        # Ne touche que `v_dense` et `rdet_fc2`.  Sans effet si `reset_f` est déjà
+        # actif (f entier vient d'être réinitialisé).
+        reset_v = getattr(cfg.train, "reset_value_head", False) and not reset_f
+        if reset_v:
+            logger.info(
+                "=== [RESET-VALUE-HEAD] Réinitialisation de la seule tête de valeur/récompense "
+                "(h, politique et transition g conservés) ==="
+            )
+            params_jax = _reset_value_head_params(params_jax, state.params)
+
+        # Le target network doit repartir des MÊMES poids : sinon l'EMA continue
+        # d'alimenter le Reanalyze avec l'ancienne tête de valeur corrompue
+        # pendant plusieurs centaines de steps (tau=0.995 → demi-vie ~138 steps).
         state = state.replace(params=params_jax, target_params=params_jax, step=jnp.array(start_step, dtype=jnp.int32))
 
         fresh_opt_state = state.tx.init(params_jax)
-        if loaded_opt_state is not None:
+        if (reset_f or reset_g) or loaded_opt_state is None:
+            logger.info("=== [HOT-FIX] Réinitialisation propre de l'optimiseur Adam ===")
+            state = state.replace(opt_state=fresh_opt_state)
+        else:
             try:
                 opt_state_jax = jax.tree_util.tree_map(jax.device_put, loaded_opt_state)
                 opt_state_merged = _merge_params(fresh_opt_state, opt_state_jax)
                 # Validation de compatibilité du PyTree avec les gradients du nouveau modèle
                 jax.tree.map(lambda a, b: None, fresh_opt_state, opt_state_merged)
+                if reset_v:
+                    # Moments Adam remis à zéro pour les SEULES couches neuves.
+                    opt_state_merged = _zero_adam_moments(opt_state_merged, params_jax)
+                    logger.info(
+                        "=== [RESET-VALUE-HEAD] Moments Adam remis à zéro pour v_dense / rdet_fc2 "
+                        "(inertie conservée pour h, g et la politique) ==="
+                    )
                 state = state.replace(opt_state=opt_state_merged)
                 logger.info("=== État de l'optimiseur MuZero restauré et fusionné avec succès à l'étape %d ===", start_step)
             except Exception as e:
@@ -1020,8 +1293,6 @@ def train(cfg: Config) -> None:
                     e, start_step
                 )
                 state = state.replace(opt_state=fresh_opt_state)
-        else:
-            state = state.replace(opt_state=fresh_opt_state)
     else:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
 
@@ -1051,24 +1322,28 @@ def train(cfg: Config) -> None:
     state    = flax.jax_utils.replicate(state, devices)
     logger.info("[train] TrainState répliqué sur %d device(s) : %s", num_devs, devices)
 
-    train_step_fn = make_train_step(network, probes, cfg)
+    train_step_fn = make_train_step(network, probes, cfg, start_step=start_step)
 
     # ── 6. Replay buffer (avec tentative de restauration HF Hub & local) ──
     from training.replay_buffer import PrioritizedReplayBuffer
     buffer = None
     buffer_meta = {}
 
-    # 1. Tenter de charger le buffer depuis HF Hub si activé
-    if cfg.hf.enabled and cfg.hf.repo_id:
-        try:
-            from export.hub import load_buffer_from_hub
-            logger.info("Vérification d'un Replay Buffer existant sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
-            hf_buf, hf_meta = load_buffer_from_hub(cfg.hf.repo_id, cfg.train, cfg.model, cfg=cfg)
-            if hf_buf is not None:
-                buffer = hf_buf
-                buffer_meta = hf_meta
-        except Exception as e:
-            logger.warning("[hf-buffer] Échec de restauration HF Hub : %s", e)
+    skip_buffer_load = getattr(cfg.train, "hot_fix", False) or getattr(cfg.train, "fresh_buffer", False)
+    if skip_buffer_load:
+        logger.info("=== [HOT-FIX / FRESH BUFFER] Démarrage avec un Replay Buffer vide (anciennes parties passives ignorées) ===")
+    else:
+        # 1. Tenter de charger le buffer depuis HF Hub si activé
+        if cfg.hf.enabled and cfg.hf.repo_id:
+            try:
+                from export.hub import load_buffer_from_hub
+                logger.info("Vérification d'un Replay Buffer existant sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
+                hf_buf, hf_meta = load_buffer_from_hub(cfg.hf.repo_id, cfg.train, cfg.model, cfg=cfg)
+                if hf_buf is not None:
+                    buffer = hf_buf
+                    buffer_meta = hf_meta
+            except Exception as e:
+                logger.warning("[hf-buffer] Échec de restauration HF Hub : %s", e)
 
     # 2. Vérifier si un buffer local existe (dans local_dir ou checkpoint_dir)
     local_buf_path = Path(cfg.hf.local_dir) / "replay_buffer.pkl"
@@ -1194,23 +1469,11 @@ def train(cfg: Config) -> None:
             processes.append(p)
 
     # ── 8. Main training loop ─────────────────────────────────────────────
-    import collections
     global_step = 0
     t0 = time.time()
     total_transitions_since_last_push = 0
-    rep_frozen = getattr(cfg.train, "freeze_representation_initially", False)
-    loss_window = collections.deque(maxlen=getattr(cfg.train, "unfreeze_w", 500))
 
-    tracker.update(start_step=start_step, rep_frozen=rep_frozen)
-
-    if rep_frozen:
-        logger.info(
-            "[train] h(s) (RepresentationNetwork) gelé initialement. Dégel automatique activé "
-            "(W=%d, epsilon=%.1f%%, S_min=%d steps nouveaux).",
-            getattr(cfg.train, "unfreeze_w", 500),
-            getattr(cfg.train, "unfreeze_epsilon", 0.01) * 100.0,
-            getattr(cfg.train, "unfreeze_s_min", 2000),
-        )
+    tracker.update(start_step=start_step)
 
     for step in range(start_step, cfg.train.num_total_steps):
         global_step = step
@@ -1218,7 +1481,9 @@ def train(cfg: Config) -> None:
 
         # ── a. Self-play ──────────────────────────────────────────────────
         if step % cfg.train.self_play_interval == 0:
-            _tp = getattr(state, "target_params", None) or state.params
+            _tp = getattr(state, "target_params", None)
+            if _tp is None:
+                _tp = state.params
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], _tp)
             
             # Enregistrer immédiatement le modèle entraîné courant pour la suite
@@ -1254,17 +1519,31 @@ def train(cfg: Config) -> None:
                 t_added = _add_history_to_buffer(hist, buffer, cfg)
                 added_transitions += t_added
                 tracker.transitions_per_game_list.append(t_added)
-            
+
+                # AUDIT §3.6 — la distribution des types d'action est désormais
+                # relevée par le worker à partir du champ `type` de l'option
+                # réellement jouée, puis rejouée ici.  L'ancienne heuristique
+                # (`argmax(option_feat[:17])`) renvoyait 0 pour toute ligne
+                # paddée/nulle et gonflait donc la catégorie « other ».
+                for opt_type in getattr(hist, "action_types", None) or []:
+                    tracker.record_action(int(opt_type))
+
             total_transitions_since_last_push += added_transitions
 
-            for deck_ids, rew in deck_updates:
-                deck_params, deck_opt_state, deck_baseline, d_loss = \
-                    deck_reinforce_update(
-                        deck_net, deck_params, deck_opt_state, deck_optimizer,
-                        deck_ids, rew, deck_baseline,
-                        entropy_coef=cfg.train.deck_entropy_coef,
-                        baseline_ema=cfg.train.deck_baseline_ema,
-                    )
+            # AUDIT §2.4 — REINFORCE sur un deck constant n'apporte aucune
+            # information (les deux joueurs jouent DEFAULT_COMPETITIVE_DECK et
+            # reçoivent des récompenses opposées) : les mises à jour sont une
+            # marche aléatoire sur les logits.  Activable via
+            # `cfg.train.deck_builder_enabled` quand le deck redeviendra dynamique.
+            if getattr(cfg.train, "deck_builder_enabled", False):
+                for deck_ids, rew in deck_updates:
+                    deck_params, deck_opt_state, deck_baseline, d_loss = \
+                        deck_reinforce_update(
+                            deck_net, deck_params, deck_opt_state, deck_optimizer,
+                            deck_ids, rew, deck_baseline,
+                            entropy_coef=cfg.train.deck_entropy_coef,
+                            baseline_ema=cfg.train.deck_baseline_ema,
+                        )
 
         # ── b. Sample + train ─────────────────────────────────────────────
         entries, indices, is_w = buffer.sample(cfg.train.batch_size)
@@ -1278,13 +1557,10 @@ def train(cfg: Config) -> None:
         rng_step_replicated = jnp.broadcast_to(
             rng_step[None], (num_devs,) + rng_step.shape
         )
-        rep_frozen_replicated = jnp.broadcast_to(
-            jnp.array(rep_frozen, dtype=jnp.bool_), (num_devs,)
-        )
 
         t_step_start = time.time()
         state, metrics, td_errs = train_step_fn(
-            state, batch_sharded, rng_step_replicated, rep_frozen_replicated
+            state, batch_sharded, rng_step_replicated
         )
         tracker.train_step_times.append(time.time() - t_step_start)
 
@@ -1295,45 +1571,7 @@ def train(cfg: Config) -> None:
             )
             continue
 
-        # ── Contrôleur de dégel automatique (Split-Window Plateau Detection) ──
-        loss_val = float(metrics["loss_total"][0])
-        loss_window.append(loss_val)
-
-        w_size = getattr(cfg.train, "unfreeze_w", 500)
-        s_min = getattr(cfg.train, "unfreeze_s_min", 2000)
-        eps = getattr(cfg.train, "unfreeze_epsilon", 0.01)
-
-        current_gain = None
-        if rep_frozen and len(loss_window) == w_size:
-            w_list = list(loss_window)
-            half_w = w_size // 2
-            m_ancien = float(np.mean(w_list[:half_w]))
-            m_recent = float(np.mean(w_list[half_w:]))
-            current_gain = (m_ancien - m_recent) / (m_ancien + 1e-8)
-
-            if new_step >= s_min and current_gain < eps:
-                rep_frozen = False
-                logger.info("=========================================================================")
-                logger.info(
-                    "[train] Plateau de loss détecté (M_ancien=%.4f, M_récent=%.4f, Gain=%.2f%% < %.1f%%) à l'étape %d (nouveau: %d).",
-                    m_ancien, m_recent, current_gain * 100.0, eps * 100.0, step, new_step
-                )
-                logger.info("[train] Dégel automatique de h(s) (RepresentationNetwork) ! Début du fine-tuning global.")
-                logger.info("=========================================================================")
-
-        h_status = format_h_status(
-            step=step,
-            start_step=start_step,
-            rep_frozen=rep_frozen,
-            loss_window_len=len(loss_window),
-            w_size=w_size,
-            s_min=s_min,
-            eps=eps,
-            current_gain=current_gain,
-            avg_step_time=tracker.avg_train_step_time,
-        )
-
-        tracker.update(step=step, rep_frozen=rep_frozen, h_status=h_status)
+        tracker.update(step=step)
 
         # Update priorities (TD error basé sur les fresh targets Reanalyze)
         td_err_flat = np.array(unshard(td_errs))
@@ -1341,7 +1579,9 @@ def train(cfg: Config) -> None:
 
         # ── Priority Refresh allégé (tous les N steps) ────────────────────
         if step % cfg.train.priority_refresh_every == 0 and len(buffer) > 0:
-            _tp = getattr(state, "target_params", None) or state.params
+            _tp = getattr(state, "target_params", None)
+            if _tp is None:
+                _tp = state.params
             _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], _tp)["muzero"]
             _refresh_buffer_priorities(buffer, network, _params_cpu_mz, cfg)
 
@@ -1352,9 +1592,28 @@ def train(cfg: Config) -> None:
                  (hasattr(v, 'shape') and v.shape == (cfg.infra.num_devices,))}
             elapsed = time.time() - t0
             prb_acc_mean = float(np.mean(metrics.get("probe_acc_per_task", [np.zeros(11)])[0])) * 100.0
+            
+            h_norm = float(metrics.get("policy_entropy_norm", [0.0])[0])
+            p_max = float(metrics.get("policy_p_max_mean", [0.0])[0])
+            h_net = float(metrics.get("policy_entropy_net", [0.0])[0])
+            h_mcts = float(metrics.get("policy_entropy_mcts", [0.0])[0])
+            v_sat = float(metrics.get("value_saturation_pct", [0.0])[0])
+            h_scale = float(metrics.get("h_grad_scale", [1.0])[0])
+            act_dist = tracker.get_action_percentages()
+
+            tracker.update(
+                policy_entropy_norm=h_norm,
+                policy_p_max=p_max,
+                policy_entropy_net=h_net,
+                policy_entropy_mcts=h_mcts,
+                value_sat_pct=v_sat,
+                h_grad_scale=h_scale,
+            )
+
             logger.info(
                 "step=%d (nouveau:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
-                "prb=%.4f (acc=%.1f%%)  buf=%d  h(s)=%s  %.1fs",
+                "prb=%.4f (acc=%.1f%%)  H_norm=%.2f  p_max=%.2f  H(π)=%.2f vs H(p)=%.2f  "
+                "ATK=%.1f%% ATT=%.1f%% PLY=%.1f%% END=%.1f%%  h_scale=%.2f  buf=%d  %.1fs",
                 step,
                 new_step,
                 float(metrics["loss_total"][0]),
@@ -1363,15 +1622,23 @@ def train(cfg: Config) -> None:
                 float(metrics["loss_reward"][0]),
                 float(metrics["loss_probes"][0]),
                 prb_acc_mean,
+                h_norm,
+                p_max,
+                h_mcts,
+                h_net,
+                act_dist.get("attack", 0.0),
+                act_dist.get("attach", 0.0),
+                act_dist.get("play", 0.0),
+                act_dist.get("end", 0.0),
+                h_scale,
                 len(buffer),
-                h_status,
                 elapsed,
             )
             # Detailed per-probe loss and accuracy breakdown
             _log_probe_metrics(metrics, cfg)
 
             _log_wandb_full_metrics(
-                metrics, buffer, batch_cpu, td_err_flat, step, elapsed, rep_frozen, cfg
+                metrics, buffer, batch_cpu, td_err_flat, step, elapsed, cfg
             )
 
         # ── d. Checkpoint & HF push ───────────────────────────────────────
@@ -1468,10 +1735,19 @@ def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, c
 
     if len(hist) == 0 or hist.returns is None:
         return 0
-    probe_tgts = np.stack([
-        extract_probe_targets(raw, hist.player_idx)
-        for raw in hist.raw_states
-    ] + [np.full(11, -1, dtype=np.int32)])   # +1 for final state
+
+    # AUDIT §3.8 — les cibles de sonde sont désormais extraites côté worker et
+    # `raw_states` (l'observation brute complète de chaque pas : main, défausse
+    # de 60 cartes, prizes, logs…) n'est plus transmis par le pipe.  On garde le
+    # chemin historique en secours pour les anciennes trajectoires.
+    precomputed = getattr(hist, "probe_targets", None)
+    if precomputed:
+        rows = [np.asarray(p, dtype=np.int32) for p in precomputed]
+    else:
+        rows = [extract_probe_targets(raw, hist.player_idx) for raw in hist.raw_states]
+    if not rows:
+        rows = [np.full(11, -1, dtype=np.int32)] * len(hist.observations)
+    probe_tgts = np.stack(rows + [np.full(11, -1, dtype=np.int32)])   # +1 for final state
 
     buffer.add_game(
         obs_list    = hist.observations,

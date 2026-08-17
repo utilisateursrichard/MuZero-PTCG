@@ -20,24 +20,20 @@ Point d'entrée principal : ``ismcts_action``
 """
 from __future__ import annotations
 
+import logging
 from functools import partial
-from typing import Any, Callable, Dict, NamedTuple, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
 import mctx
 
 from config import Config, ModelConfig, SearchConfig
-from dataclasses import asdict
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Types
-# ─────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger("ptcg_muzero.ismcts")
 
-class MuZeroRecurrentFn(NamedTuple):
-    """Wraps g+f into the signature expected by mctx."""
-    dynamics_fn:   Callable   # (params, rng, z, action) → (reward, z_next)
-    prediction_fn: Callable   # (params, z)               → (pi_logits, value)
+# AUDIT §3.5 — le NamedTuple `MuZeroRecurrentFn` et l'import `asdict` étaient
+# inutilisés ; supprimés.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,6 +88,59 @@ def make_recurrent_fn(
 # ─────────────────────────────────────────────────────────────────────────────
 # Belief model (déterminisation de la main adverse)
 # ─────────────────────────────────────────────────────────────────────────────
+# ── AUDIT §2.1 : pool de cartes utilisé pour la déterminisation ───────────────
+# L'ancienne version tirait la main adverse dans `arange(1, num_card_ids)`, soit
+# les 1268 IDs du jeu, alors que les deux joueurs utilisent un deck FIXE de 60
+# cartes.  La main adverse simulée était donc composée à ~100 % de cartes
+# impossibles : le MCTS raisonnait sur des mondes irréalisables et — surtout —
+# l'observation stockée dans le replay buffer (déterminisation n°0) entraînait
+# h(s) sur ~5-8 tokens de bruit pur par pas, avec des features statiques (HP,
+# type, dégâts) totalement hors distribution.
+_BELIEF_DECK: list[int] | None = None      # None = non résolu, [] = désactivé
+_BELIEF_DECK_EXPLICIT: bool = False
+
+
+def set_belief_deck(card_ids) -> None:
+    """Déclare le deck réellement joué par l'adversaire (multiset de card_ids).
+
+    Passer ``None`` ou une liste vide rétablit l'ancien comportement (tirage
+    dans tout le pool de cartes), à n'utiliser que si le deck adverse est
+    réellement inconnu.
+    """
+    global _BELIEF_DECK, _BELIEF_DECK_EXPLICIT
+    _BELIEF_DECK_EXPLICIT = True
+    _BELIEF_DECK = list(card_ids) if card_ids else []
+
+
+def _default_belief_deck() -> list[int] | None:
+    global _BELIEF_DECK
+    if _BELIEF_DECK is None and not _BELIEF_DECK_EXPLICIT:
+        try:
+            from models.deck_builder import DEFAULT_COMPETITIVE_DECK
+            _BELIEF_DECK = list(DEFAULT_COMPETITIVE_DECK)
+        except Exception:
+            _BELIEF_DECK = []
+    return _BELIEF_DECK or None
+
+
+def _candidate_pool(known_opp_counts: dict, cfg: ModelConfig):
+    """Cartes plausiblement dans la main adverse, en respectant les multiplicités.
+
+    Retourne un ``np.ndarray`` d'IDs (avec répétitions) ou ``None`` si aucun deck
+    de référence n'est connu (→ repli sur le pool complet).
+    """
+    import numpy as np
+    from collections import Counter
+
+    deck = _default_belief_deck()
+    if not deck:
+        return None
+    remaining = Counter(int(c) for c in deck)
+    remaining.subtract(known_opp_counts)
+    pool = [cid for cid, n in remaining.items() if n > 0 for _ in range(n)]
+    return np.array(pool, dtype=np.int32) if pool else None
+
+
 def sample_belief(
     obs: dict,
     rng: jnp.ndarray,
@@ -100,63 +149,151 @@ def sample_belief(
     """
     Produce one determinised world by sampling a plausible opponent hand.
 
-    Strategy:
-      - We know ``opp_discard_ids`` (face-up) and our own ``my_hand_ids``.
-      - The remaining unseen cards (opponent hand + deck) are sampled
-        uniformly from the complement.
-      - ``opp_hand_count`` tells us how many cards to assign to the hand.
-      - This is a simple uniform prior; a learned belief model can replace
-        this function later without changing the rest of the pipeline.
-
-    Returns a copy of ``obs`` with ``opp_bench_ids`` / ``opp_hand_ids``
-    fields filled in from the sampled world.
+    Supports both raw Python environment dicts (from self-play workers)
+    and pre-encoded numpy array dicts (from direct agent inference).
     """
-    # We work in numpy-land here (called outside JAX traced code)
     import numpy as np
+    from collections import Counter
 
-    obs_out = {k: v.copy() if hasattr(v, "copy") else v for k, v in obs.items()}
+    is_raw_dict = isinstance(obs, dict) and ("current" in obs or "select" in obs)
+    known_opp_counts: Counter = Counter()
 
-    # Cards already accounted for (visible)
-    known_ids = set()
-    for field in ("my_hand_ids", "my_active_id", "my_bench_ids",
-                  "my_discard_ids", "my_prize_ids",
-                  "opp_active_id", "opp_bench_ids", "opp_discard_ids"):
-        arr = obs.get(field)
-        if arr is not None:
-            known_ids.update(int(x) for x in arr.ravel() if x > 0)
+    if is_raw_dict:
+        # AUDIT §3.7 — `copy.deepcopy(obs)` était appelé num_belief_samples (4) ×
+        # par décision × 8 workers sur des observations contenant défausse (60),
+        # main, prizes et logs.  Seul `players[opp]["hand"]` est modifié : une
+        # copie superficielle ciblée suffit.
+        current = dict(obs.get("current") or {})
+        your_idx = current.get("yourIndex", 0)
+        players_src = current.get("players") or [{}, {}]
+        players = [dict(p) if isinstance(p, dict) else p for p in players_src]
+        current["players"] = players
+        obs_out = dict(obs)
+        obs_out["current"] = current
 
-    # Universe: all card IDs 1..num_card_ids-1
-    all_ids = np.arange(1, cfg.num_card_ids, dtype=np.int32)
-    unseen  = all_ids[~np.isin(all_ids, list(known_ids))]
+        me = players[your_idx] if (isinstance(players, list) and your_idx < len(players)) else {}
+        opp = players[1 - your_idx] if (isinstance(players, list) and (1 - your_idx) < len(players)) else {}
 
-    opp_hand_count = int(obs.get("global_feat", np.zeros(12))[11] * 20)
-    opp_hand_count = min(max(opp_hand_count, 0), cfg.max_hand_size)
+        known_ids = set()
+        for area_key in ("active", "bench", "hand", "discard", "prize"):
+            items = me.get(area_key) or []
+            if not isinstance(items, list):
+                items = [items]
+            for item in items:
+                if isinstance(item, dict) and item.get("id"):
+                    known_ids.add(int(item["id"]))
+
+        for area_key in ("active", "bench", "discard"):
+            items = opp.get(area_key) or []
+            if not isinstance(items, list):
+                items = [items]
+            for item in items:
+                if isinstance(item, dict) and item.get("id"):
+                    known_ids.add(int(item["id"]))
+                    known_opp_counts[int(item["id"])] += 1
+
+        opp_hand_count = int(opp.get("handCount", 0) or 0)
+    else:
+        obs_out = {k: v.copy() if hasattr(v, "copy") else v for k, v in obs.items()}
+        known_ids = set()
+        for field in ("my_hand_ids", "my_active_id", "my_bench_ids",
+                      "my_discard_ids", "my_prize_ids",
+                      "opp_active_id", "opp_bench_ids", "opp_discard_ids"):
+            arr = obs.get(field)
+            if arr is not None:
+                known_ids.update(int(x) for x in arr.ravel() if x > 0)
+        for field in ("opp_active_id", "opp_bench_ids", "opp_discard_ids"):
+            arr = obs.get(field)
+            if arr is not None:
+                for x in arr.ravel():
+                    if x > 0:
+                        known_opp_counts[int(x)] += 1
+
+        global_feat = obs.get("global_feat")
+        if global_feat is not None:
+            opp_hand_count = int(round(float(global_feat[11]) * 20.0))
+        else:
+            opp_hand_count = 0
+
+    # AUDIT §2.1 : tirer dans le deck adverse connu, avec ses multiplicités.
+    unseen = _candidate_pool(known_opp_counts, cfg)
+    if unseen is None:
+        all_ids = np.arange(1, cfg.num_card_ids, dtype=np.int32)
+        unseen = all_ids[~np.isin(all_ids, list(known_ids))]
 
     if len(unseen) == 0 or opp_hand_count == 0:
         return obs_out
 
-    if hasattr(rng, "__len__") or hasattr(rng, "shape"):
-        seed = int(rng[0])
-    else:
+    try:
+        seed = int(np.asarray(rng).ravel()[0])
+    except (IndexError, TypeError, ValueError):
         seed = int(rng)
     rng_np = np.random.default_rng(seed % (2**31))
-    sample_count = min(opp_hand_count, len(unseen))
+    sample_count = min(opp_hand_count, len(unseen), cfg.max_hand_size)
+    # `replace=False` sur un pool contenant déjà les répétitions du deck :
+    # on peut donc tirer 4 exemplaires d'une carte présente en 4 exemplaires.
     sampled = rng_np.choice(unseen, size=sample_count, replace=False)
 
-    opp_hand = np.zeros(cfg.max_hand_size, dtype=np.int32)
-    opp_hand_mask = np.zeros(cfg.max_hand_size, dtype=bool)
-    opp_hand[:len(sampled)] = sampled
-    opp_hand_mask[:len(sampled)] = True
-    # Inject into obs (used by the encoder to build the opponent hand token)
-    obs_out["opp_hand_ids"] = opp_hand
-    obs_out["opp_hand_mask"] = opp_hand_mask
+    if is_raw_dict:
+        players = obs_out.get("current", {}).get("players", [{}, {}])
+        opp = players[1 - your_idx]
+        opp["hand"] = [{"id": int(cid)} for cid in sampled]
+    else:
+        opp_hand = np.zeros(cfg.max_hand_size, dtype=np.int32)
+        opp_hand_mask = np.zeros(cfg.max_hand_size, dtype=bool)
+        n = min(len(sampled), cfg.max_hand_size)
+        if n > 0:
+            opp_hand[:n] = sampled[:n]
+            opp_hand_mask[:n] = True
+        obs_out["opp_hand_ids"] = opp_hand
+        obs_out["opp_hand_mask"] = opp_hand_mask
+
     return obs_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Dirichlet noise helper via exact Gamma sampling (JAX vectorisé)
+# ─────────────────────────────────────────────────────────────────────────────
+def inject_dirichlet_noise(
+    prior_logits: jnp.ndarray,
+    invalid_mask: jnp.ndarray,
+    rng: jnp.ndarray,
+    dirichlet_epsilon: float = 0.0,
+    dirichlet_alpha: float = 0.3,
+) -> jnp.ndarray:
+    """
+    Injecte un bruit de Dirichlet exact sur les actions légales via échantillonnage Gamma.
+    - Exploite la propriété Gamma : Dirichlet(alpha) ~ Gamma(alpha, 1) / sum(Gamma sur actions légales)
+    - Alpha adaptatif calibré sur le nombre d'actions légales : alpha = clip(10.0 / N_legal, 0.3, 5.0)
+    - Garantit un epsilon effectif rigoureusement stable sur le sous-ensemble légal.
+    """
+    if dirichlet_epsilon <= 0.0:
+        return jnp.where(invalid_mask, -1e9, prior_logits)
+
+    legal_mask = ~invalid_mask
+    num_legal = jnp.maximum(jnp.sum(legal_mask.astype(jnp.float32), axis=-1, keepdims=True), 1.0)
+    alpha_adapt = jnp.clip(10.0 / num_legal, 0.3, 5.0)
+
+    # Gamma sampling
+    gamma_noise = jax.random.gamma(rng, alpha_adapt, shape=prior_logits.shape)
+    gamma_masked = jnp.where(legal_mask, gamma_noise, 0.0)
+    gamma_sum = jnp.maximum(jnp.sum(gamma_masked, axis=-1, keepdims=True), 1e-8)
+    dirichlet_noise = gamma_masked / gamma_sum
+
+    # Prior probabilities on legal actions
+    legal_logits = jnp.where(invalid_mask, -1e9, prior_logits)
+    prior_probs = jax.nn.softmax(legal_logits, axis=-1)
+    noisy_probs = (1.0 - dirichlet_epsilon) * prior_probs + dirichlet_epsilon * dirichlet_noise
+
+    # Return masked logits
+    return jnp.where(invalid_mask, -1e9, jnp.log(jnp.maximum(noisy_probs, 1e-12)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main ISMCTS entry point
 # ─────────────────────────────────────────────────────────────────────────────
-@partial(jax.jit, static_argnames=("cfg_tuple", "num_simulations", "max_num_considered_actions"))
+@partial(jax.jit, static_argnames=("cfg_tuple", "num_simulations", "max_num_considered_actions", "dirichlet_epsilon", "dirichlet_alpha"))
 def _run_batched_mcts_jit(
     params: dict,
     z: jnp.ndarray,
@@ -169,6 +306,8 @@ def _run_batched_mcts_jit(
     cfg_tuple: tuple,
     num_simulations: int,
     max_num_considered_actions: int,
+    dirichlet_epsilon: float = 0.0,
+    dirichlet_alpha: float = 0.3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Exécute Gumbel MuZero MCTS compilé avec JAX JIT sur un batch de N_samples (belief samples).
@@ -177,7 +316,12 @@ def _run_batched_mcts_jit(
     from models.networks import MuZeroNetwork
     model_cfg = ModelConfig(**dict(cfg_tuple))
     network = MuZeroNetwork(cfg=model_cfg, static_features=static_features)
-    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
+
+    rng_mcts, rng_noise = jax.random.split(rng)
+    masked_logits = inject_dirichlet_noise(
+        pi_logits, invalid_mask, rng_noise, dirichlet_epsilon, dirichlet_alpha
+    )
+
     root = mctx.RootFnOutput(
         prior_logits=masked_logits,
         value=v,
@@ -186,7 +330,7 @@ def _run_batched_mcts_jit(
     recurrent_fn = make_recurrent_fn(network, params)
     policy_output = mctx.gumbel_muzero_policy(
         params=params,
-        rng_key=rng,
+        rng_key=rng_mcts,
         root=root,
         recurrent_fn=recurrent_fn,
         num_simulations=num_simulations,
@@ -203,6 +347,8 @@ def ismcts_action(
     option_mask_np,     # numpy [max_actions] bool
     rng: jnp.ndarray,
     cfg: Config,
+    dirichlet_epsilon: float = 0.0,
+    dirichlet_alpha: float = 0.3,
 ) -> Tuple[int, jnp.ndarray, float]:
     """
     Full ISMCTS decision:
@@ -224,7 +370,6 @@ def ismcts_action(
 
     # 1. Générer toutes les déterminisations (belief samples) sur CPU
     rng, *rng_beliefs = jax.random.split(rng, N_samples + 1)
-    rng_mcts_keys = jax.random.split(rng, N_samples)
     
     det_list = []
     for s in range(N_samples):
@@ -260,6 +405,8 @@ def ismcts_action(
         cfg_tuple=cfg_tuple,
         num_simulations=int(sc.num_simulations),
         max_num_considered_actions=int(sc.max_num_considered_actions),
+        dirichlet_epsilon=float(dirichlet_epsilon),
+        dirichlet_alpha=float(dirichlet_alpha),
     )
 
     # 4. Moyenne sur l'axe des belief samples
@@ -275,23 +422,9 @@ def ismcts_action(
     return best_action, avg_policy, avg_value
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dirichlet noise injection at root (self-play only)
-# ─────────────────────────────────────────────────────────────────────────────
-def add_exploration_noise(
-    policy_logits: jnp.ndarray,   # [A]
-    option_mask: jnp.ndarray,     # [A] bool
-    rng: jnp.ndarray,
-    alpha: float = 0.3,
-    epsilon: float = 0.25,
-) -> jnp.ndarray:
-    """
-    Inject Dirichlet noise à la AlphaZero over legal actions only.
-    """
-    num_legal = jnp.sum(option_mask).astype(jnp.int32)
-    noise = jax.random.dirichlet(rng, alpha * jnp.ones(policy_logits.shape))
-    noisy = (1 - epsilon) * policy_logits + epsilon * noise
-    return jnp.where(option_mask, noisy, policy_logits)
+# AUDIT §3.5 — `add_exploration_noise` (variante non batchée, importée mais
+# jamais appelée) supprimée : `inject_dirichlet_noise` ci-dessus est la seule
+# implémentation utilisée, et elle est batchée.
 
 
 def reanalyze_root(
@@ -306,7 +439,7 @@ def reanalyze_root(
     max_num_considered_actions: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Reanalyze In-Pipeline GPU : relance un MCTS Gumbel allégé sur le batch
+    Reanalyze In-Pipeline GPU : relance un MCTS Gumbel sur le batch
     root entier en utilisant les paramètres courants du réseau.
 
     Contrairement à ismcts_action_batched (self-play) qui utilise vmap parce
@@ -366,6 +499,8 @@ def _ismcts_action_batched_impl(
     max_num_considered_actions: int,
     num_belief_samples: int,
     max_actions: int,
+    dirichlet_epsilon: float = 0.0,
+    dirichlet_alpha: float = 0.3,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     B = option_masks.shape[0]
     S = num_belief_samples
@@ -382,7 +517,11 @@ def _ismcts_action_batched_impl(
 
     mask_jax_batched = jnp.repeat(option_masks, S, axis=0)
     invalid_mask = ~mask_jax_batched
-    masked_logits = jnp.where(invalid_mask, -1e9, pi_logits)
+
+    rng_mcts, rng_noise = jax.random.split(rng)
+    masked_logits = inject_dirichlet_noise(
+        pi_logits, invalid_mask, rng_noise, dirichlet_epsilon, dirichlet_alpha
+    )
 
     root = mctx.RootFnOutput(
         prior_logits=masked_logits,
@@ -391,7 +530,6 @@ def _ismcts_action_batched_impl(
     )
 
     recurrent_fn = make_recurrent_fn(network, mz_params)
-    rng_mcts, _ = jax.random.split(rng)
 
     policy_output = mctx.gumbel_muzero_policy(
         params=mz_params,
@@ -431,6 +569,8 @@ def _get_ismcts_action_batched_jit(
     max_num_considered_actions: int,
     num_belief_samples: int,
     max_actions: int,
+    dirichlet_epsilon: float = 0.0,
+    dirichlet_alpha: float = 0.3,
 ):
     key = (
         id(network),
@@ -438,9 +578,25 @@ def _get_ismcts_action_batched_jit(
         max_num_considered_actions,
         num_belief_samples,
         max_actions,
+        float(dirichlet_epsilon),
+        float(dirichlet_alpha),
     )
-    compiled = _ISMCTS_BATCHED_JIT_CACHE.get(key)
+    # AUDIT §3.2 — `id()` est recyclé après garbage collection : on conserve une
+    # référence forte au module dans le cache pour que son identité reste unique
+    # tant que l'entrée existe, et on revérifie l'identité à la lecture.
+    cached = _ISMCTS_BATCHED_JIT_CACHE.get(key)
+    compiled = None
+    if cached is not None:
+        cached_net, cached_fn = cached
+        if cached_net is network:
+            compiled = cached_fn
+        else:
+            _ISMCTS_BATCHED_JIT_CACHE.pop(key, None)
     if compiled is None:
+        logger.info(
+            "[ismcts_batched] JIT compilation ISMCTS: sims=%d, belief_samples=%d, max_considered=%d, dirichlet_eps=%.3f, dirichlet_alp=%.3f",
+            num_simulations, num_belief_samples, max_num_considered_actions, dirichlet_epsilon, dirichlet_alpha
+        )
         @jax.jit
         def compiled(params, batched_enc_obs, option_masks, rng):
             return _ismcts_action_batched_impl(
@@ -453,9 +609,11 @@ def _get_ismcts_action_batched_jit(
                 max_num_considered_actions=max_num_considered_actions,
                 num_belief_samples=num_belief_samples,
                 max_actions=max_actions,
+                dirichlet_epsilon=dirichlet_epsilon,
+                dirichlet_alpha=dirichlet_alpha,
             )
 
-        _ISMCTS_BATCHED_JIT_CACHE[key] = compiled
+        _ISMCTS_BATCHED_JIT_CACHE[key] = (network, compiled)
     return compiled
 
 
@@ -466,6 +624,8 @@ def ismcts_action_batched(
     option_masks_np,
     rng: jnp.ndarray,
     cfg: Config,
+    dirichlet_epsilon: float | None = None,
+    dirichlet_alpha: float | None = None,
 ) -> Tuple[Any, jnp.ndarray, Any]:
     """
     Runs MCTS on a batch of B games, each with S belief samples.
@@ -476,6 +636,8 @@ def ismcts_action_batched(
     mc = cfg.model
 
     option_masks_jnp = jnp.array(option_masks_np)
+    eps = float(sc.dirichlet_epsilon if dirichlet_epsilon is None else dirichlet_epsilon)
+    alp = float(sc.dirichlet_alpha if dirichlet_alpha is None else dirichlet_alpha)
 
     compiled = _get_ismcts_action_batched_jit(
         network,
@@ -483,6 +645,8 @@ def ismcts_action_batched(
         int(sc.max_num_considered_actions),
         int(sc.num_belief_samples),
         int(mc.max_actions),
+        eps,
+        alp,
     )
     best_actions, avg_policies, avg_values = compiled(
         params,

@@ -282,8 +282,6 @@ class RepresentationNetwork(nn.Module):
         # ── Available options ─────────────────────────────────────────────
         opt_card = self.card_emb(obs["option_ids"])   # [B, A, card_dim]
         opt_feat = obs["option_feat"]                 # [B, A, OPTION_FEAT_DIM]
-        if opt_feat.shape[-1] > 45 and opt_card.shape[-1] == 112:
-            opt_feat = opt_feat[..., :45]
         opt_tok  = self.option_proj(
             jnp.concatenate([opt_card, opt_feat], axis=-1)
         )
@@ -307,14 +305,15 @@ class RepresentationNetwork(nn.Module):
 class PredictionNetwork(nn.Module):
     cfg: ModelConfig
 
-    @nn.compact
+    # NOTE (audit §1.0) : un seul `@nn.compact` est autorisé par module Flax.
+    # `__call__` délègue donc à `predict_full` sans être lui-même compact.
     def __call__(
         self, z: jnp.ndarray, option_feat: jnp.ndarray | None = None
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Args:
             z: latent state [B, latent_dim]
-            option_feat: optional [B, max_actions, OPTION_FEAT_DIM] for Pointer Network matching
+            option_feat: accepté pour compatibilité d'appel, non utilisé (cf. predict_full)
         Returns:
             policy_logits: [B, max_actions]
             value_scalar:  [B]            (expected scalar in [v_min, v_max])
@@ -331,29 +330,27 @@ class PredictionNetwork(nn.Module):
             policy_logits: [B, max_actions]
             value_scalar:  [B]            (expected scalar in [v_min, v_max])
             value_logits:  [B, num_bins]   (categorical distribution logits)
+
+        AUDIT §1.1 — la branche « Pointer Network » (pi_q / pi_k) a été supprimée.
+        Elle n'était active que lorsque `option_feat` était fourni, c'est-à-dire
+        uniquement à la racine de la self-play / inférence, JAMAIS dans la loss ni
+        dans le `recurrent_fn` de mctx.  Ses poids ne recevaient donc aucun
+        gradient et injectaient un bruit figé d'amplitude O(1) dans la policy
+        prior, réappris en boucle par le réseau → policy collapse.
+        La tête est maintenant strictement identique à la racine et dans l'arbre.
+        `option_feat` reste accepté (et ignoré) pour ne pas casser les appelants.
         """
+        del option_feat  # volontairement inutilisé — cf. docstring
         D = self.cfg.latent_dim
         num_bins = getattr(self.cfg, "num_value_bins", 51)
-        v_min = getattr(self.cfg, "value_min", -2.5)
-        v_max = getattr(self.cfg, "value_max", 2.5)
+        v_min = getattr(self.cfg, "value_min", -1.8)
+        v_max = getattr(self.cfg, "value_max", 1.8)
 
-        # Policy head with Pointer Network / Cross-Attention
+        # Policy head
         pi_hid = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
         pi_hid = LayerNorm()(pi_hid)
 
-        pi_dense_logits = nn.Dense(self.cfg.max_actions, name="pi_dense")(pi_hid)
-
-        opt_f = option_feat if option_feat is not None else jnp.zeros((z.shape[0], self.cfg.max_actions, OPTION_FEAT_DIM), dtype=z.dtype)
-        if opt_f.shape[-1] > 45:
-            opt_f = opt_f[..., :45]
-        q = nn.Dense(64, name="pi_q")(pi_hid)                         # [B, 64]
-        k = nn.Dense(64, name="pi_k")(opt_f)                          # [B, A, 64]
-
-        if option_feat is not None:
-            ptr_logits = jnp.einsum("bd,bad->ba", q, k) / (64.0 ** 0.5)     # [B, A]
-            pi_logits = pi_dense_logits + ptr_logits
-        else:
-            pi_logits = pi_dense_logits
+        pi_logits = nn.Dense(self.cfg.max_actions, name="pi_dense")(pi_hid)
 
         # Value head (Categorical logits)
         v_hid = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
@@ -378,7 +375,7 @@ class DynamicsNetwork(nn.Module):
     """
     cfg: ModelConfig
 
-    @nn.compact
+    # NOTE (audit §1.0) : un seul `@nn.compact` par module Flax.
     def __call__(
         self,
         z: jnp.ndarray,
@@ -389,7 +386,7 @@ class DynamicsNetwork(nn.Module):
         Args:
             z:             [B, latent_dim]
             action_onehot: [B, max_actions]
-            action_feat:   optional [B, OPTION_FEAT_DIM] semantic action features
+            action_feat:   accepté pour compatibilité, non utilisé
         Returns:
             reward:  [B] (expected scalar)
             z_next:  [B, latent_dim]
@@ -409,23 +406,18 @@ class DynamicsNetwork(nn.Module):
             reward_scalar: [B]            (expected scalar)
             reward_logits: [B, num_bins]   (categorical reward logits)
             z_next:        [B, latent_dim]
+
+        AUDIT §1.1 — `action_feat` n'était fourni par aucun appelant : la couche
+        `a_feat_emb` était du poids mort.  Supprimée ; seul l'embedding one-hot
+        est conservé, ce qui rend la dynamique identique partout.
         """
+        del action_feat  # volontairement inutilisé — cf. docstring
         D = self.cfg.latent_dim
         num_bins = getattr(self.cfg, "num_value_bins", 51)
-        v_min = getattr(self.cfg, "value_min", -2.5)
-        v_max = getattr(self.cfg, "value_max", 2.5)
+        v_min = getattr(self.cfg, "value_min", -1.8)
+        v_max = getattr(self.cfg, "value_max", 1.8)
 
-        a_emb_onehot = nn.Dense(D, name="a_emb")(action_onehot)
-
-        act_f = action_feat if action_feat is not None else jnp.zeros((z.shape[0], OPTION_FEAT_DIM), dtype=z.dtype)
-        if act_f.shape[-1] > 45:
-            act_f = act_f[..., :45]
-        a_emb_feat = nn.Dense(D, name="a_feat_emb")(act_f)
-
-        if action_feat is not None:
-            a_emb = a_emb_feat
-        else:
-            a_emb = a_emb_onehot
+        a_emb = nn.Dense(D, name="a_emb")(action_onehot)
         a_emb = nn.gelu(a_emb)
 
         x = jnp.concatenate([z, a_emb], axis=-1)   # [B, 2D]
@@ -547,11 +539,16 @@ class MuZeroNetwork(nn.Module):
         z        = self.represent(obs, deterministic=deterministic)
         opt_feat = obs.get("option_feat", None) if isinstance(obs, dict) else None
         pi, v    = self.predict(z, option_feat=opt_feat)
+        return z, pi, v
 
+    def init_all(
+        self, obs: dict, deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Eagerly initializes all submodules (h, f, g, project, predict_next) during init."""
+        z        = self.represent(obs, deterministic=deterministic)
+        opt_feat = obs.get("option_feat", None) if isinstance(obs, dict) else None
+        pi, v    = self.predict(z, option_feat=opt_feat)
 
-        
-        # Force l'initialisation des paramètres du modèle de dynamique (self.g)
-        # et des têtes de projection/prédiction pendant l'init sans affecter la sortie de la racine.
         dummy_action = jnp.zeros((z.shape[0], self.cfg.max_actions))
         _, _ = self.dynamics(z, dummy_action)
         
