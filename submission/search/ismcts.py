@@ -123,6 +123,35 @@ def _default_belief_deck() -> list[int] | None:
     return _BELIEF_DECK or None
 
 
+def _card_id_of(card) -> int:
+    """ID d'une carte, quelle que soit sa forme renvoyée par le moteur.
+
+    Le moteur peut exposer une carte comme un dict ``{"id": 96}``, comme un
+    objet portant un attribut ``id``, ou directement comme l'entier ``96``
+    (cf. le même traitement dans ``env/encoding.py``).  Sans ce dernier cas les
+    cartes visibles n'étaient pas reconnues : elles n'étaient pas retirées du
+    pool de déterminisation et pouvaient être « re-tirées » dans la main
+    adverse simulée.
+    """
+    import numpy as _np
+
+    if card is None:
+        return 0
+    if isinstance(card, bool):          # bool est un int en Python
+        return 0
+    if isinstance(card, (int, _np.integer)):
+        return int(card)
+    raw = card.get("id") if isinstance(card, dict) else getattr(card, "id", None)
+    if raw is None:
+        return 0
+    if hasattr(raw, "value"):
+        raw = raw.value
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _candidate_pool(known_opp_counts: dict, cfg: ModelConfig):
     """Cartes plausiblement dans la main adverse, en respectant les multiplicités.
 
@@ -180,17 +209,19 @@ def sample_belief(
             if not isinstance(items, list):
                 items = [items]
             for item in items:
-                if isinstance(item, dict) and item.get("id"):
-                    known_ids.add(int(item["id"]))
+                cid = _card_id_of(item)
+                if cid > 0:
+                    known_ids.add(cid)
 
         for area_key in ("active", "bench", "discard"):
             items = opp.get(area_key) or []
             if not isinstance(items, list):
                 items = [items]
             for item in items:
-                if isinstance(item, dict) and item.get("id"):
-                    known_ids.add(int(item["id"]))
-                    known_opp_counts[int(item["id"])] += 1
+                cid = _card_id_of(item)
+                if cid > 0:
+                    known_ids.add(cid)
+                    known_opp_counts[cid] += 1
 
         opp_hand_count = int(opp.get("handCount", 0) or 0)
     else:
@@ -635,7 +666,19 @@ def ismcts_action_batched(
     sc = cfg.search
     mc = cfg.model
 
-    option_masks_jnp = jnp.array(option_masks_np)
+    # Aligner tous les tenseurs sur le même device matériel que `params`
+    target_dev = None
+    if isinstance(params, dict):
+        first_val = next((v for v in params.values() if hasattr(v, "devices")), None)
+        if first_val and hasattr(first_val, "devices") and first_val.devices():
+            target_dev = list(first_val.devices())[0]
+
+    if target_dev:
+        option_masks_jnp = jax.device_put(option_masks_np, target_dev)
+        rng = jax.device_put(rng, target_dev)
+    else:
+        option_masks_jnp = jnp.array(option_masks_np)
+
     eps = float(sc.dirichlet_epsilon if dirichlet_epsilon is None else dirichlet_epsilon)
     alp = float(sc.dirichlet_alpha if dirichlet_alpha is None else dirichlet_alpha)
 
@@ -656,4 +699,5 @@ def ismcts_action_batched(
     )
 
     return np.array(best_actions), np.array(avg_policies), np.array(avg_values)
+
 

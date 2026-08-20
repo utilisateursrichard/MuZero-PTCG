@@ -134,7 +134,7 @@ def _get_card_db() -> dict:
                                 db[int(cid)] = c
                                 break
                     _card_db = db
-                    _probe_logger.info(
+                    _probe_logger.debug(
                         "[probes] card_db chargé : %d cartes", len(_card_db)
                     )
                 except Exception as exc:
@@ -350,7 +350,7 @@ def _get_attack_db() -> dict:
                         if max_dmg > 0:
                             table[cid] = max_dmg
 
-                    _probe_logger.info(
+                    _probe_logger.debug(
                         "[probes] attack_db chargée : %d cartes avec dégâts connus", len(table)
                     )
                 except Exception as exc:

@@ -350,12 +350,12 @@ def _merge_params(defaults, loaded):
     if hasattr(defaults, "shape") and hasattr(loaded, "shape"):
         if defaults.shape != loaded.shape:
             logger.warning(
-                "Incompatibilité de forme détectée pour la couche (modèle %s vs checkpoint %s) ; adaptation/réinitialisation de cette couche.",
+                "Shape mismatch detected for layer (model %s vs checkpoint %s); adapting/resetting this layer.",
                 defaults.shape, loaded.shape
             )
             # Adapt 2D kernels if input dimension expanded (e.g. option_proj: 157 -> 160)
             if defaults.ndim == 2 and loaded.ndim == 2 and defaults.shape[1] == loaded.shape[1] and defaults.shape[0] > loaded.shape[0]:
-                logger.info("Adaptation partielle de la matrice de poids %s -> %s (conservation des poids existants).", loaded.shape, defaults.shape)
+                logger.info("Partial adaptation of weight matrix %s -> %s (preserving existing weights).", loaded.shape, defaults.shape)
                 new_param = np.array(defaults)
                 new_param[:loaded.shape[0], :] = np.array(loaded)
                 return jnp.array(new_param)
@@ -537,6 +537,7 @@ def run_parallel_self_play(
     is_seeding: bool = False,
     min_batch_threshold: int = -1,   # -1 = utiliser num_workers (batch GPU toujours complet)
     card_data = None,
+    actor_devices: Optional[list] = None,
 ):
     if is_seeding:
         import copy
@@ -554,11 +555,14 @@ def run_parallel_self_play(
     import numpy as np
     from training.activity import tracker
 
-    # Pré-transférer les params sur les GPUs UNE SEULE FOIS (évite CPU→GPU à chaque inférence)
-    devices = jax.devices()
-    accel_devices = [d for d in devices if d.platform in ("gpu", "tpu")]
-    if not accel_devices:
-        accel_devices = devices  # fallback CPU
+    # Déterminer les accélérateurs dédiés au Self-Play
+    if actor_devices:
+        accel_devices = actor_devices
+    else:
+        devices = jax.devices()
+        accel_devices = [d for d in devices if d.platform in ("gpu", "tpu")]
+        if not accel_devices:
+            accel_devices = devices  # fallback CPU
     logger.info(
         "[self-play] Launching parallel self-play: %d workers, sims=%d, belief_samples=%d, dirichlet_eps=%.3f, dirichlet_alpha=%.3f",
         num_workers,
@@ -567,11 +571,12 @@ def run_parallel_self_play(
         cfg.search.dirichlet_epsilon,
         cfg.search.dirichlet_alpha,
     )
-    logger.info("[self-play] Accelerators (%s) pour MCTS : %s", accel_devices[0].platform, accel_devices)
+    logger.info("[self-play] Actor TPU/GPU accelerators (%s) for MCTS: %s", accel_devices[0].platform, accel_devices)
     _gpu_params = [
         jax.device_put(state_params, dev) for dev in accel_devices
     ]
     _inference_device_idx = [0]  # compteur pour alterner les GPUs
+
 
     ctx = mp.get_context("spawn")
 
@@ -609,7 +614,7 @@ def run_parallel_self_play(
         # Réanimation robuste du worker s'il s'est arrêté (ex. suite à une exception)
         p = processes[pipe_idx]
         if not p.is_alive():
-            logger.info(f"[coordinateur] Relance du worker {pipe_idx} qui s'était arrêté...")
+            logger.info(f"[coordinator] Restarting stopped worker {pipe_idx}...")
             with pipe_locks[pipe_idx]:
                 try:
                     pipes[pipe_idx].close()
@@ -638,7 +643,7 @@ def run_parallel_self_play(
                 })
             games_started += 1
         except Exception as e:
-            logger.error(f"[coordinateur] Échec d'envoi au worker {pipe_idx} relancé : {e}")
+            logger.error(f"[coordinator] Failed to send to restarted worker {pipe_idx}: {e}")
             pipe_meta[pipe_idx]["game_active"] = False
 
 
@@ -679,21 +684,18 @@ def run_parallel_self_play(
 
             items = [first]
 
-            # ── Collecte : agréger tous les workers déjà prêts ────────────────
-            # AUDIT §3.4 — le batch est de toute façon paddé à `num_workers`
-            # (forme fixe imposée par le JIT).  Une fenêtre de 2 ms ne laissait
-            # quasiment jamais le temps aux autres workers d'arriver : jusqu'à
-            # 87 % des simulations MCTS étaient calculées sur du padding.
-            # 15 ms est négligeable devant le coût d'un batch MCTS et remplit
-            # le batch dans la grande majorité des cas.
+
+            # ── Collecte : agréger les requêtes assignées à cet Actor TPU ───
+            actor_batch_size = max(1, (num_workers + len(accel_devices) - 1) // len(accel_devices))
             _t0 = time.time()
-            while len(items) < num_workers and time.time() - _t0 < 0.015:
+            while len(items) < actor_batch_size and time.time() - _t0 < 0.015:
                 try:
                     items.append(work_queue.get(timeout=0.002))
                 except _pyqueue.Empty:
                     continue
 
-            # ── Build batch padded à num_workers (taille fixe → pas de recompilation JAX) ──
+
+            # ── Build batch padded à actor_batch_size (taille fixe → 0 recompilation JAX) ──
             na_indices  = [it[0] for it in items]
             na_encs     = [it[1] for it in items]
             na_masks    = [it[2] for it in items]
@@ -701,9 +703,10 @@ def run_parallel_self_play(
 
             _pe = list(na_encs)
             _pm = list(na_masks)
-            while len(_pe) < num_workers:
+            while len(_pe) < actor_batch_size:
                 _pe.append(na_encs[-1])
                 _pm.append(na_masks[-1])
+
 
             _enc = {}
             for k in _pe[0].keys():
@@ -722,7 +725,7 @@ def run_parallel_self_play(
                 ap_np = np.array(_ap)
                 av_np = np.array(_av)
             except Exception as _e:
-                logger.error("[Acc%d] Erreur inférence (batch=%d) : %s", gpu_idx, _n, _e, exc_info=True)
+                logger.error("[Acc%d] Inference error (batch=%d): %s", gpu_idx, _n, _e, exc_info=True)
                 ba_np = np.array([int(np.random.choice(np.where(na_masks[i])[0])) for i in range(_n)])
                 ap_np = np.zeros((_n, int(cfg.model.max_actions)), dtype=np.float32)
                 av_np = np.zeros(_n, dtype=np.float32)
@@ -735,7 +738,7 @@ def run_parallel_self_play(
                     with pipe_locks[_pidx]:
                         if pipe_epoch[_pidx] != na_epochs[_i]:
                             logger.debug(
-                                "[Acc%d] Résultat obsolète ignoré pour le worker %d (époque %d != %d).",
+                                "[Acc%d] Stale result ignored for worker %d (epoch %d != %d).",
                                 gpu_idx, _pidx, na_epochs[_i], pipe_epoch[_pidx],
                             )
                             continue
@@ -745,7 +748,7 @@ def run_parallel_self_play(
                             "search_val":     float(av_np[_i]),
                         })
                 except Exception as _e:
-                    logger.error("[Acc%d] Erreur envoi action worker %d : %s", gpu_idx, _pidx, _e)
+                    logger.error("[Acc%d] Error sending action to worker %d: %s", gpu_idx, _pidx, _e)
 
     # Lancer autant de threads GPU/TPU qu'il y a d'accélérateurs
     gpu_threads = []
@@ -754,7 +757,7 @@ def run_parallel_self_play(
                               name=f"accel-inference-{_gidx}")
         _t.start()
         gpu_threads.append(_t)
-        logger.info("[coordinateur] Accelerator inference thread %d démarré (device: %s)", _gidx, accel_devices[_gidx])
+        logger.info("[coordinator] Accelerator inference thread %d started (device: %s)", _gidx, accel_devices[_gidx])
 
     # ── Boucle principale : I/O uniquement, pas d'inférence GPU ───────────
     while games_completed < num_games_to_play:
@@ -793,9 +796,9 @@ def run_parallel_self_play(
 
             if status == "deck_error":
                 deck_errors_count += 1
-                logger.warning(f"[coordinateur] Erreur de deck sur le worker {pipe_idx} : {msg.get('error')}")
+                logger.warning(f"[coordinator] Deck error on worker {pipe_idx}: {msg.get('error')}")
                 meta = pipe_meta[pipe_idx]
-                for p_idx, ids in [("joueur 0", meta.get("ids0")), ("joueur 1", meta.get("ids1"))]:
+                for p_idx, ids in [("player 0", meta.get("ids0")), ("player 1", meta.get("ids1"))]:
                     if ids is not None:
                         from collections import Counter
                         counts = Counter(list(np.array(ids)))
@@ -804,7 +807,7 @@ def run_parallel_self_play(
                             name = card_data.card_name(int(cid)) if card_data else f"ID {cid}"
                             is_ace = int(cid) in ace_spec_ids
                             deck_summary.append(f"{name} (ID: {cid}, count: {count}{', ACE' if is_ace else ''})")
-                        logger.info(f"  Deck de {p_idx} impliqué : {', '.join(deck_summary)}")
+                        logger.info(f"  Involved deck for {p_idx}: {', '.join(deck_summary)}")
                 if games_started < num_games_to_play:
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
@@ -821,7 +824,7 @@ def run_parallel_self_play(
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
                 games_completed += 1
                 tracker.update(games_completed=tracker.games_completed + 1)
-                logger.info(f"[coordinateur] Partie completee sur worker {pipe_idx} ! ({games_completed}/{num_games_to_play} completes, {games_started}/{num_games_to_play} lancees)")
+                logger.info(f"[coordinator] Game completed on worker {pipe_idx}! ({games_completed}/{num_games_to_play} completed, {games_started}/{num_games_to_play} started)")
                 if games_started < num_games_to_play:
                     rng, rng_next = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_next)
@@ -829,28 +832,29 @@ def run_parallel_self_play(
                     pipe_meta[pipe_idx]["game_active"] = False
 
             elif status == "error":
-                logger.error(f"[coordinateur] Le worker {pipe_idx} a envoye une erreur fatale : {msg.get('error')}")
+                logger.error(f"[coordinator] Worker {pipe_idx} sent fatal error: {msg.get('error')}")
                 pipe_meta[pipe_idx]["game_active"] = False
                 games_completed += 1
                 if games_started < num_games_to_play:
-                    logger.info(f"[coordinateur] Tentative de remplacement pour le worker {pipe_idx} en échec...")
+                    logger.info(f"[coordinator] Attempting to replace failed worker {pipe_idx}...")
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
 
-        # Détecter et relancer les workers gelés (inactivité > 120s)
+        # Détecter et relancer les workers réellement gelés (inactivité > 240s)
         now = time.time()
         for idx in range(num_workers):
-            if pipe_meta[idx].get("game_active") and (now - last_msg_time[idx] > 120.0):
+            if pipe_meta[idx].get("game_active") and (now - last_msg_time[idx] > 240.0):
                 logger.warning(
-                    f"[coordinateur] Le worker {idx} semble gele (inactif depuis {now - last_msg_time[idx]:.1f}s, etape {worker_steps[idx]}). Force restart..."
+                    f"[coordinator] Worker {idx} appears frozen (idle for {now - last_msg_time[idx]:.1f}s, step {worker_steps[idx]}). Force restarting..."
                 )
+
                 try:
                     processes[idx].terminate()
                     processes[idx].join(timeout=2.0)
                     if processes[idx].is_alive():
                         processes[idx].kill()
                 except Exception as e:
-                    logger.error(f"[coordinateur] Erreur lors de la coupure du worker {idx} : {e}")
+                    logger.error(f"[coordinator] Error terminating worker {idx}: {e}")
                 with pipe_locks[idx]:
                     try:
                         pipes[idx].close()
@@ -907,7 +911,7 @@ def _init_wandb(cfg: Config):
         wandb_key = user_secrets.get_secret(cfg.wandb.kaggle_secret_name)
         if wandb_key:
             os.environ["WANDB_API_KEY"] = wandb_key
-            logger.info("[wandb] Clé API récupérée depuis le secret Kaggle '%s'", cfg.wandb.kaggle_secret_name)
+            logger.info("[wandb] API key retrieved from Kaggle secret '%s'", cfg.wandb.kaggle_secret_name)
     except Exception:
         pass
 
@@ -916,7 +920,7 @@ def _init_wandb(cfg: Config):
         os.environ["WANDB_API_KEY"] = os.environ.get("WANDB")
 
     if not os.environ.get("WANDB_API_KEY"):
-        logger.warning("[wandb] Aucune clé WANDB_API_KEY ou secret Kaggle '%s' trouvé. WandB sera désactivé.", cfg.wandb.kaggle_secret_name)
+        logger.warning("[wandb] No WANDB_API_KEY or Kaggle secret '%s' found. WandB disabled.", cfg.wandb.kaggle_secret_name)
         return None
 
     try:
@@ -930,10 +934,10 @@ def _init_wandb(cfg: Config):
             reinit=True,
         )
         url = run.url if hasattr(run, "url") else ""
-        logger.info("[wandb] wandb.init() réussi ! (project=%s, run_id=%s, url=%s)", cfg.wandb.project, run.id, url)
+        logger.info("[wandb] wandb.init() successful! (project=%s, run_id=%s, url=%s)", cfg.wandb.project, run.id, url)
         return run
     except Exception as e:
-        logger.warning("[wandb] Impossible d'initialiser WandB : %s", e)
+        logger.warning("[wandb] Could not initialize WandB: %s", e)
         return None
 
 
@@ -1048,7 +1052,7 @@ def _log_wandb_full_metrics(
         wandb.log(w_dict, step=step)
 
     except Exception as e:
-        logger.warning("[wandb] Erreur lors du log étendu : %s", e)
+        logger.warning("[wandb] Error during extended log: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1101,7 +1105,7 @@ def train(cfg: Config) -> None:
     # Only explicit card metadata is trustworthy here.  A card appearing once
     # in a reference deck is not evidence that it is an Ace Spec.
     ace_spec_set = set(card_data.ace_spec_ids)
-    logger.info("[ace-spec] %d Ace Spec card(s) détecté(s) via cards.csv : %s", len(ace_spec_set), list(ace_spec_set))
+    logger.info("[ace-spec] %d Ace Spec card(s) detected via cards.csv: %s", len(ace_spec_set), list(ace_spec_set))
 
     # Complétion via l'API de l'engine si disponible
     try:
@@ -1137,13 +1141,13 @@ def train(cfg: Config) -> None:
 
         engine_ace = [_card_id(i, c) for i, c in items if _card_is_ace(c)]
         ace_spec_set.update(engine_ace)
-        logger.info("[ace-spec] Après fusion avec all_card_data() : %d Ace Spec cards", len(ace_spec_set))
+        logger.info("[ace-spec] After merge with all_card_data(): %d Ace Spec cards", len(ace_spec_set))
     except Exception as e:
         logger.warning("[ace-spec] all_card_data() failed: %s", e)
 
     ace_spec_ids = sorted(list(ace_spec_set))
     if not ace_spec_ids:
-        logger.warning("[ace-spec] Aucune carte Ace Spec détectée !")
+        logger.warning("[ace-spec] No Ace Spec cards detected!")
 
     set_ace_spec_ids(ace_spec_ids)
     logger.info("Card pool: %d ids, %d energy ids, %d Basic Pokémon, %d ace spec ids",
@@ -1182,23 +1186,23 @@ def train(cfg: Config) -> None:
             loaded_deck_params = ckpt_data.get("deck", {})
             loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
             start_step = ckpt_data.get("step", 0)
-            logger.info("=== Checkpoint local explicite chargé : %s (étape %d) ===", target_ckpt, start_step)
+            logger.info("=== Loaded explicit local checkpoint: %s (step %d) ===", target_ckpt, start_step)
         except Exception as e:
-            logger.warning("Échec du chargement du checkpoint explicite %s : %s", target_ckpt, e)
+            logger.warning("Failed to load explicit checkpoint %s: %s", target_ckpt, e)
 
     # 2. Tenter de charger depuis HF Hub si activé (avec target_step si spécifié)
     if loaded_params is None and cfg.hf.enabled and cfg.hf.repo_id:
         try:
             from export.hub import load_from_hub
-            logger.info("Vérification du modèle sur HuggingFace Hub (%s, step=%s)...", cfg.hf.repo_id, target_step)
+            logger.info("Checking model on HuggingFace Hub (%s, step=%s)...", cfg.hf.repo_id, target_step)
             hf_mz, hf_dk, hf_cfg, hf_step = load_from_hub(cfg.hf.repo_id, step=target_step, cfg=cfg)
             if hf_mz:
                 loaded_params = hf_mz
                 loaded_deck_params = hf_dk
                 start_step = hf_step
-                logger.info("=== Modèle chargé depuis HF Hub : %s (étape %d) ===", cfg.hf.repo_id, start_step)
+                logger.info("=== Model loaded from HF Hub: %s (step %d) ===", cfg.hf.repo_id, start_step)
         except Exception as e:
-            logger.info("Aucun modèle HuggingFace Hub téléchargé ou échec de vérification (%s) : %s", cfg.hf.repo_id, e)
+            logger.info("No HuggingFace Hub model downloaded or check failed (%s): %s", cfg.hf.repo_id, e)
 
     # 3. Vérifier le checkpoint local UNIQUEMENT si aucun step/ckpt explicite n'a été demandé
     if target_step is None and target_ckpt is None and latest_path.exists():
@@ -1213,11 +1217,11 @@ def train(cfg: Config) -> None:
                 loaded_opt_state = ckpt_data.get("opt_state", None)
                 loaded_deck_params = ckpt_data.get("deck", {})
                 loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
-                logger.info("=== Reprise depuis le checkpoint local plus récent : %s (étape %d) ===", latest_path, start_step)
+                logger.info("=== Resuming from latest local checkpoint: %s (step %d) ===", latest_path, start_step)
             elif loaded_params is not None:
-                logger.info("=== Checkpoint local (étape %d) <= HF Hub (étape %d). Conservation des poids HF Hub. ===", local_step, start_step)
+                logger.info("=== Local checkpoint (step %d) <= HF Hub (step %d). Keeping HF Hub weights. ===", local_step, start_step)
         except Exception as e:
-            logger.warning("Échec de la lecture du checkpoint local existant : %s.", e)
+            logger.warning("Failed to read existing local checkpoint: %s.", e)
 
     if loaded_params is not None:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
@@ -1240,11 +1244,11 @@ def train(cfg: Config) -> None:
         fresh_mz = _get_mz_dict(state.params)
 
         if reset_f:
-            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Prediction Network f (policy π & value V) ===")
+            logger.info("=== [HOT-FIX] Surgical reset of Prediction Network f (policy π & value V) ===")
             if "f" in fresh_mz:
                 target_mz["f"] = fresh_mz["f"]
         if reset_g:
-            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Dynamics Network g (50-dim transitions) et têtes de consistance ===")
+            logger.info("=== [HOT-FIX] Surgical reset of Dynamics Network g (50-dim transitions) and consistency heads ===")
             if "g" in fresh_mz:
                 target_mz["g"] = fresh_mz["g"]
             if "project" in fresh_mz:
@@ -1258,8 +1262,8 @@ def train(cfg: Config) -> None:
         reset_v = getattr(cfg.train, "reset_value_head", False) and not reset_f
         if reset_v:
             logger.info(
-                "=== [RESET-VALUE-HEAD] Réinitialisation de la seule tête de valeur/récompense "
-                "(h, politique et transition g conservés) ==="
+                "=== [RESET-VALUE-HEAD] Reset of value/reward head only "
+                "(keeping h, policy, and transition g) ==="
             )
             params_jax = _reset_value_head_params(params_jax, state.params)
 
@@ -1270,7 +1274,7 @@ def train(cfg: Config) -> None:
 
         fresh_opt_state = state.tx.init(params_jax)
         if (reset_f or reset_g) or loaded_opt_state is None:
-            logger.info("=== [HOT-FIX] Réinitialisation propre de l'optimiseur Adam ===")
+            logger.info("=== [HOT-FIX] Clean reset of Adam optimizer ===")
             state = state.replace(opt_state=fresh_opt_state)
         else:
             try:
@@ -1282,14 +1286,14 @@ def train(cfg: Config) -> None:
                     # Moments Adam remis à zéro pour les SEULES couches neuves.
                     opt_state_merged = _zero_adam_moments(opt_state_merged, params_jax)
                     logger.info(
-                        "=== [RESET-VALUE-HEAD] Moments Adam remis à zéro pour v_dense / rdet_fc2 "
-                        "(inertie conservée pour h, g et la politique) ==="
+                        "=== [RESET-VALUE-HEAD] Adam moments reset for v_dense / rdet_fc2 "
+                        "(momentum kept for h, g, and policy) ==="
                     )
                 state = state.replace(opt_state=opt_state_merged)
-                logger.info("=== État de l'optimiseur MuZero restauré et fusionné avec succès à l'étape %d ===", start_step)
+                logger.info("=== MuZero optimizer state successfully restored and merged at step %d ===", start_step)
             except Exception as e:
                 logger.warning(
-                    "État d'optimiseur du checkpoint incompatible avec la nouvelle architecture (%s). Réinitialisation propre de l'optimiseur à l'étape %d.",
+                    "Checkpoint optimizer state incompatible with new architecture (%s). Cleanly reinitializing optimizer at step %d.",
                     e, start_step
                 )
                 state = state.replace(opt_state=fresh_opt_state)
@@ -1303,9 +1307,9 @@ def train(cfg: Config) -> None:
         if loaded_deck_opt_state is not None:
             try:
                 deck_opt_state = jax.tree_util.tree_map(jax.device_put, loaded_deck_opt_state)
-                logger.info("=== État de l'optimiseur deck builder restauré avec succès ===")
+                logger.info("=== Deck builder optimizer state successfully restored ===")
             except Exception as e:
-                logger.warning("Impossible de restaurer l'état de l'optimiseur deck builder : %s", e)
+                logger.warning("Could not restore deck builder optimizer state: %s", e)
                 deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
         else:
             deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
@@ -1316,13 +1320,36 @@ def train(cfg: Config) -> None:
         )
     deck_optimizer = optax.adam(cfg.train.deck_lr)
 
-    # ── 5. Replicate onto available devices (1 GPU, 2 GPUs, or CPU) ─────
-    num_devs = min(len(jax.devices()), cfg.infra.num_devices)
-    devices  = jax.devices()[:num_devs]
-    state    = flax.jax_utils.replicate(state, devices)
-    logger.info("[train] TrainState répliqué sur %d device(s) : %s", num_devs, devices)
+    # ── 5. Découplage Matériel des Devices (Learner vs Actors) ───────────
+    all_devs = jax.devices()[:cfg.infra.num_devices]
+    num_total_devs = len(all_devs)
+
+    # Répartition optimale en puissances de 2 (ex: 4 Learners + 4 Actors sur 8 TPUs)
+    if num_total_devs >= 4:
+        configured_learners = getattr(cfg.infra, "num_learner_devices", 0)
+        num_learner_devs = configured_learners if configured_learners > 0 else (num_total_devs // 2)
+        learner_devices = all_devs[:num_learner_devs]
+        actor_devices   = all_devs[num_learner_devs:]
+    elif num_total_devs in (2, 3):
+        num_learner_devs = 1
+        learner_devices = all_devs[:1]
+        actor_devices   = all_devs[1:]
+    else:
+        num_learner_devs = 1
+        learner_devices = all_devs
+        actor_devices   = all_devs
+
+
+    num_devs = len(learner_devices)
+    state    = flax.jax_utils.replicate(state, learner_devices)
+    logger.info(
+        "[train] Decoupled TPU architecture: %d Learner(s) %s | %d Actor(s) %s",
+        len(learner_devices), [str(d) for d in learner_devices],
+        len(actor_devices), [str(d) for d in actor_devices],
+    )
 
     train_step_fn = make_train_step(network, probes, cfg, start_step=start_step)
+
 
     # ── 6. Replay buffer (avec tentative de restauration HF Hub & local) ──
     from training.replay_buffer import PrioritizedReplayBuffer
@@ -1331,19 +1358,19 @@ def train(cfg: Config) -> None:
 
     skip_buffer_load = getattr(cfg.train, "hot_fix", False) or getattr(cfg.train, "fresh_buffer", False)
     if skip_buffer_load:
-        logger.info("=== [HOT-FIX / FRESH BUFFER] Démarrage avec un Replay Buffer vide (anciennes parties passives ignorées) ===")
+        logger.info("=== [HOT-FIX / FRESH BUFFER] Starting with empty Replay Buffer (ignoring older passive games) ===")
     else:
         # 1. Tenter de charger le buffer depuis HF Hub si activé
         if cfg.hf.enabled and cfg.hf.repo_id:
             try:
                 from export.hub import load_buffer_from_hub
-                logger.info("Vérification d'un Replay Buffer existant sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
+                logger.info("Checking for existing Replay Buffer on HuggingFace Hub (%s)...", cfg.hf.repo_id)
                 hf_buf, hf_meta = load_buffer_from_hub(cfg.hf.repo_id, cfg.train, cfg.model, cfg=cfg)
                 if hf_buf is not None:
                     buffer = hf_buf
                     buffer_meta = hf_meta
             except Exception as e:
-                logger.warning("[hf-buffer] Échec de restauration HF Hub : %s", e)
+                logger.warning("[hf-buffer] HF Hub restore failed: %s", e)
 
     # 2. Vérifier si un buffer local existe (dans local_dir ou checkpoint_dir)
     local_buf_path = Path(cfg.hf.local_dir) / "replay_buffer.pkl"
@@ -1368,19 +1395,19 @@ def train(cfg: Config) -> None:
                 buffer = loc_buf
                 fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
                 logger.info(
-                    "=== Replay Buffer restauré depuis le stockage local (%s) : %d/%d entrées (%.1f%% rempli, étape %d) ===",
+                    "=== Replay Buffer restored from local storage (%s): %d/%d entries (%.1f%% full, step %d) ===",
                     local_buf_path, len(buffer), buffer._max_size, fill_pct, loc_step
                 )
         except Exception as e:
-            logger.warning("Échec du chargement du replay buffer local (%s) : %s", local_buf_path, e)
+            logger.warning("Failed to load local replay buffer (%s): %s", local_buf_path, e)
 
     if buffer is None:
         buffer = PrioritizedReplayBuffer(cfg.train, cfg.model)
-        logger.info("Aucun Replay Buffer existant trouvé. Création d'un buffer vierge.")
+        logger.info("No existing Replay Buffer found. Creating a fresh buffer.")
     else:
         fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
         logger.info(
-            "Replay Buffer prêt : %d/%d entrées chargées (%.1f%% rempli, min requis pour seeding: %d).",
+            "Replay Buffer ready: %d/%d entries loaded (%.1f%% full, min required for seeding: %d).",
             len(buffer), buffer._max_size, fill_pct, cfg.train.min_replay_size
         )
 
@@ -1391,11 +1418,63 @@ def train(cfg: Config) -> None:
     from training.activity import tracker, format_h_status
     tracker.attach_buffer(buffer)  # lecture en direct de len(buffer) dans le heartbeat
 
-    NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
+    is_tpu = any(getattr(d, "platform", "") == "tpu" for d in jax.devices()) or os.environ.get("TPU_NAME") is not None or "TPU" in str(jax.devices())
+    if getattr(cfg.train, "num_workers", 0) > 0:
+        NUM_WORKERS = cfg.train.num_workers
+    elif is_tpu:
+        NUM_WORKERS = max(1, min(96, os.cpu_count() or 64))
+        if getattr(cfg.train, "games_per_self_play", 8) == 8:
+            cfg.train.games_per_self_play = NUM_WORKERS
+        # Adapter l'intervalle pour maintenir le Replay Ratio d'or (~8x) avec 96 workers
+        if getattr(cfg.train, "self_play_interval", 100) == 100:
+            cfg.train.self_play_interval = max(100, int(NUM_WORKERS * 12.5))
+    else:
+        NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+    logger.info(
+        "[train] Hardware detection: TPU=%s, %d CPU cores → %d workers (games_per_self_play=%d, self_play_interval=%d steps, target Replay Ratio ≈ 8.8x).",
+        is_tpu, os.cpu_count() or 1, NUM_WORKERS, cfg.train.games_per_self_play, cfg.train.self_play_interval
+    )
+
+
+    # ── JIT Warmup (TPU / GPU) pour éliminer les latences de première compilation ──
+    try:
+        actor_batch_size = max(1, (NUM_WORKERS + len(actor_devices) - 1) // len(actor_devices))
+        logger.info(
+            "[train] TPU JIT-compilation warmup on %d Actor(s) (ismcts_action_batched, actor_batch_size=%d)...",
+            len(actor_devices), actor_batch_size
+        )
+        from search.ismcts import ismcts_action_batched
+        from env.encoding import encode_observation
+        dummy_enc_single = encode_observation({}, 0, cfg.model)
+        N_s = int(cfg.search.num_belief_samples)
+        dummy_batch_enc_base = {}
+        for k, v in dummy_enc_single.items():
+            arr_sample = np.stack([v] * N_s, axis=0)
+            dummy_batch_enc_base[k] = np.stack([arr_sample] * actor_batch_size, axis=0)
+        dummy_omasks_base = np.ones((actor_batch_size, int(cfg.model.max_actions)), dtype=bool)
+
+        for dev_idx, dev in enumerate(actor_devices):
+            logger.info("  → Warmup and XLA compilation on Actor TPU %d (%s)...", dev_idx, dev)
+            dev_params = jax.device_put(_params_cpu, dev)
+            dev_enc = {k: jax.device_put(v, dev) for k, v in dummy_batch_enc_base.items()}
+            dev_omasks = jax.device_put(dummy_omasks_base, dev)
+            dev_rng = jax.device_put(jax.random.PRNGKey(dev_idx), dev)
+            _ba_warm, _ap_warm, _av_warm = ismcts_action_batched(
+                network, dev_params, dev_enc, dev_omasks, dev_rng, cfg
+            )
+        logger.info("[train] ISMCTS warmup completed successfully on all Actor TPUs (batch=%d, belief=%d).", actor_batch_size, N_s)
+    except Exception as exc:
+        logger.warning("[train] ISMCTS warmup skipped (%s).", exc)
+
+
+
+
+
 
     if len(buffer) < cfg.train.min_replay_size:
         logger.info(
-            "Seeding replay buffer (%d/%d entrées actuelles, min requis=%d)…",
+            "Seeding replay buffer (%d/%d current entries, min required=%d)...",
             len(buffer), buffer._max_size, cfg.train.min_replay_size
         )
         tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
@@ -1438,7 +1517,9 @@ def train(cfg: Config) -> None:
                 processes=processes,
                 is_seeding=True,
                 card_data=card_data,
+                actor_devices=actor_devices,
             )
+
             tracker.self_play_times.append(time.time() - t_sp_start)
             
             _deck_errors += errs
@@ -1452,7 +1533,7 @@ def train(cfg: Config) -> None:
     else:
         fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
         logger.info(
-            "Replay Buffer déjà suffisamment rempli (%d entrées >= min=%d, %.1f%%). Phase de seeding sautée !",
+            "Replay Buffer already sufficiently filled (%d entries >= min=%d, %.1f%%). Seeding phase skipped!",
             len(buffer), cfg.train.min_replay_size, fill_pct
         )
         import multiprocessing as mp
@@ -1491,7 +1572,7 @@ def train(cfg: Config) -> None:
             
             rng, rng_sp = jax.random.split(rng)
             
-            tracker.update(phase=f"Self-Play Step {step} (nouveau: {new_step})")
+            tracker.update(phase=f"Self-Play Step {step} (new: {new_step})")
 
             n_games = cfg.train.games_per_self_play
             t_sp_start = time.time()
@@ -1511,7 +1592,9 @@ def train(cfg: Config) -> None:
                 processes=processes,
                 is_seeding=False,
                 card_data=card_data,
+                actor_devices=actor_devices,
             )
+
             tracker.self_play_times.append(time.time() - t_sp_start)
 
             added_transitions = 0
@@ -1611,7 +1694,7 @@ def train(cfg: Config) -> None:
             )
 
             logger.info(
-                "step=%d (nouveau:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
+                "step=%d (new:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
                 "prb=%.4f (acc=%.1f%%)  H_norm=%.2f  p_max=%.2f  H(π)=%.2f vs H(p)=%.2f  "
                 "ATK=%.1f%% ATT=%.1f%% PLY=%.1f%% END=%.1f%%  h_scale=%.2f  buf=%d  %.1fs",
                 step,
@@ -1647,9 +1730,9 @@ def train(cfg: Config) -> None:
             
             if cfg.hf.enabled:
                 _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
-                logger.info("[hf-push] Publication synchrone du snapshot %d...", step)
+                logger.info("[hf-push] Synchronous push of snapshot %d...", step)
                 if not push_to_hub(_params_cpu, deck_params, cfg, step):
-                    logger.error("[hf-push] Snapshot %d non confirmé sur HF.", step)
+                    logger.error("[hf-push] Snapshot %d not confirmed on HF.", step)
 
         # ── e. Async replay buffer push to HF ─────────────────────────────
         if step % cfg.train.buffer_push_every == 0 and step > 0 and cfg.hf.enabled:
@@ -1660,14 +1743,14 @@ def train(cfg: Config) -> None:
     _save_checkpoint(state, deck_params, cfg, global_step, deck_opt_state=deck_opt_state)
     if cfg.hf.enabled:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
-        logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
+        logger.info("[hf-push] Launching final synchronous push to HuggingFace...")
         push_to_hub(_params_cpu, deck_params, cfg, global_step)
         # Final buffer push (sync — wait for completion before exit)
         from export.hub import push_buffer_to_hub_async
         push_buffer_to_hub_async(buffer, cfg, global_step)
 
     # Clean up persistent workers pool
-    logger.info("[train] Nettoyage du pool de workers persistants...")
+    logger.info("[train] Cleaning up persistent worker pool...")
     for pipe in pipes:
         try:
             pipe.send(None)
@@ -1719,6 +1802,12 @@ def _refresh_buffer_priorities(
         chunk = indexed_entries[start:start + batch_size]
         chunk_indices = np.array([i for i, _ in chunk], dtype=np.int32)
         entries = [entry for _, entry in chunk]
+        actual_len = len(entries)
+        
+        # Padding à batch_size fixe pour garantir 0 recompilation XLA
+        if actual_len < batch_size:
+            entries = entries + [entries[-1]] * (batch_size - actual_len)
+
         obs_keys = entries[0].obs_seq[0].keys()
         obs_batch = {
             k: jnp.array(np.stack([entry.obs_seq[0][k] for entry in entries]))
@@ -1727,8 +1816,10 @@ def _refresh_buffer_priorities(
 
         z = network.apply(mz_params, obs_batch, method=network.represent)
         _, v_pred = network.apply(mz_params, z, method=network.predict)
-        v_target = np.array([entry.target_val[0] for entry in entries], dtype=np.float32)
-        buffer.update_priorities(chunk_indices, np.abs(np.array(v_pred) - v_target))
+        v_pred_arr = np.array(v_pred)[:actual_len]
+        v_target = np.array([entry.target_val[0] for _, entry in chunk], dtype=np.float32)
+        buffer.update_priorities(chunk_indices, np.abs(v_pred_arr - v_target))
+
 
 
 def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, cfg: Config) -> int:

@@ -347,8 +347,8 @@ def run_self_play_game(
                 else:
                     fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                     logger.warning(
-                        f"[run_self_play_game] Action choisie invalide ({idx}) pour options {options}. "
-                        f"Fallback vers {fallback_idx}."
+                        f"[run_self_play_game] Invalid chosen action ({idx}) for options {options}. "
+                        f"Fallback to {fallback_idx}."
                     )
                     valid_action_indices.append(fallback_idx)
             action_indices = valid_action_indices
@@ -558,7 +558,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
             if getattr(cfg.search, "belief_from_known_deck", True) else None
         )
     except Exception as _be:
-        logger.warning("[worker-%s] set_belief_deck indisponible : %s", worker_id, _be)
+        logger.warning("[worker-%s] set_belief_deck unavailable: %s", worker_id, _be)
 
     env = CabtEnv()
 
@@ -708,8 +708,8 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         else:
                             fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                             logger.warning(
-                                f"[worker-{worker_id}] Action choisie invalide ({idx}) pour options {options}. "
-                                f"Fallback vers {fallback_idx}."
+                                f"[worker-{worker_id}] Invalid chosen action ({idx}) for options {options}. "
+                                f"Fallback to {fallback_idx}."
                             )
                             valid_action_indices.append(fallback_idx)
                     action_indices = valid_action_indices
@@ -722,7 +722,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                             extract_probe_targets(obs_dict, your_idx)
                         )
                     except Exception as _pe:
-                        logger.debug("[worker-%s] extract_probe_targets a échoué : %s", worker_id, _pe)
+                        logger.debug("[worker-%s] extract_probe_targets failed: %s", worker_id, _pe)
                         hist[your_idx].probe_targets.append(np.full(11, -1, dtype=np.int32))
 
                     # AUDIT §3.6 — relever le type RÉEL de chaque option jouée.
@@ -813,11 +813,11 @@ def self_play_worker_fn(pipe, worker_id, cfg):
         except Exception as e:
             import traceback
             err_msg = f"{e}\n{traceback.format_exc()}"
-            logger.error(f"[worker-{worker_id}] Exception fatale rencontree : {err_msg}")
+            logger.error(f"[worker-{worker_id}] Fatal exception encountered: {err_msg}")
             try:
                 pipe.send({"status": "error", "error": err_msg})
             except Exception as pipe_err:
-                logger.error(f"[worker-{worker_id}] Impossible d'envoyer l'erreur via le pipe : {pipe_err}")
+                logger.error(f"[worker-{worker_id}] Unable to send error via pipe: {pipe_err}")
             break
 
     env.close()

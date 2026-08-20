@@ -65,7 +65,7 @@ from models.deck_builder import (
     set_energy_ids,
 )
 from models.networks import MuZeroNetwork
-from search.ismcts import add_exploration_noise, ismcts_action, ismcts_action_batched, reanalyze_root
+from search.ismcts import ismcts_action, ismcts_action_batched, reanalyze_root
 from training.activity import tracker
 from training.loss import collate_batch, muzero_loss
 from training.replay_buffer import PrioritizedReplayBuffer
@@ -88,22 +88,9 @@ class MuZeroTrainState(train_state.TrainState):
 # ─────────────────────────────────────────────────────────────────────────────
 # pmap'd train step
 # ─────────────────────────────────────────────────────────────────────────────
-@functools.partial(jax.pmap, axis_name="devices", donate_argnums=(0,))
-def _train_step(
-    state: train_state.TrainState,
-    batch: dict,
-    # Les modules passés via closure (static) : voir make_train_step
-) -> Tuple[train_state.TrainState, dict, jnp.ndarray]:
-    """
-    Un pas de gradient sur un shard du batch.
-    Retourne (new_state, metrics, td_errors).
-
-    Note : ``network`` et ``probe_heads`` sont dans la fermeture via
-    ``make_train_step``; on ne les passe pas comme argument pour éviter
-    les recompilations.
-    """
-    # ← Défini dynamiquement par make_train_step
-    raise NotImplementedError("Use make_train_step() to build this function.")
+# AUDIT §3.5 — le stub `_train_step` (décoré `jax.pmap` puis levant
+# NotImplementedError) a été supprimé : seul `make_train_step()` construit la
+# fonction réellement utilisée.
 
 
 def make_train_step(
@@ -124,6 +111,9 @@ def make_train_step(
     """
     reanalyze_sims     = cfg.train.reanalyze_num_simulations
     reanalyze_consider = cfg.search.max_num_considered_actions
+    K_unroll           = int(cfg.train.num_unroll_steps)
+    gamma              = float(cfg.train.gamma)
+    max_actions        = int(cfg.model.max_actions)
 
     def _step(
         state: train_state.TrainState,
@@ -137,23 +127,70 @@ def make_train_step(
         # ── Reanalyze In-Pipeline GPU (utilisant le Target Network) ───────────
         rng_device = jax.random.fold_in(rng, jax.lax.axis_index("devices"))
 
-        # Extraire l'observation racine (step k=0) — déjà sur le GPU
-        obs0 = {k: v[:, 0] for k, v in batch["obs_seq"].items()}  # [B, ...]
+        B = batch["action_seq"].shape[0]
+        valid_seq = batch["valid_seq"].astype(jnp.float32)        # [B, K+1]
 
-        z_root     = network.apply(mz_target_params, obs0, method=network.represent)
-        pi_root, v_root = network.apply(mz_target_params, z_root, method=network.predict)
+        # AUDIT §1.3 — Reanalyze n-step correct.
+        # Ancien comportement : `target_val[:,0]` était écrasé par la valeur
+        # racine du MCTS, produite intégralement par le réseau cible, sans
+        # AUCUNE récompense réelle.  La tête de valeur n'était donc jamais
+        # ancrée dans le résultat des parties (récompenses sparses ±1 au
+        # terminal) → point fixe arbitraire, dérive puis effondrement, et une
+        # priorité PER qui ne mesurait que le désaccord online/target.
+        #
+        # Nouveau comportement (MuZero Reanalyze standard) :
+        #     V(s_0) = Σ_{k<K} γ^k · r_k · valid_k  +  γ^K · v_MCTS(s_K) · valid_K
+        # NB : `reward_seq[k]` est la récompense perçue AU pas k (cf. add_game :
+        # rew_window = rewards[t:end], obs_window = obs_list[t:end+1]).  Sa
+        # validité est donc `valid_seq[:, k]`.  Le masque `valid_seq[:, 1:]`
+        # utilisé initialement décalait d'un cran et annulait la récompense
+        # terminale ±1 de toute fenêtre tronquée par la fin de partie : comme
+        # c'est la seule récompense non nulle du jeu, `partial_ret` valait
+        # toujours 0 et la cible redevenait un pur auto-bootstrap.
+        # Les deux MCTS (racine et état de bootstrap) sont exécutés en UN SEUL
+        # appel mctx sur un batch concaténé : le coût supplémentaire est un
+        # forward de h() sur B exemples, l'arbre lui-même restant en latent.
+        obs0 = {k: v[:, 0]        for k, v in batch["obs_seq"].items()}   # [B, ...]
+        obsK = {k: v[:, K_unroll] for k, v in batch["obs_seq"].items()}   # [B, ...]
+        obs_cat = {k: jnp.concatenate([obs0[k], obsK[k]], axis=0) for k in obs0}
 
-        mask_root = obs0["option_mask"].astype(jnp.bool_)  # [B, A]
+        z_cat = network.apply(mz_target_params, obs_cat, method=network.represent)
+        pi_cat, v_cat = network.apply(mz_target_params, z_cat, method=network.predict)
 
-        fresh_pol, fresh_val = reanalyze_root(
-            mz_target_params, network, z_root, pi_root, v_root, mask_root,
+        mask_cat = obs_cat["option_mask"].astype(jnp.bool_)               # [2B, A]
+        # Les lignes paddées (fin de partie) ont un masque entièrement faux :
+        # mctx produirait des NaN.  On leur donne une action légale factice ;
+        # leur contribution est de toute façon annulée par `valid_seq[:, K]`.
+        any_legal = jnp.any(mask_cat, axis=-1, keepdims=True)
+        fallback  = (jnp.arange(max_actions)[None, :] == 0)
+        mask_cat  = jnp.where(any_legal, mask_cat, fallback)
+
+        fresh_pol_cat, fresh_val_cat = reanalyze_root(
+            mz_target_params, network, z_cat, pi_cat, v_cat, mask_cat,
             rng_device, reanalyze_sims, reanalyze_consider,
         )
+
+        fresh_pol = fresh_pol_cat[:B]                                     # [B, A]
+        v_mcts_K  = fresh_val_cat[B:]                                     # [B]
+
+        discounts   = gamma ** jnp.arange(K_unroll, dtype=jnp.float32)    # [K]
+        rewards_ok  = batch["reward_seq"] * valid_seq[:, :K_unroll]       # [B, K]
+        partial_ret = jnp.sum(rewards_ok * discounts[None, :], axis=-1)   # [B]
+        bootstrap   = (gamma ** K_unroll) * v_mcts_K * valid_seq[:, K_unroll]
+        fresh_val   = partial_ret + bootstrap                             # [B]
+
+        # MuZero Reanalyze v2 standard : combiner le retour empirique stocké
+        # (portant le vrai signal ±1 de victoire/défaite calculé avec td_steps=20)
+        # avec la valeur fraîche MCTS (fresh_val).
+        # Évite le découplage de la valeur en récompense sparse et harmonise k=0
+        # avec k=1..K.
+        stored_val  = batch["target_val"][:, 0]
+        blended_val = 0.5 * stored_val + 0.5 * fresh_val
 
         batch = {
             **batch,
             "target_pol": batch["target_pol"].at[:, 0].set(jax.lax.stop_gradient(fresh_pol)),
-            "target_val": batch["target_val"].at[:, 0].set(jax.lax.stop_gradient(fresh_val)),
+            "target_val": batch["target_val"].at[:, 0].set(jax.lax.stop_gradient(blended_val)),
         }
 
         # ── Gradient step ──────────────────────────────────────────────────────
@@ -269,7 +306,14 @@ def create_muzero_train_state(
 
 
 def _merge_params(defaults, loaded):
-    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure)."""
+    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure).
+
+    AUDIT §1.1/§3.5 — les clés présentes dans le checkpoint mais ABSENTES de
+    l'architecture courante sont désormais écartées (ex. `pi_q`, `pi_k`,
+    `a_feat_emb` supprimés).  Auparavant elles étaient réinjectées dans l'arbre
+    de paramètres : Adam maintenait des moments pour des poids morts et le
+    checkpoint suivant les propageait indéfiniment.
+    """
     is_defaults_map = isinstance(defaults, Mapping)
     is_loaded_map = isinstance(loaded, Mapping)
 
@@ -280,9 +324,12 @@ def _merge_params(defaults, loaded):
                 res[k] = _merge_params(v, loaded[k])
             else:
                 res[k] = v
-        for k, v in loaded.items():
-            if k not in defaults:
-                res[k] = v
+        dropped = [k for k in loaded if k not in defaults]
+        if dropped:
+            logger.info(
+                "[checkpoint] Clés obsolètes ignorées (absentes de l'architecture courante) : %s",
+                ", ".join(str(k) for k in dropped),
+            )
         return res
     elif is_defaults_map != is_loaded_map:
         logger.warning(
@@ -303,12 +350,12 @@ def _merge_params(defaults, loaded):
     if hasattr(defaults, "shape") and hasattr(loaded, "shape"):
         if defaults.shape != loaded.shape:
             logger.warning(
-                "Incompatibilité de forme détectée pour la couche (modèle %s vs checkpoint %s) ; adaptation/réinitialisation de cette couche.",
+                "Shape mismatch detected for layer (model %s vs checkpoint %s); adapting/resetting this layer.",
                 defaults.shape, loaded.shape
             )
             # Adapt 2D kernels if input dimension expanded (e.g. option_proj: 157 -> 160)
             if defaults.ndim == 2 and loaded.ndim == 2 and defaults.shape[1] == loaded.shape[1] and defaults.shape[0] > loaded.shape[0]:
-                logger.info("Adaptation partielle de la matrice de poids %s -> %s (conservation des poids existants).", loaded.shape, defaults.shape)
+                logger.info("Partial adaptation of weight matrix %s -> %s (preserving existing weights).", loaded.shape, defaults.shape)
                 new_param = np.array(defaults)
                 new_param[:loaded.shape[0], :] = np.array(loaded)
                 return jnp.array(new_param)
@@ -316,24 +363,87 @@ def _merge_params(defaults, loaded):
     return loaded
 
 
-def _reset_value_head_params(params: dict, fresh_params: dict) -> dict:
-    """
-    Réinitialise uniquement la tête de valeur (v_dense) et de récompense (rdet_fc2)
-    pour adapter les poids au nouvel encodage de bins [-1.2, 1.2], tout en conservant
-    100% du reste des poids entraînés (Transformer, Policy, Dynamics, etc.).
-    """
-    def _reset_layer(path, param_val):
-        keys = [getattr(p, "key", p) for p in path]
-        path_str = "/".join(str(k) for k in keys)
-        if "v_dense" in path_str or "rdet_fc2" in path_str:
-            logger.info("[checkpoint] Réinitialisation ciblée de la couche '%s' pour adaptation aux nouveaux bins [-1.2, 1.2].", path_str)
-            val = fresh_params
-            for k in keys:
-                val = val[k]
-            return val
-        return param_val
+# ─────────────────────────────────────────────────────────────────────────────
+# Reset chirurgical de la tête de valeur / récompense
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE : cette fonction avait été classée « code mort » en §3.5 puis supprimée.
+# C'était une erreur d'appréciation : elle est exactement l'outil nécessaire pour
+# repartir après les correctifs §1.3 / §2.2 / §2.3, qui n'ont abîmé QUE la tête
+# de valeur (cible auto-référentielle + padding tiré vers 0 + saturation ±2) et
+# la couche de sortie de la tête de récompense.  Le tronc Transformer h, la tête
+# de politique et la fonction de transition de g restent valides et coûtent
+# beaucoup plus cher à réapprendre.
+DEFAULT_VALUE_HEAD_FRAGMENTS = ("v_dense", "rdet_fc2")
 
-    return jax.tree_util.tree_map_with_path(_reset_layer, params)
+
+def _matches_fragment(path, fragments) -> bool:
+    keys = [getattr(p, "key", p) for p in path]
+    path_str = "/".join(str(k) for k in keys)
+    return any(f in path_str for f in fragments)
+
+
+def _reset_value_head_params(params: dict, fresh_params: dict, fragments=None) -> dict:
+    """Réinitialise les couches dont le chemin contient l'un de ``fragments``.
+
+    Par défaut : ``v_dense`` (tête de valeur catégorielle) et ``rdet_fc2``
+    (couche de sortie de la tête de récompense).  Tout le reste — h, pi_dense,
+    det_fc1/det_fc2, projecteurs, embeddings de cartes, sondes — est conservé
+    bit pour bit.
+    """
+    frags = tuple(fragments or DEFAULT_VALUE_HEAD_FRAGMENTS)
+    reset_paths: list[str] = []
+
+    def _reset_leaf(path, param_val):
+        if not _matches_fragment(path, frags):
+            return param_val
+        keys = [getattr(p, "key", p) for p in path]
+        reset_paths.append("/".join(str(k) for k in keys))
+        val = fresh_params
+        for k in keys:
+            val = val[k]
+        return val
+
+    out = jax.tree_util.tree_map_with_path(_reset_leaf, params)
+    if reset_paths:
+        logger.info(
+            "[reset-value-head] %d couche(s) réinitialisée(s) : %s",
+            len(reset_paths), ", ".join(reset_paths),
+        )
+    else:
+        logger.warning(
+            "[reset-value-head] Aucune couche ne correspond à %s — rien réinitialisé !", frags
+        )
+    return out
+
+
+def _zero_adam_moments(opt_state, params, fragments=None):
+    """Remet à zéro les moments Adam (mu / nu) des seules couches réinitialisées.
+
+    Indispensable : conserver des moments accumulés sur d'anciens poids en face
+    de poids fraîchement initialisés produit un premier pas de gradient énorme,
+    qui détruirait la couche neuve.  Les moments des couches CONSERVÉES (h, g,
+    politique) restent intacts — on ne repaie pas la reconstruction de l'inertie
+    d'Adam pour tout le réseau.
+    """
+    frags = tuple(fragments or DEFAULT_VALUE_HEAD_FRAGMENTS)
+    mask = jax.tree_util.tree_map_with_path(
+        lambda path, _leaf: _matches_fragment(path, frags), params
+    )
+
+    def _zero(tree):
+        return jax.tree_util.tree_map(
+            lambda hit, arr: jnp.zeros_like(arr) if hit else arr, mask, tree
+        )
+
+    def _walk(node):
+        if hasattr(node, "mu") and hasattr(node, "nu"):
+            return node._replace(mu=_zero(node.mu), nu=_zero(node.nu))
+        if isinstance(node, tuple):
+            rebuilt = tuple(_walk(x) for x in node)
+            return type(node)(*rebuilt) if hasattr(node, "_fields") else rebuilt
+        return node
+
+    return _walk(opt_state)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,16 +475,13 @@ def make_agent_fn(
         enc_obs     = encode_observation(obs_dict, player_idx, cfg.model)
         option_mask = enc_obs["option_mask"]
 
-        best_action, avg_policy, avg_value = ismcts_action(
-            network, params_cpu["muzero"], enc_obs, option_mask, rng_act, cfg
-        )
+        dir_eps = float(cfg.search.dirichlet_epsilon) if train_mode else 0.0
+        dir_alp = float(cfg.search.dirichlet_alpha) if train_mode else 0.3
 
-        if train_mode:
-            avg_policy = np.array(add_exploration_noise(
-                jnp.array(avg_policy), jnp.array(option_mask),
-                rng_noise, cfg.search.dirichlet_alpha,
-                cfg.search.dirichlet_epsilon,
-            ))
+        best_action, avg_policy, avg_value = ismcts_action(
+            network, params_cpu["muzero"], enc_obs, option_mask, rng_act, cfg,
+            dirichlet_epsilon=dir_eps, dirichlet_alpha=dir_alp,
+        )
 
         # maxCount > 1 : top-k par logit
         max_count = int(select.get("maxCount", 1))
@@ -430,6 +537,7 @@ def run_parallel_self_play(
     is_seeding: bool = False,
     min_batch_threshold: int = -1,   # -1 = utiliser num_workers (batch GPU toujours complet)
     card_data = None,
+    actor_devices: Optional[list] = None,
 ):
     if is_seeding:
         import copy
@@ -447,16 +555,28 @@ def run_parallel_self_play(
     import numpy as np
     from training.activity import tracker
 
-    # Pré-transférer les params sur les GPUs UNE SEULE FOIS (évite CPU→GPU à chaque inférence)
-    devices = jax.devices()
-    accel_devices = [d for d in devices if d.platform in ("gpu", "tpu")]
-    if not accel_devices:
-        accel_devices = devices  # fallback CPU
-    logger.info("[self-play] Accelerators (%s) pour MCTS : %s", accel_devices[0].platform, accel_devices)
+    # Déterminer les accélérateurs dédiés au Self-Play
+    if actor_devices:
+        accel_devices = actor_devices
+    else:
+        devices = jax.devices()
+        accel_devices = [d for d in devices if d.platform in ("gpu", "tpu")]
+        if not accel_devices:
+            accel_devices = devices  # fallback CPU
+    logger.info(
+        "[self-play] Launching parallel self-play: %d workers, sims=%d, belief_samples=%d, dirichlet_eps=%.3f, dirichlet_alpha=%.3f",
+        num_workers,
+        cfg.search.num_simulations,
+        cfg.search.num_belief_samples,
+        cfg.search.dirichlet_epsilon,
+        cfg.search.dirichlet_alpha,
+    )
+    logger.info("[self-play] Actor TPU/GPU accelerators (%s) for MCTS: %s", accel_devices[0].platform, accel_devices)
     _gpu_params = [
         jax.device_put(state_params, dev) for dev in accel_devices
     ]
     _inference_device_idx = [0]  # compteur pour alterner les GPUs
+
 
     ctx = mp.get_context("spawn")
 
@@ -473,6 +593,14 @@ def run_parallel_self_play(
     worker_steps = [0] * num_workers
     last_msg_time = [time.time()] * num_workers
 
+    # AUDIT §3.1 — Les threads d'inférence écrivent dans `pipes[i]` pendant que le
+    # thread principal peut fermer et remplacer ce même pipe (worker gelé ou
+    # relancé).  Un verrou par pipe sérialise ces accès, et un compteur d'« époque »
+    # permet de jeter les résultats calculés pour une instance de worker désormais
+    # morte (sinon une action est envoyée à un worker qui attend un `start`).
+    pipe_locks = [threading.Lock() for _ in range(num_workers)]
+    pipe_epoch = [0] * num_workers
+
     def start_game_on_worker(pipe_idx, local_rng):
         nonlocal games_started
         worker_steps[pipe_idx] = 0
@@ -486,16 +614,18 @@ def run_parallel_self_play(
         # Réanimation robuste du worker s'il s'est arrêté (ex. suite à une exception)
         p = processes[pipe_idx]
         if not p.is_alive():
-            logger.info(f"[coordinateur] Relance du worker {pipe_idx} qui s'était arrêté...")
-            try:
-                pipes[pipe_idx].close()
-            except Exception:
-                pass
-            parent_conn, child_conn = ctx.Pipe()
-            new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, pipe_idx, cfg), daemon=True)
-            new_p.start()
-            pipes[pipe_idx] = parent_conn
-            processes[pipe_idx] = new_p
+            logger.info(f"[coordinator] Restarting stopped worker {pipe_idx}...")
+            with pipe_locks[pipe_idx]:
+                try:
+                    pipes[pipe_idx].close()
+                except Exception:
+                    pass
+                parent_conn, child_conn = ctx.Pipe()
+                new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, pipe_idx, cfg), daemon=True)
+                new_p.start()
+                pipes[pipe_idx] = parent_conn
+                processes[pipe_idx] = new_p
+                pipe_epoch[pipe_idx] += 1
 
         pipe_meta[pipe_idx] = {
             "ids0": ids0,
@@ -504,15 +634,16 @@ def run_parallel_self_play(
         }
         last_msg_time[pipe_idx] = time.time()
         try:
-            pipes[pipe_idx].send({
-                "cmd": "start",
-                "deck0": list(deck0),
-                "deck1": list(deck1),
-                "num_belief_samples": int(cfg.search.num_belief_samples)
-            })
+            with pipe_locks[pipe_idx]:
+                pipes[pipe_idx].send({
+                    "cmd": "start",
+                    "deck0": list(deck0),
+                    "deck1": list(deck1),
+                    "num_belief_samples": int(cfg.search.num_belief_samples)
+                })
             games_started += 1
         except Exception as e:
-            logger.error(f"[coordinateur] Échec d'envoi au worker {pipe_idx} relancé : {e}")
+            logger.error(f"[coordinator] Failed to send to restarted worker {pipe_idx}: {e}")
             pipe_meta[pipe_idx]["game_active"] = False
 
 
@@ -530,8 +661,11 @@ def run_parallel_self_play(
     #                       lance l'inférence, envoie les résultats
     # Les deux GPUs fonctionnent totalement en parallèle sans se bloquer.
     # ──────────────────────────────────────────────────────────────────────
+    # NB : ne PAS refaire `import threading` ici.  Le module est déjà importé en
+    # tête de fichier ; un import local en fait une variable locale pour TOUTE la
+    # fonction, y compris la ligne `pipe_locks = [threading.Lock() ...]` qui la
+    # précède → UnboundLocalError au premier appel.
     import queue as _pyqueue
-    import threading
 
     work_queue: "_pyqueue.Queue" = _pyqueue.Queue()
     stop_event = threading.Event()
@@ -550,24 +684,29 @@ def run_parallel_self_play(
 
             items = [first]
 
-            # ── Collecte rapide (max 2ms) : agréger tous les workers déjà prêts ──
-            _t0 = time.time()
-            while time.time() - _t0 < 0.002:
-                try:
-                    items.append(work_queue.get_nowait())
-                except _pyqueue.Empty:
-                    break
 
-            # ── Build batch padded à num_workers (taille fixe → pas de recompilation JAX) ──
+            # ── Collecte : agréger les requêtes assignées à cet Actor TPU ───
+            actor_batch_size = max(1, (num_workers + len(accel_devices) - 1) // len(accel_devices))
+            _t0 = time.time()
+            while len(items) < actor_batch_size and time.time() - _t0 < 0.015:
+                try:
+                    items.append(work_queue.get(timeout=0.002))
+                except _pyqueue.Empty:
+                    continue
+
+
+            # ── Build batch padded à actor_batch_size (taille fixe → 0 recompilation JAX) ──
             na_indices  = [it[0] for it in items]
             na_encs     = [it[1] for it in items]
             na_masks    = [it[2] for it in items]
+            na_epochs   = [it[3] for it in items]
 
             _pe = list(na_encs)
             _pm = list(na_masks)
-            while len(_pe) < num_workers:
+            while len(_pe) < actor_batch_size:
                 _pe.append(na_encs[-1])
                 _pm.append(na_masks[-1])
+
 
             _enc = {}
             for k in _pe[0].keys():
@@ -586,21 +725,30 @@ def run_parallel_self_play(
                 ap_np = np.array(_ap)
                 av_np = np.array(_av)
             except Exception as _e:
-                logger.error("[Acc%d] Erreur inférence (batch=%d) : %s", gpu_idx, _n, _e, exc_info=True)
+                logger.error("[Acc%d] Inference error (batch=%d): %s", gpu_idx, _n, _e, exc_info=True)
                 ba_np = np.array([int(np.random.choice(np.where(na_masks[i])[0])) for i in range(_n)])
                 ap_np = np.zeros((_n, int(cfg.model.max_actions)), dtype=np.float32)
                 av_np = np.zeros(_n, dtype=np.float32)
 
-            # ── Envoyer les résultats aux workers (chaque pipe est écrit par ce thread uniquement) ──
+            # ── Envoyer les résultats aux workers ────────────────────────────
+            # AUDIT §3.1 : verrou par pipe + contrôle d'époque (un worker relancé
+            # entre-temps ne doit pas recevoir la réponse de l'ancienne instance).
             for _i, _pidx in enumerate(na_indices):
                 try:
-                    pipes[_pidx].send({
-                        "action_indices": [int(ba_np[_i])],
-                        "search_pol":     ap_np[_i],
-                        "search_val":     float(av_np[_i]),
-                    })
+                    with pipe_locks[_pidx]:
+                        if pipe_epoch[_pidx] != na_epochs[_i]:
+                            logger.debug(
+                                "[Acc%d] Stale result ignored for worker %d (epoch %d != %d).",
+                                gpu_idx, _pidx, na_epochs[_i], pipe_epoch[_pidx],
+                            )
+                            continue
+                        pipes[_pidx].send({
+                            "action_indices": [int(ba_np[_i])],
+                            "search_pol":     ap_np[_i],
+                            "search_val":     float(av_np[_i]),
+                        })
                 except Exception as _e:
-                    logger.error("[Acc%d] Erreur envoi action worker %d : %s", gpu_idx, _pidx, _e)
+                    logger.error("[Acc%d] Error sending action to worker %d: %s", gpu_idx, _pidx, _e)
 
     # Lancer autant de threads GPU/TPU qu'il y a d'accélérateurs
     gpu_threads = []
@@ -609,7 +757,7 @@ def run_parallel_self_play(
                               name=f"accel-inference-{_gidx}")
         _t.start()
         gpu_threads.append(_t)
-        logger.info("[coordinateur] Accelerator inference thread %d démarré (device: %s)", _gidx, accel_devices[_gidx])
+        logger.info("[coordinator] Accelerator inference thread %d started (device: %s)", _gidx, accel_devices[_gidx])
 
     # ── Boucle principale : I/O uniquement, pas d'inférence GPU ───────────
     while games_completed < num_games_to_play:
@@ -641,16 +789,16 @@ def run_parallel_self_play(
                 worker_steps[pipe_idx] = msg.get("step_count", 0)
                 tracker.update(current_game_steps=int(np.max(worker_steps)))
                 # → GPU thread se charge de l'inférence et de l'envoi du résultat
-                work_queue.put((pipe_idx, msg["batched_enc"], msg["option_mask"]))
+                work_queue.put((pipe_idx, msg["batched_enc"], msg["option_mask"], pipe_epoch[pipe_idx]))
 
             else:
                 tracker.update()
 
             if status == "deck_error":
                 deck_errors_count += 1
-                logger.warning(f"[coordinateur] Erreur de deck sur le worker {pipe_idx} : {msg.get('error')}")
+                logger.warning(f"[coordinator] Deck error on worker {pipe_idx}: {msg.get('error')}")
                 meta = pipe_meta[pipe_idx]
-                for p_idx, ids in [("joueur 0", meta.get("ids0")), ("joueur 1", meta.get("ids1"))]:
+                for p_idx, ids in [("player 0", meta.get("ids0")), ("player 1", meta.get("ids1"))]:
                     if ids is not None:
                         from collections import Counter
                         counts = Counter(list(np.array(ids)))
@@ -659,7 +807,7 @@ def run_parallel_self_play(
                             name = card_data.card_name(int(cid)) if card_data else f"ID {cid}"
                             is_ace = int(cid) in ace_spec_ids
                             deck_summary.append(f"{name} (ID: {cid}, count: {count}{', ACE' if is_ace else ''})")
-                        logger.info(f"  Deck de {p_idx} impliqué : {', '.join(deck_summary)}")
+                        logger.info(f"  Involved deck for {p_idx}: {', '.join(deck_summary)}")
                 if games_started < num_games_to_play:
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
@@ -676,7 +824,7 @@ def run_parallel_self_play(
                     deck_builder_updates.append((pipe_meta[pipe_idx]["ids1"], reward_1))
                 games_completed += 1
                 tracker.update(games_completed=tracker.games_completed + 1)
-                logger.info(f"[coordinateur] Partie completee sur worker {pipe_idx} ! ({games_completed}/{num_games_to_play} completes, {games_started}/{num_games_to_play} lancees)")
+                logger.info(f"[coordinator] Game completed on worker {pipe_idx}! ({games_completed}/{num_games_to_play} completed, {games_started}/{num_games_to_play} started)")
                 if games_started < num_games_to_play:
                     rng, rng_next = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_next)
@@ -684,37 +832,40 @@ def run_parallel_self_play(
                     pipe_meta[pipe_idx]["game_active"] = False
 
             elif status == "error":
-                logger.error(f"[coordinateur] Le worker {pipe_idx} a envoye une erreur fatale : {msg.get('error')}")
+                logger.error(f"[coordinator] Worker {pipe_idx} sent fatal error: {msg.get('error')}")
                 pipe_meta[pipe_idx]["game_active"] = False
                 games_completed += 1
                 if games_started < num_games_to_play:
-                    logger.info(f"[coordinateur] Tentative de remplacement pour le worker {pipe_idx} en échec...")
+                    logger.info(f"[coordinator] Attempting to replace failed worker {pipe_idx}...")
                     rng, rng_restart = jax.random.split(rng)
                     start_game_on_worker(pipe_idx, rng_restart)
 
-        # Détecter et relancer les workers gelés (inactivité > 120s)
+        # Détecter et relancer les workers réellement gelés (inactivité > 240s)
         now = time.time()
         for idx in range(num_workers):
-            if pipe_meta[idx].get("game_active") and (now - last_msg_time[idx] > 120.0):
+            if pipe_meta[idx].get("game_active") and (now - last_msg_time[idx] > 240.0):
                 logger.warning(
-                    f"[coordinateur] Le worker {idx} semble gele (inactif depuis {now - last_msg_time[idx]:.1f}s, etape {worker_steps[idx]}). Force restart..."
+                    f"[coordinator] Worker {idx} appears frozen (idle for {now - last_msg_time[idx]:.1f}s, step {worker_steps[idx]}). Force restarting..."
                 )
+
                 try:
                     processes[idx].terminate()
                     processes[idx].join(timeout=2.0)
                     if processes[idx].is_alive():
                         processes[idx].kill()
                 except Exception as e:
-                    logger.error(f"[coordinateur] Erreur lors de la coupure du worker {idx} : {e}")
-                try:
-                    pipes[idx].close()
-                except Exception:
-                    pass
-                parent_conn, child_conn = ctx.Pipe()
-                new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
-                new_p.start()
-                pipes[idx] = parent_conn
-                processes[idx] = new_p
+                    logger.error(f"[coordinator] Error terminating worker {idx}: {e}")
+                with pipe_locks[idx]:
+                    try:
+                        pipes[idx].close()
+                    except Exception:
+                        pass
+                    parent_conn, child_conn = ctx.Pipe()
+                    new_p = ctx.Process(target=_worker_bootstrap, args=(child_conn, idx, cfg), daemon=True)
+                    new_p.start()
+                    pipes[idx] = parent_conn
+                    processes[idx] = new_p
+                    pipe_epoch[idx] += 1
                 pipe_meta[idx] = {"game_active": False}
                 last_msg_time[idx] = now
                 worker_steps[idx] = 0
@@ -760,7 +911,7 @@ def _init_wandb(cfg: Config):
         wandb_key = user_secrets.get_secret(cfg.wandb.kaggle_secret_name)
         if wandb_key:
             os.environ["WANDB_API_KEY"] = wandb_key
-            logger.info("[wandb] Clé API récupérée depuis le secret Kaggle '%s'", cfg.wandb.kaggle_secret_name)
+            logger.info("[wandb] API key retrieved from Kaggle secret '%s'", cfg.wandb.kaggle_secret_name)
     except Exception:
         pass
 
@@ -769,7 +920,7 @@ def _init_wandb(cfg: Config):
         os.environ["WANDB_API_KEY"] = os.environ.get("WANDB")
 
     if not os.environ.get("WANDB_API_KEY"):
-        logger.warning("[wandb] Aucune clé WANDB_API_KEY ou secret Kaggle '%s' trouvé. WandB sera désactivé.", cfg.wandb.kaggle_secret_name)
+        logger.warning("[wandb] No WANDB_API_KEY or Kaggle secret '%s' found. WandB disabled.", cfg.wandb.kaggle_secret_name)
         return None
 
     try:
@@ -783,10 +934,10 @@ def _init_wandb(cfg: Config):
             reinit=True,
         )
         url = run.url if hasattr(run, "url") else ""
-        logger.info("[wandb] wandb.init() réussi ! (project=%s, run_id=%s, url=%s)", cfg.wandb.project, run.id, url)
+        logger.info("[wandb] wandb.init() successful! (project=%s, run_id=%s, url=%s)", cfg.wandb.project, run.id, url)
         return run
     except Exception as e:
-        logger.warning("[wandb] Impossible d'initialiser WandB : %s", e)
+        logger.warning("[wandb] Could not initialize WandB: %s", e)
         return None
 
 
@@ -901,7 +1052,7 @@ def _log_wandb_full_metrics(
         wandb.log(w_dict, step=step)
 
     except Exception as e:
-        logger.warning("[wandb] Erreur lors du log étendu : %s", e)
+        logger.warning("[wandb] Error during extended log: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -911,6 +1062,16 @@ def train(cfg: Config) -> None:
     """Point d'entrée principal d'entraînement."""
     logger.info("=== PTCG MuZero training start ===")
     logger.info("Devices: %s", jax.devices())
+    logger.info(
+        "[search-config] MCTS self-play: sims=%d, belief_samples=%d, max_considered=%d, dirichlet_eps=%.3f, dirichlet_alpha=%.3f, temp_init=%.2f, temp_min=%.2f",
+        cfg.search.num_simulations,
+        cfg.search.num_belief_samples,
+        cfg.search.max_num_considered_actions,
+        cfg.search.dirichlet_epsilon,
+        cfg.search.dirichlet_alpha,
+        cfg.search.temperature_init,
+        cfg.search.temperature_min,
+    )
 
     Path(cfg.infra.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.infra.log_dir).mkdir(parents=True, exist_ok=True)
@@ -944,7 +1105,7 @@ def train(cfg: Config) -> None:
     # Only explicit card metadata is trustworthy here.  A card appearing once
     # in a reference deck is not evidence that it is an Ace Spec.
     ace_spec_set = set(card_data.ace_spec_ids)
-    logger.info("[ace-spec] %d Ace Spec card(s) détecté(s) via cards.csv : %s", len(ace_spec_set), list(ace_spec_set))
+    logger.info("[ace-spec] %d Ace Spec card(s) detected via cards.csv: %s", len(ace_spec_set), list(ace_spec_set))
 
     # Complétion via l'API de l'engine si disponible
     try:
@@ -980,13 +1141,13 @@ def train(cfg: Config) -> None:
 
         engine_ace = [_card_id(i, c) for i, c in items if _card_is_ace(c)]
         ace_spec_set.update(engine_ace)
-        logger.info("[ace-spec] Après fusion avec all_card_data() : %d Ace Spec cards", len(ace_spec_set))
+        logger.info("[ace-spec] After merge with all_card_data(): %d Ace Spec cards", len(ace_spec_set))
     except Exception as e:
         logger.warning("[ace-spec] all_card_data() failed: %s", e)
 
     ace_spec_ids = sorted(list(ace_spec_set))
     if not ace_spec_ids:
-        logger.warning("[ace-spec] Aucune carte Ace Spec détectée !")
+        logger.warning("[ace-spec] No Ace Spec cards detected!")
 
     set_ace_spec_ids(ace_spec_ids)
     logger.info("Card pool: %d ids, %d energy ids, %d Basic Pokémon, %d ace spec ids",
@@ -1011,22 +1172,40 @@ def train(cfg: Config) -> None:
     loaded_deck_params = None
     loaded_deck_opt_state = None
 
-    # 1. Tenter de charger le dernier modèle depuis HF Hub si activé
-    if cfg.hf.enabled and cfg.hf.repo_id:
+    target_step = getattr(cfg.train, "resume_step", None)
+    target_ckpt = getattr(cfg.train, "resume_ckpt", None)
+
+    # 1. Tenter de charger depuis un chemin explicite si spécifié (--ckpt ou -s chemin.pkl)
+    if target_ckpt and Path(target_ckpt).exists():
+        try:
+            import pickle
+            with open(target_ckpt, "rb") as f:
+                ckpt_data = pickle.load(f)
+            loaded_params = ckpt_data["params"]
+            loaded_opt_state = ckpt_data.get("opt_state", None)
+            loaded_deck_params = ckpt_data.get("deck", {})
+            loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
+            start_step = ckpt_data.get("step", 0)
+            logger.info("=== Loaded explicit local checkpoint: %s (step %d) ===", target_ckpt, start_step)
+        except Exception as e:
+            logger.warning("Failed to load explicit checkpoint %s: %s", target_ckpt, e)
+
+    # 2. Tenter de charger depuis HF Hub si activé (avec target_step si spécifié)
+    if loaded_params is None and cfg.hf.enabled and cfg.hf.repo_id:
         try:
             from export.hub import load_from_hub
-            logger.info("Vérification du modèle le plus récent sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
-            hf_mz, hf_dk, hf_cfg, hf_step = load_from_hub(cfg.hf.repo_id, cfg=cfg)
+            logger.info("Checking model on HuggingFace Hub (%s, step=%s)...", cfg.hf.repo_id, target_step)
+            hf_mz, hf_dk, hf_cfg, hf_step = load_from_hub(cfg.hf.repo_id, step=target_step, cfg=cfg)
             if hf_mz:
                 loaded_params = hf_mz
                 loaded_deck_params = hf_dk
                 start_step = hf_step
-                logger.info("=== Modèle le plus récent chargé depuis HF Hub : %s (étape %d) ===", cfg.hf.repo_id, start_step)
+                logger.info("=== Model loaded from HF Hub: %s (step %d) ===", cfg.hf.repo_id, start_step)
         except Exception as e:
-            logger.info("Aucun modèle HuggingFace Hub téléchargé ou échec de vérification (%s) : %s", cfg.hf.repo_id, e)
+            logger.info("No HuggingFace Hub model downloaded or check failed (%s): %s", cfg.hf.repo_id, e)
 
-    # 2. Vérifier le checkpoint local et conserver le plus avancé (HF vs local)
-    if latest_path.exists():
+    # 3. Vérifier le checkpoint local UNIQUEMENT si aucun step/ckpt explicite n'a été demandé
+    if target_step is None and target_ckpt is None and latest_path.exists():
         try:
             import pickle
             with open(latest_path, "rb") as f:
@@ -1038,11 +1217,11 @@ def train(cfg: Config) -> None:
                 loaded_opt_state = ckpt_data.get("opt_state", None)
                 loaded_deck_params = ckpt_data.get("deck", {})
                 loaded_deck_opt_state = ckpt_data.get("deck_opt_state", None)
-                logger.info("=== Reprise depuis le checkpoint local plus récent : %s (étape %d) ===", latest_path, start_step)
+                logger.info("=== Resuming from latest local checkpoint: %s (step %d) ===", latest_path, start_step)
             elif loaded_params is not None:
-                logger.info("=== Checkpoint local (étape %d) <= HF Hub (étape %d). Conservation des poids HF Hub. ===", local_step, start_step)
+                logger.info("=== Local checkpoint (step %d) <= HF Hub (step %d). Keeping HF Hub weights. ===", local_step, start_step)
         except Exception as e:
-            logger.warning("Échec de la lecture du checkpoint local existant : %s.", e)
+            logger.warning("Failed to read existing local checkpoint: %s.", e)
 
     if loaded_params is not None:
         state = create_muzero_train_state(network, probes, cfg, r1, dummy_obs)
@@ -1065,11 +1244,11 @@ def train(cfg: Config) -> None:
         fresh_mz = _get_mz_dict(state.params)
 
         if reset_f:
-            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Prediction Network f (policy π & value V) ===")
+            logger.info("=== [HOT-FIX] Surgical reset of Prediction Network f (policy π & value V) ===")
             if "f" in fresh_mz:
                 target_mz["f"] = fresh_mz["f"]
         if reset_g:
-            logger.info("=== [HOT-FIX] Réinitialisation chirurgicale du Dynamics Network g (50-dim transitions) et têtes de consistance ===")
+            logger.info("=== [HOT-FIX] Surgical reset of Dynamics Network g (50-dim transitions) and consistency heads ===")
             if "g" in fresh_mz:
                 target_mz["g"] = fresh_mz["g"]
             if "project" in fresh_mz:
@@ -1077,11 +1256,25 @@ def train(cfg: Config) -> None:
             if "predict_next" in fresh_mz:
                 target_mz["predict_next"] = fresh_mz["predict_next"]
 
+        # ── Reset chirurgical de la tête de valeur (option la moins destructrice) ──
+        # Ne touche que `v_dense` et `rdet_fc2`.  Sans effet si `reset_f` est déjà
+        # actif (f entier vient d'être réinitialisé).
+        reset_v = getattr(cfg.train, "reset_value_head", False) and not reset_f
+        if reset_v:
+            logger.info(
+                "=== [RESET-VALUE-HEAD] Reset of value/reward head only "
+                "(keeping h, policy, and transition g) ==="
+            )
+            params_jax = _reset_value_head_params(params_jax, state.params)
+
+        # Le target network doit repartir des MÊMES poids : sinon l'EMA continue
+        # d'alimenter le Reanalyze avec l'ancienne tête de valeur corrompue
+        # pendant plusieurs centaines de steps (tau=0.995 → demi-vie ~138 steps).
         state = state.replace(params=params_jax, target_params=params_jax, step=jnp.array(start_step, dtype=jnp.int32))
 
         fresh_opt_state = state.tx.init(params_jax)
         if (reset_f or reset_g) or loaded_opt_state is None:
-            logger.info("=== [HOT-FIX] Réinitialisation propre de l'optimiseur Adam ===")
+            logger.info("=== [HOT-FIX] Clean reset of Adam optimizer ===")
             state = state.replace(opt_state=fresh_opt_state)
         else:
             try:
@@ -1089,11 +1282,18 @@ def train(cfg: Config) -> None:
                 opt_state_merged = _merge_params(fresh_opt_state, opt_state_jax)
                 # Validation de compatibilité du PyTree avec les gradients du nouveau modèle
                 jax.tree.map(lambda a, b: None, fresh_opt_state, opt_state_merged)
+                if reset_v:
+                    # Moments Adam remis à zéro pour les SEULES couches neuves.
+                    opt_state_merged = _zero_adam_moments(opt_state_merged, params_jax)
+                    logger.info(
+                        "=== [RESET-VALUE-HEAD] Adam moments reset for v_dense / rdet_fc2 "
+                        "(momentum kept for h, g, and policy) ==="
+                    )
                 state = state.replace(opt_state=opt_state_merged)
-                logger.info("=== État de l'optimiseur MuZero restauré et fusionné avec succès à l'étape %d ===", start_step)
+                logger.info("=== MuZero optimizer state successfully restored and merged at step %d ===", start_step)
             except Exception as e:
                 logger.warning(
-                    "État d'optimiseur du checkpoint incompatible avec la nouvelle architecture (%s). Réinitialisation propre de l'optimiseur à l'étape %d.",
+                    "Checkpoint optimizer state incompatible with new architecture (%s). Cleanly reinitializing optimizer at step %d.",
                     e, start_step
                 )
                 state = state.replace(opt_state=fresh_opt_state)
@@ -1107,9 +1307,9 @@ def train(cfg: Config) -> None:
         if loaded_deck_opt_state is not None:
             try:
                 deck_opt_state = jax.tree_util.tree_map(jax.device_put, loaded_deck_opt_state)
-                logger.info("=== État de l'optimiseur deck builder restauré avec succès ===")
+                logger.info("=== Deck builder optimizer state successfully restored ===")
             except Exception as e:
-                logger.warning("Impossible de restaurer l'état de l'optimiseur deck builder : %s", e)
+                logger.warning("Could not restore deck builder optimizer state: %s", e)
                 deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
         else:
             deck_opt_state = optax.adam(cfg.train.deck_lr).init(deck_params)
@@ -1120,13 +1320,36 @@ def train(cfg: Config) -> None:
         )
     deck_optimizer = optax.adam(cfg.train.deck_lr)
 
-    # ── 5. Replicate onto available devices (1 GPU, 2 GPUs, or CPU) ─────
-    num_devs = min(len(jax.devices()), cfg.infra.num_devices)
-    devices  = jax.devices()[:num_devs]
-    state    = flax.jax_utils.replicate(state, devices)
-    logger.info("[train] TrainState répliqué sur %d device(s) : %s", num_devs, devices)
+    # ── 5. Découplage Matériel des Devices (Learner vs Actors) ───────────
+    all_devs = jax.devices()[:cfg.infra.num_devices]
+    num_total_devs = len(all_devs)
+
+    # Répartition optimale en puissances de 2 (ex: 4 Learners + 4 Actors sur 8 TPUs)
+    if num_total_devs >= 4:
+        configured_learners = getattr(cfg.infra, "num_learner_devices", 0)
+        num_learner_devs = configured_learners if configured_learners > 0 else (num_total_devs // 2)
+        learner_devices = all_devs[:num_learner_devs]
+        actor_devices   = all_devs[num_learner_devs:]
+    elif num_total_devs in (2, 3):
+        num_learner_devs = 1
+        learner_devices = all_devs[:1]
+        actor_devices   = all_devs[1:]
+    else:
+        num_learner_devs = 1
+        learner_devices = all_devs
+        actor_devices   = all_devs
+
+
+    num_devs = len(learner_devices)
+    state    = flax.jax_utils.replicate(state, learner_devices)
+    logger.info(
+        "[train] Decoupled TPU architecture: %d Learner(s) %s | %d Actor(s) %s",
+        len(learner_devices), [str(d) for d in learner_devices],
+        len(actor_devices), [str(d) for d in actor_devices],
+    )
 
     train_step_fn = make_train_step(network, probes, cfg, start_step=start_step)
+
 
     # ── 6. Replay buffer (avec tentative de restauration HF Hub & local) ──
     from training.replay_buffer import PrioritizedReplayBuffer
@@ -1135,19 +1358,19 @@ def train(cfg: Config) -> None:
 
     skip_buffer_load = getattr(cfg.train, "hot_fix", False) or getattr(cfg.train, "fresh_buffer", False)
     if skip_buffer_load:
-        logger.info("=== [HOT-FIX / FRESH BUFFER] Démarrage avec un Replay Buffer vide (anciennes parties passives ignorées) ===")
+        logger.info("=== [HOT-FIX / FRESH BUFFER] Starting with empty Replay Buffer (ignoring older passive games) ===")
     else:
         # 1. Tenter de charger le buffer depuis HF Hub si activé
         if cfg.hf.enabled and cfg.hf.repo_id:
             try:
                 from export.hub import load_buffer_from_hub
-                logger.info("Vérification d'un Replay Buffer existant sur HuggingFace Hub (%s)...", cfg.hf.repo_id)
+                logger.info("Checking for existing Replay Buffer on HuggingFace Hub (%s)...", cfg.hf.repo_id)
                 hf_buf, hf_meta = load_buffer_from_hub(cfg.hf.repo_id, cfg.train, cfg.model, cfg=cfg)
                 if hf_buf is not None:
                     buffer = hf_buf
                     buffer_meta = hf_meta
             except Exception as e:
-                logger.warning("[hf-buffer] Échec de restauration HF Hub : %s", e)
+                logger.warning("[hf-buffer] HF Hub restore failed: %s", e)
 
     # 2. Vérifier si un buffer local existe (dans local_dir ou checkpoint_dir)
     local_buf_path = Path(cfg.hf.local_dir) / "replay_buffer.pkl"
@@ -1172,19 +1395,19 @@ def train(cfg: Config) -> None:
                 buffer = loc_buf
                 fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
                 logger.info(
-                    "=== Replay Buffer restauré depuis le stockage local (%s) : %d/%d entrées (%.1f%% rempli, étape %d) ===",
+                    "=== Replay Buffer restored from local storage (%s): %d/%d entries (%.1f%% full, step %d) ===",
                     local_buf_path, len(buffer), buffer._max_size, fill_pct, loc_step
                 )
         except Exception as e:
-            logger.warning("Échec du chargement du replay buffer local (%s) : %s", local_buf_path, e)
+            logger.warning("Failed to load local replay buffer (%s): %s", local_buf_path, e)
 
     if buffer is None:
         buffer = PrioritizedReplayBuffer(cfg.train, cfg.model)
-        logger.info("Aucun Replay Buffer existant trouvé. Création d'un buffer vierge.")
+        logger.info("No existing Replay Buffer found. Creating a fresh buffer.")
     else:
         fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
         logger.info(
-            "Replay Buffer prêt : %d/%d entrées chargées (%.1f%% rempli, min requis pour seeding: %d).",
+            "Replay Buffer ready: %d/%d entries loaded (%.1f%% full, min required for seeding: %d).",
             len(buffer), buffer._max_size, fill_pct, cfg.train.min_replay_size
         )
 
@@ -1195,11 +1418,63 @@ def train(cfg: Config) -> None:
     from training.activity import tracker, format_h_status
     tracker.attach_buffer(buffer)  # lecture en direct de len(buffer) dans le heartbeat
 
-    NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
+    is_tpu = any(getattr(d, "platform", "") == "tpu" for d in jax.devices()) or os.environ.get("TPU_NAME") is not None or "TPU" in str(jax.devices())
+    if getattr(cfg.train, "num_workers", 0) > 0:
+        NUM_WORKERS = cfg.train.num_workers
+    elif is_tpu:
+        NUM_WORKERS = max(1, min(96, os.cpu_count() or 64))
+        if getattr(cfg.train, "games_per_self_play", 8) == 8:
+            cfg.train.games_per_self_play = NUM_WORKERS
+        # Adapter l'intervalle pour maintenir le Replay Ratio d'or (~8x) avec 96 workers
+        if getattr(cfg.train, "self_play_interval", 100) == 100:
+            cfg.train.self_play_interval = max(100, int(NUM_WORKERS * 12.5))
+    else:
+        NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
+
+    logger.info(
+        "[train] Hardware detection: TPU=%s, %d CPU cores → %d workers (games_per_self_play=%d, self_play_interval=%d steps, target Replay Ratio ≈ 8.8x).",
+        is_tpu, os.cpu_count() or 1, NUM_WORKERS, cfg.train.games_per_self_play, cfg.train.self_play_interval
+    )
+
+
+    # ── JIT Warmup (TPU / GPU) pour éliminer les latences de première compilation ──
+    try:
+        actor_batch_size = max(1, (NUM_WORKERS + len(actor_devices) - 1) // len(actor_devices))
+        logger.info(
+            "[train] TPU JIT-compilation warmup on %d Actor(s) (ismcts_action_batched, actor_batch_size=%d)...",
+            len(actor_devices), actor_batch_size
+        )
+        from search.ismcts import ismcts_action_batched
+        from env.encoding import encode_observation
+        dummy_enc_single = encode_observation({}, 0, cfg.model)
+        N_s = int(cfg.search.num_belief_samples)
+        dummy_batch_enc_base = {}
+        for k, v in dummy_enc_single.items():
+            arr_sample = np.stack([v] * N_s, axis=0)
+            dummy_batch_enc_base[k] = np.stack([arr_sample] * actor_batch_size, axis=0)
+        dummy_omasks_base = np.ones((actor_batch_size, int(cfg.model.max_actions)), dtype=bool)
+
+        for dev_idx, dev in enumerate(actor_devices):
+            logger.info("  → Warmup and XLA compilation on Actor TPU %d (%s)...", dev_idx, dev)
+            dev_params = jax.device_put(_params_cpu, dev)
+            dev_enc = {k: jax.device_put(v, dev) for k, v in dummy_batch_enc_base.items()}
+            dev_omasks = jax.device_put(dummy_omasks_base, dev)
+            dev_rng = jax.device_put(jax.random.PRNGKey(dev_idx), dev)
+            _ba_warm, _ap_warm, _av_warm = ismcts_action_batched(
+                network, dev_params, dev_enc, dev_omasks, dev_rng, cfg
+            )
+        logger.info("[train] ISMCTS warmup completed successfully on all Actor TPUs (batch=%d, belief=%d).", actor_batch_size, N_s)
+    except Exception as exc:
+        logger.warning("[train] ISMCTS warmup skipped (%s).", exc)
+
+
+
+
+
 
     if len(buffer) < cfg.train.min_replay_size:
         logger.info(
-            "Seeding replay buffer (%d/%d entrées actuelles, min requis=%d)…",
+            "Seeding replay buffer (%d/%d current entries, min required=%d)...",
             len(buffer), buffer._max_size, cfg.train.min_replay_size
         )
         tracker.update(phase="Seeding Replay Buffer", buffer_size=len(buffer), deck_errors=0)
@@ -1242,7 +1517,9 @@ def train(cfg: Config) -> None:
                 processes=processes,
                 is_seeding=True,
                 card_data=card_data,
+                actor_devices=actor_devices,
             )
+
             tracker.self_play_times.append(time.time() - t_sp_start)
             
             _deck_errors += errs
@@ -1256,7 +1533,7 @@ def train(cfg: Config) -> None:
     else:
         fill_pct = round(100.0 * len(buffer) / max(buffer._max_size, 1), 2)
         logger.info(
-            "Replay Buffer déjà suffisamment rempli (%d entrées >= min=%d, %.1f%%). Phase de seeding sautée !",
+            "Replay Buffer already sufficiently filled (%d entries >= min=%d, %.1f%%). Seeding phase skipped!",
             len(buffer), cfg.train.min_replay_size, fill_pct
         )
         import multiprocessing as mp
@@ -1285,7 +1562,9 @@ def train(cfg: Config) -> None:
 
         # ── a. Self-play ──────────────────────────────────────────────────
         if step % cfg.train.self_play_interval == 0:
-            _tp = getattr(state, "target_params", None) or state.params
+            _tp = getattr(state, "target_params", None)
+            if _tp is None:
+                _tp = state.params
             _params_cpu = jax.tree_util.tree_map(lambda x: x[0], _tp)
             
             # Enregistrer immédiatement le modèle entraîné courant pour la suite
@@ -1293,7 +1572,7 @@ def train(cfg: Config) -> None:
             
             rng, rng_sp = jax.random.split(rng)
             
-            tracker.update(phase=f"Self-Play Step {step} (nouveau: {new_step})")
+            tracker.update(phase=f"Self-Play Step {step} (new: {new_step})")
 
             n_games = cfg.train.games_per_self_play
             t_sp_start = time.time()
@@ -1313,7 +1592,9 @@ def train(cfg: Config) -> None:
                 processes=processes,
                 is_seeding=False,
                 card_data=card_data,
+                actor_devices=actor_devices,
             )
+
             tracker.self_play_times.append(time.time() - t_sp_start)
 
             added_transitions = 0
@@ -1322,24 +1603,30 @@ def train(cfg: Config) -> None:
                 added_transitions += t_added
                 tracker.transitions_per_game_list.append(t_added)
 
-                # Unpack played action types in coordinator for live distribution tracking
-                for obs_enc, act_vec in zip(hist.observations, hist.actions):
-                    chosen_indices = np.where(act_vec > 0.5)[0]
-                    for a_idx in chosen_indices:
-                        if "option_feat" in obs_enc and a_idx < len(obs_enc["option_feat"]):
-                            opt_type = int(np.argmax(obs_enc["option_feat"][a_idx][:17]))
-                            tracker.record_action(opt_type)
-            
+                # AUDIT §3.6 — la distribution des types d'action est désormais
+                # relevée par le worker à partir du champ `type` de l'option
+                # réellement jouée, puis rejouée ici.  L'ancienne heuristique
+                # (`argmax(option_feat[:17])`) renvoyait 0 pour toute ligne
+                # paddée/nulle et gonflait donc la catégorie « other ».
+                for opt_type in getattr(hist, "action_types", None) or []:
+                    tracker.record_action(int(opt_type))
+
             total_transitions_since_last_push += added_transitions
 
-            for deck_ids, rew in deck_updates:
-                deck_params, deck_opt_state, deck_baseline, d_loss = \
-                    deck_reinforce_update(
-                        deck_net, deck_params, deck_opt_state, deck_optimizer,
-                        deck_ids, rew, deck_baseline,
-                        entropy_coef=cfg.train.deck_entropy_coef,
-                        baseline_ema=cfg.train.deck_baseline_ema,
-                    )
+            # AUDIT §2.4 — REINFORCE sur un deck constant n'apporte aucune
+            # information (les deux joueurs jouent DEFAULT_COMPETITIVE_DECK et
+            # reçoivent des récompenses opposées) : les mises à jour sont une
+            # marche aléatoire sur les logits.  Activable via
+            # `cfg.train.deck_builder_enabled` quand le deck redeviendra dynamique.
+            if getattr(cfg.train, "deck_builder_enabled", False):
+                for deck_ids, rew in deck_updates:
+                    deck_params, deck_opt_state, deck_baseline, d_loss = \
+                        deck_reinforce_update(
+                            deck_net, deck_params, deck_opt_state, deck_optimizer,
+                            deck_ids, rew, deck_baseline,
+                            entropy_coef=cfg.train.deck_entropy_coef,
+                            baseline_ema=cfg.train.deck_baseline_ema,
+                        )
 
         # ── b. Sample + train ─────────────────────────────────────────────
         entries, indices, is_w = buffer.sample(cfg.train.batch_size)
@@ -1375,7 +1662,9 @@ def train(cfg: Config) -> None:
 
         # ── Priority Refresh allégé (tous les N steps) ────────────────────
         if step % cfg.train.priority_refresh_every == 0 and len(buffer) > 0:
-            _tp = getattr(state, "target_params", None) or state.params
+            _tp = getattr(state, "target_params", None)
+            if _tp is None:
+                _tp = state.params
             _params_cpu_mz = jax.tree_util.tree_map(lambda x: x[0], _tp)["muzero"]
             _refresh_buffer_priorities(buffer, network, _params_cpu_mz, cfg)
 
@@ -1405,7 +1694,7 @@ def train(cfg: Config) -> None:
             )
 
             logger.info(
-                "step=%d (nouveau:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
+                "step=%d (new:%d)  loss=%.4f  pol=%.4f  val=%.4f  rew=%.4f  "
                 "prb=%.4f (acc=%.1f%%)  H_norm=%.2f  p_max=%.2f  H(π)=%.2f vs H(p)=%.2f  "
                 "ATK=%.1f%% ATT=%.1f%% PLY=%.1f%% END=%.1f%%  h_scale=%.2f  buf=%d  %.1fs",
                 step,
@@ -1441,9 +1730,9 @@ def train(cfg: Config) -> None:
             
             if cfg.hf.enabled:
                 _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
-                logger.info("[hf-push] Publication synchrone du snapshot %d...", step)
+                logger.info("[hf-push] Synchronous push of snapshot %d...", step)
                 if not push_to_hub(_params_cpu, deck_params, cfg, step):
-                    logger.error("[hf-push] Snapshot %d non confirmé sur HF.", step)
+                    logger.error("[hf-push] Snapshot %d not confirmed on HF.", step)
 
         # ── e. Async replay buffer push to HF ─────────────────────────────
         if step % cfg.train.buffer_push_every == 0 and step > 0 and cfg.hf.enabled:
@@ -1454,14 +1743,14 @@ def train(cfg: Config) -> None:
     _save_checkpoint(state, deck_params, cfg, global_step, deck_opt_state=deck_opt_state)
     if cfg.hf.enabled:
         _params_cpu = jax.tree_util.tree_map(lambda x: x[0], state.params)
-        logger.info("[hf-push] Lancement du push final synchrone vers HuggingFace...")
+        logger.info("[hf-push] Launching final synchronous push to HuggingFace...")
         push_to_hub(_params_cpu, deck_params, cfg, global_step)
         # Final buffer push (sync — wait for completion before exit)
         from export.hub import push_buffer_to_hub_async
         push_buffer_to_hub_async(buffer, cfg, global_step)
 
     # Clean up persistent workers pool
-    logger.info("[train] Nettoyage du pool de workers persistants...")
+    logger.info("[train] Cleaning up persistent worker pool...")
     for pipe in pipes:
         try:
             pipe.send(None)
@@ -1513,6 +1802,12 @@ def _refresh_buffer_priorities(
         chunk = indexed_entries[start:start + batch_size]
         chunk_indices = np.array([i for i, _ in chunk], dtype=np.int32)
         entries = [entry for _, entry in chunk]
+        actual_len = len(entries)
+        
+        # Padding à batch_size fixe pour garantir 0 recompilation XLA
+        if actual_len < batch_size:
+            entries = entries + [entries[-1]] * (batch_size - actual_len)
+
         obs_keys = entries[0].obs_seq[0].keys()
         obs_batch = {
             k: jnp.array(np.stack([entry.obs_seq[0][k] for entry in entries]))
@@ -1521,18 +1816,29 @@ def _refresh_buffer_priorities(
 
         z = network.apply(mz_params, obs_batch, method=network.represent)
         _, v_pred = network.apply(mz_params, z, method=network.predict)
-        v_target = np.array([entry.target_val[0] for entry in entries], dtype=np.float32)
-        buffer.update_priorities(chunk_indices, np.abs(np.array(v_pred) - v_target))
+        v_pred_arr = np.array(v_pred)[:actual_len]
+        v_target = np.array([entry.target_val[0] for _, entry in chunk], dtype=np.float32)
+        buffer.update_priorities(chunk_indices, np.abs(v_pred_arr - v_target))
+
 
 
 def _add_history_to_buffer(hist: GameHistory, buffer: PrioritizedReplayBuffer, cfg: Config) -> int:
 
     if len(hist) == 0 or hist.returns is None:
         return 0
-    probe_tgts = np.stack([
-        extract_probe_targets(raw, hist.player_idx)
-        for raw in hist.raw_states
-    ] + [np.full(11, -1, dtype=np.int32)])   # +1 for final state
+
+    # AUDIT §3.8 — les cibles de sonde sont désormais extraites côté worker et
+    # `raw_states` (l'observation brute complète de chaque pas : main, défausse
+    # de 60 cartes, prizes, logs…) n'est plus transmis par le pipe.  On garde le
+    # chemin historique en secours pour les anciennes trajectoires.
+    precomputed = getattr(hist, "probe_targets", None)
+    if precomputed:
+        rows = [np.asarray(p, dtype=np.int32) for p in precomputed]
+    else:
+        rows = [extract_probe_targets(raw, hist.player_idx) for raw in hist.raw_states]
+    if not rows:
+        rows = [np.full(11, -1, dtype=np.int32)] * len(hist.observations)
+    probe_tgts = np.stack(rows + [np.full(11, -1, dtype=np.int32)])   # +1 for final state
 
     buffer.add_game(
         obs_list    = hist.observations,

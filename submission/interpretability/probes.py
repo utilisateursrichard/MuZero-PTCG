@@ -121,8 +121,20 @@ def _get_card_db() -> dict:
             if _card_db is None:   # double-checked locking
                 try:
                     from env.cabt_api import all_card_data
-                    _card_db = {c.cardId: c for c in all_card_data()}
-                    _probe_logger.info(
+                    cards = all_card_data()
+                    items = cards.values() if isinstance(cards, dict) else cards
+                    # AUDIT §2.5 — résolution tolérante du nom d'attribut d'ID :
+                    # un seul `AttributeError` faisait basculer TOUTES les sondes
+                    # dépendant de card_db sur target=-1 (donc ignorées).
+                    db = {}
+                    for c in items:
+                        for attr in ("cardId", "card_id", "id", "cardID"):
+                            cid = getattr(c, attr, None)
+                            if cid is not None:
+                                db[int(cid)] = c
+                                break
+                    _card_db = db
+                    _probe_logger.debug(
                         "[probes] card_db chargé : %d cartes", len(_card_db)
                     )
                 except Exception as exc:
@@ -197,8 +209,12 @@ def extract_probe_targets(
                         targets[1] = 1    # neutre
 
     # ── Sonde 2 : prize_lead ─────────────────────────────────────────────
-    my_prizes  = len(me.get("prize") or [])
-    opp_prizes = len(opp.get("prize") or [])
+    # Même source que global_feat[6]/[7] : `len(prize)` était constant, donc la
+    # cible de cette sonde l'était aussi — d'où une précision de 90-100 % qui ne
+    # mesurait rien (cf. env/encoding.py:prize_left).
+    from env.encoding import prize_left
+    my_prizes  = prize_left(me)
+    opp_prizes = prize_left(opp)
     # Plus de prizes restants = plus à prendre = EN RETARD
     if my_prizes < opp_prizes:
         targets[2] = 2    # ahead (j'ai moins de prizes restants)
@@ -265,13 +281,95 @@ def _safe_int(obj, key, default):
         return default
 
 
+# ── AUDIT §2.5 : dégâts réels issus du moteur (all_attack) ────────────────────
+# L'ancienne heuristique `max(60, maxHp // 2)` n'avait aucun rapport avec les
+# attaques réelles de la carte : les sondes 0 (`active_in_ko_range`),
+# 6 (`gust_ko_opportunity`) et 9 (`ko_next_turn_probable`) apprenaient du bruit.
+# Le moteur expose `all_attack()` (déjà ré-exporté par env/cabt_api) : on en
+# dérive une table card_id → dégât maximum, avec repli sur l'ancienne heuristique
+# si l'API n'est pas disponible ou change de forme.
+_attack_db: dict | None = None
+_attack_db_lock = threading.Lock()
+
+_ATTACK_CARD_KEYS = ("cardId", "card_id", "cardID", "pokemonId", "id")
+_ATTACK_DMG_KEYS = ("damage", "dmg", "power", "baseDamage", "damageValue")
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    if hasattr(value, "value"):
+        value = value.value
+    if isinstance(value, str):
+        digits = "".join(c for c in value if c.isdigit())
+        return int(digits) if digits else default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_attack_db() -> dict:
+    """card_id → dégât maximum parmi les attaques de la carte."""
+    global _attack_db
+    if _attack_db is None:
+        with _attack_db_lock:
+            if _attack_db is None:
+                table: Dict[int, int] = {}
+                try:
+                    from env.cabt_api import all_attack, all_card_data
+                    attacks = all_attack()
+                    cards = all_card_data()
+
+                    def _get(obj, key):
+                        if isinstance(obj, dict):
+                            return obj.get(key)
+                        return getattr(obj, key, None)
+
+                    # 1. Dictionnaire attackId -> dégâts
+                    atk_items = attacks.values() if isinstance(attacks, dict) else attacks
+                    atk_dmg_map: Dict[int, int] = {}
+                    for atk in atk_items:
+                        aid = _coerce_int(_get(atk, "attackId") or _get(atk, "id"), -1)
+                        dmg = max((_coerce_int(_get(atk, k), 0) for k in _ATTACK_DMG_KEYS), default=0)
+                        if aid >= 0:
+                            atk_dmg_map[aid] = dmg
+
+                    # 2. Association carte -> max dégâts parmi ses attaques
+                    card_items = cards.values() if isinstance(cards, dict) else cards
+                    for c in card_items:
+                        cid = _coerce_int(_get(c, "id") or _get(c, "cardId"), -1)
+                        if cid < 0:
+                            continue
+                        atks = _get(c, "attacks") or []
+                        max_dmg = 0
+                        for a in atks:
+                            aid = _coerce_int(a if not isinstance(a, dict) else _get(a, "attackId"), -1)
+                            if aid in atk_dmg_map:
+                                max_dmg = max(max_dmg, atk_dmg_map[aid])
+                        if max_dmg > 0:
+                            table[cid] = max_dmg
+
+                    _probe_logger.debug(
+                        "[probes] attack_db chargée : %d cartes avec dégâts connus", len(table)
+                    )
+                except Exception as exc:
+                    _probe_logger.warning(
+                        "[probes] all_attack() indisponible (%s) — repli sur l'heuristique de dégâts.",
+                        exc,
+                    )
+                _attack_db = table
+    return _attack_db
+
+
 def _estimate_max_damage(poke: dict) -> int:
-    """Heuristique simple : max dégât parmi les mouvements de l'actif adverse."""
-    # Le game state n'expose pas les dégâts directement ;
-    # on utilise l'hp_ratio comme proxy inverse
+    """Dégât maximum réel de la carte (moteur) ; repli heuristique si inconnu."""
+    cid = _safe_int(poke, "id", -1)
+    if cid >= 0:
+        dmg = _get_attack_db().get(cid)
+        if dmg:
+            return int(dmg)
     hp_total = _safe_int(poke, "maxHp", 100)
-    # L'adversaire a potentiellement une attaque à ~60% de l'HP de n'importe qui
-    # C'est une borne supérieure grossière — à affiner avec les données CSV
     return max(60, hp_total // 2)
 
 
@@ -279,7 +377,27 @@ def _pokemon_attack_ready(poke: dict) -> bool:
     return len(poke.get("energies") or []) >= 2 and _estimate_max_damage(poke) > 0
 
 
+def _card_id_of(card) -> int:
+    """ID d'une carte, qu'elle soit un dict, un objet, ou un entier nu.
+
+    Le moteur peut renvoyer les zones « main » / « défausse » / « prizes » comme
+    de simples listes d'IDs (cf. `env/encoding.py`).  Sans ce cas, `_safe_int`
+    renvoyait -1 pour toute carte entière et les sondes 8
+    (`evolution_in_hand`) et 10 (`energy_attachment_available`) retournaient
+    silencieusement 0 au lieu de leur vraie valeur.
+    """
+    if card is None or isinstance(card, bool):
+        return -1
+    if isinstance(card, (int, np.integer)):
+        return int(card)
+    return _safe_int(card, "id", -1)
+
+
 def _card_name(card) -> str:
+    """Nom d'une carte ; résolu via la card_db du moteur si l'entrée est un ID nu."""
+    if isinstance(card, (int, np.integer)) and not isinstance(card, bool):
+        entry = _get_card_db().get(int(card))
+        return "" if entry is None else _card_name(entry)
     if isinstance(card, dict):
         return str(card.get("name", card.get("cardName", "")))
     return str(getattr(card, "name", getattr(card, "cardName", "")))
@@ -287,7 +405,7 @@ def _card_name(card) -> str:
 
 def _has_matching_evolution(board: list, hand: list) -> bool:
     db = _get_card_db()
-    hand_ids = {_safe_int(c, "id", -1) for c in hand}
+    hand_ids = {_card_id_of(c) for c in hand}
     hand_names = {_card_name(c).lower() for c in hand}
     for pokemon in board:
         cid = _safe_int(pokemon, "id", -1)
@@ -305,6 +423,12 @@ def _has_matching_evolution(board: list, hand: list) -> bool:
 
 def _is_energy_card(card) -> bool:
     keys = ("stage", "category", "type", "cardType")
+    # Carte donnée sous forme d'ID nu : on résout via la card_db du moteur.
+    if isinstance(card, (int, np.integer)) and not isinstance(card, bool):
+        entry = _get_card_db().get(int(card))
+        if entry is None:
+            return False
+        card = entry
     if isinstance(card, dict):
         text = " ".join(str(card.get(k, "")) for k in keys).lower()
     else:

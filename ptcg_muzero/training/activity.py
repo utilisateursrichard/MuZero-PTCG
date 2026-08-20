@@ -7,7 +7,7 @@ logger = logging.getLogger("ptcg_muzero.activity")
 
 class ActivityTracker:
     def __init__(self):
-        self.phase = "Initialisation"
+        self.phase = "Initialization"
         self._live_buffer = None   # référence directe au PrioritizedReplayBuffer (setée par trainer)
         self._buffer_size_fallback = 0  # utilisé si _live_buffer n'est pas encore attaché
         self.deck_errors = 0
@@ -18,7 +18,7 @@ class ActivityTracker:
         self.start_step = 0     # step initial de la session (depuis la reprise/changement)
         self.current_step = 0   # step d'entraînement courant (global)
         self.rep_frozen = True
-        self.h_status = "GÉLÉ (initialisation)"
+        self.h_status = "FROZEN (initialization)"
         self.h_grad_scale = 1.0
 
         # Running telemetry metrics
@@ -174,7 +174,7 @@ def format_h_status(
 ) -> str:
     """Génère un indicateur textuel décrivant si h(s) est gelé et estimant quand il sera dégelé."""
     if not rep_frozen:
-        return "DÉGELÉ"
+        return "UNFROZEN"
 
     new_step = max(0, step - start_step)
 
@@ -192,18 +192,18 @@ def format_h_status(
         else:
             t_str = f"{est_sec:.0f}s"
 
-        return f"GÉLÉ (≥{rem_steps} steps nouv. restants [{new_step}/{s_min}] | ~{t_str})"
+        return f"FROZEN (≥{rem_steps} new steps rem. [{new_step}/{s_min}] | ~{t_str})"
 
     # Phase 2 : Évaluation active du plateau
     if current_gain is not None:
         target_pct = eps * 100.0
         gain_pct = current_gain * 100.0
         if current_gain > eps:
-            return f"GÉLÉ (gain={gain_pct:.2f}% -> cible <{target_pct:.2f}%)"
+            return f"FROZEN (gain={gain_pct:.2f}% -> target <{target_pct:.2f}%)"
         else:
-            return f"GÉLÉ (plateau atteint: gain={gain_pct:.2f}% < {target_pct:.2f}%)"
+            return f"FROZEN (plateau reached: gain={gain_pct:.2f}% < {target_pct:.2f}%)"
 
-    return "GÉLÉ (évaluation plateau...)"
+    return "FROZEN (evaluating plateau...)"
 
 
 def dump_all_stacks():

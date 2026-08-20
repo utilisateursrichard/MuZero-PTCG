@@ -49,30 +49,30 @@ def resolve_local_path(original_path: str) -> str:
         if opt.exists():
             return str(opt.resolve())
             
-    print(f"Attention: Impossible de localiser le fichier {original_path} ou ses alternatives locales.")
+    print(f"Warning: Unable to locate file {original_path} or its local alternatives.")
     return original_path
 
 def main():
-    parser = argparse.ArgumentParser(description="Diagnostic local de la précision des Probes sur de vraies parties.")
-    parser.add_argument("--ckpt", default=None, help="Chemin vers le checkpoint .pkl du modèle.")
-    parser.add_argument("--config", default=None, help="Chemin vers config.json.")
-    parser.add_argument("--games", type=int, default=3, help="Nombre de parties à simuler pour récolter des données.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed pour la génération aléatoire.")
+    parser = argparse.ArgumentParser(description="Local probe diagnostic on real gameplay data.")
+    parser.add_argument("--ckpt", default=None, help="Path to the model .pkl checkpoint.")
+    parser.add_argument("--config", default=None, help="Path to config.json.")
+    parser.add_argument("--games", type=int, default=3, help="Number of games to simulate for data collection.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     args = parser.parse_args()
 
     # 1. Chargement de la configuration
     if args.config and Path(args.config).exists():
         cfg = Config.load(args.config)
-        print(f"Configuration chargée depuis {args.config}")
+        print(f"Configuration loaded from {args.config}")
     else:
         cfg = Config()
-        print("Utilisation de la configuration par défaut.")
+        print("Using default configuration.")
 
     # Surcharger les chemins Kaggle par les chemins locaux résolus
     cfg.infra.card_csv = resolve_local_path(cfg.infra.card_csv)
     cfg.infra.reference_deck_csv = resolve_local_path(cfg.infra.reference_deck_csv)
-    print(f"Chemin local card_csv : {cfg.infra.card_csv}")
-    print(f"Chemin local reference_deck_csv : {cfg.infra.reference_deck_csv}")
+    print(f"Local card_csv path: {cfg.infra.card_csv}")
+    print(f"Local reference_deck_csv path: {cfg.infra.reference_deck_csv}")
 
     # 2. Chargement du checkpoint ou initialisation aléatoire
     params = {}
@@ -80,11 +80,11 @@ def main():
     if args.ckpt and Path(args.ckpt).exists():
         with open(args.ckpt, "rb") as f:
             data = pickle.load(f)
-        print(f"Checkpoint chargé depuis {args.ckpt} (step={data.get('step', -1)})")
+        print(f"Checkpoint loaded from {args.ckpt} (step={data.get('step', -1)})")
         params = jax.tree_util.tree_map(jax.device_put, data["params"])
         deck_params = jax.tree_util.tree_map(jax.device_put, data.get("deck", {}))
     else:
-        print("Aucun checkpoint valide fourni. Les probes seront évaluées sur un modèle aux poids aléatoires.")
+        print("No valid checkpoint provided. Probes will be evaluated on a randomly initialized model.")
 
     # 3. Initialisation des caractéristiques statiques des cartes
     card_data = CardStaticFeatures(cfg.infra.card_csv)
@@ -119,7 +119,7 @@ def main():
         rng, rng_mz, rng_pr, rng_dk = jax.random.split(rng, 4)
         
         if not params:
-            mz_params = network.init(rng_mz, batch_obs)
+            mz_params = network.init(rng_mz, batch_obs, method=network.init_all)
             z_dummy = jnp.zeros((1, cfg.model.latent_dim))
             pr_params = probes.init(rng_pr, z_dummy)
             params = {"muzero": mz_params, "probes": pr_params}
@@ -140,7 +140,7 @@ def main():
         return [np.random.randint(0, n)], policy, 0.0
 
     # 6. Simulation des parties pour collecter de vraies observations/cibles
-    print(f"\nSimulation de {args.games} parties en cours pour récolter des données réelles...")
+    print(f"\nSimulating {args.games} games to collect real gameplay data...")
     all_observations = []
     all_targets = []
 
@@ -155,7 +155,7 @@ def main():
         h0, h1 = run_self_play_game(
             (agent_muzero, random_agent), deck0, deck1, cfg, np_rng
         )
-        print(f"  Partie {g+1}/{args.games} terminée (états récoltés: {len(h0.observations)})")
+        print(f"  Game {g+1}/{args.games} completed (states collected: {len(h0.observations)})")
 
         for obs, raw_state in zip(h0.observations, h0.raw_states):
             # Extraire les vraies cibles à partir des états bruts du jeu
@@ -166,7 +166,7 @@ def main():
                 all_targets.append(targets)
 
     if not all_observations:
-        print("Erreur: Aucune donnée valide collectée pendant la simulation.")
+        print("Error: No valid data collected during simulation.")
         return
 
     # 7. Batcher les données récoltées
@@ -174,7 +174,7 @@ def main():
     obs_batch = {k: jnp.stack([obs[k] for obs in all_observations], axis=0) for k in keys}
     target_batch = jnp.stack(all_targets, axis=0)
 
-    print(f"\nCalcul des performances sur {len(all_observations)} états de jeu réels...")
+    print(f"\nComputing metrics on {len(all_observations)} real game states...")
 
     # 8. Forward pass et calcul des métriques
     z = network.apply(params["muzero"], obs_batch, method=network.represent)

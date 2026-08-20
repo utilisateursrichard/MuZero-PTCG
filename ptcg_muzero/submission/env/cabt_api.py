@@ -74,6 +74,7 @@ from cg.api import (   # type: ignore[import]
     Pokemon,
     SearchState,
     SelectContext,
+    SelectType,
     all_attack,
     all_card_data,
     search_begin,
@@ -89,7 +90,8 @@ from cg.game import (  # type: ignore[import]
 
 __all__ = [
     "AreaType", "Card", "Observation", "OptionType", "PlayerState",
-    "Pokemon", "SearchState", "SelectContext", "all_attack", "all_card_data",
+    "Pokemon", "SearchState", "SelectContext", "SelectType", "all_attack", "all_card_data",
     "battle_finish", "battle_select", "battle_start",
     "search_begin", "search_end", "search_step", "to_observation_class",
 ]
+

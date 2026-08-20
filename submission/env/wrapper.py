@@ -35,7 +35,13 @@ from env.cabt_api import (
     battle_start,
     to_observation_class,
 )
-from env.encoding import encode_observation, extract_step_reward
+from env.encoding import (
+    _as_dict,
+    encode_observation,
+    extract_deck_count,
+    extract_prizes_left,
+    extract_step_reward,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +262,7 @@ def run_self_play_game(
     env  = CabtEnv()
     hist = [GameHistory(player_idx=0), GameHistory(player_idx=1)]
     prev_logs: List[list] = [[], []]
+    prev_prizes: List[Optional[Tuple[int, int]]] = [None, None]
     terminal_seen = [False, False]
 
     try:
@@ -296,6 +303,22 @@ def run_self_play_game(
                 obs_dict, done = env.step([])
                 continue
 
+            # ── Intermediate prize reward shaping ──────────────────────────
+            my_prizes, opp_prizes = extract_prizes_left(obs_dict, your_idx)
+            shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+            if shaping_enabled:
+                if prev_prizes[your_idx] is not None and hist[your_idx].rewards:
+                    prev_my, prev_opp = prev_prizes[your_idx]
+                    if prev_my > 0:
+                        delta_my = max(0, prev_my - my_prizes)
+                        delta_opp = max(0, prev_opp - opp_prizes)
+                        prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                        prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+                        if delta_my > 0 or delta_opp > 0:
+                            hist[your_idx].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+                if my_prizes > 0 or prev_prizes[your_idx] is not None:
+                    prev_prizes[your_idx] = (my_prizes, opp_prizes)
+
             # ── Encode observation ──────────────────────────────────────────
             enc_obs = encode_observation(obs_dict, your_idx, cfg.model)
             option_mask = enc_obs["option_mask"]
@@ -324,8 +347,8 @@ def run_self_play_game(
                 else:
                     fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                     logger.warning(
-                        f"[run_self_play_game] Action choisie invalide ({idx}) pour options {options}. "
-                        f"Fallback vers {fallback_idx}."
+                        f"[run_self_play_game] Invalid chosen action ({idx}) for options {options}. "
+                        f"Fallback to {fallback_idx}."
                     )
                     valid_action_indices.append(fallback_idx)
             action_indices = valid_action_indices
@@ -347,7 +370,9 @@ def run_self_play_game(
             terminal_seen[your_idx] = terminal_seen[your_idx] or any(
                 _log_int(log, "type", -1) == 23 for log in new_logs
             )
-            reward = extract_step_reward(new_logs, your_idx)
+            win_r = float(getattr(cfg.train, "win_reward", 1.0))
+            loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+            reward = extract_step_reward(new_logs, your_idx, win_reward=win_r, loss_penalty=loss_p)
 
             # ── Store step in history ──────────────────────────────────────
             action_vec = np.zeros(cfg.model.max_actions, dtype=np.float32)
@@ -366,15 +391,37 @@ def run_self_play_game(
 
         # ── Terminal reward adjustment ─────────────────────────────────────
         result = env.result
+        final_obs = _as_dict(obs_dict)
+        shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+        win_r = float(getattr(cfg.train, "win_reward", 1.0))
+        loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+        deck_pen = float(getattr(cfg.train, "deck_out_penalty", 0.1))
+        prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+        prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+
         for p in range(2):
             if hist[p].rewards:
+                # Écart final de prizes sur la transition menant au résultat
+                if shaping_enabled and prev_prizes[p] is not None:
+                    prev_my, prev_opp = prev_prizes[p]
+                    curr_my, curr_opp = extract_prizes_left(final_obs, p)
+                    if prev_my > 0:
+                        delta_my = max(0, prev_my - curr_my)
+                        delta_opp = max(0, prev_opp - curr_opp)
+                        if delta_my > 0 or delta_opp > 0:
+                            hist[p].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+
+                is_deck_out = (extract_deck_count(final_obs, p) <= 0)
+
                 if result == p:
                     if not terminal_seen[p]:
-                        hist[p].rewards[-1] += 1.0
+                        hist[p].rewards[-1] += win_r if shaping_enabled else 1.0
                     hist[p].game_won = True
                 elif result == 1 - p:
                     if not terminal_seen[p]:
-                        hist[p].rewards[-1] -= 1.0
+                        hist[p].rewards[-1] -= loss_p if shaping_enabled else 1.0
+                    if shaping_enabled and is_deck_out:
+                        hist[p].rewards[-1] -= deck_pen
                     hist[p].game_won = False
                 else:
                     hist[p].game_won = None   # draw
@@ -511,7 +558,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
             if getattr(cfg.search, "belief_from_known_deck", True) else None
         )
     except Exception as _be:
-        logger.warning("[worker-%s] set_belief_deck indisponible : %s", worker_id, _be)
+        logger.warning("[worker-%s] set_belief_deck unavailable: %s", worker_id, _be)
 
     env = CabtEnv()
 
@@ -535,6 +582,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
 
                 step_count = 0
                 prev_logs = [[], []]
+                prev_prizes: List[Optional[Tuple[int, int]]] = [None, None]
                 terminal_seen = [False, False]
                 from env.wrapper import GameHistory, _TurnCounter, compute_temperature
                 from interpretability.probes import extract_probe_targets
@@ -560,6 +608,22 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     if not options:
                         obs_dict, done = env.step([])
                         continue
+
+                    # ── Intermediate prize reward shaping ──────────────────────────
+                    my_prizes, opp_prizes = extract_prizes_left(obs_dict, your_idx)
+                    shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+                    if shaping_enabled:
+                        if prev_prizes[your_idx] is not None and hist[your_idx].rewards:
+                            prev_my, prev_opp = prev_prizes[your_idx]
+                            if prev_my > 0:
+                                delta_my = max(0, prev_my - my_prizes)
+                                delta_opp = max(0, prev_opp - opp_prizes)
+                                prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                                prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+                                if delta_my > 0 or delta_opp > 0:
+                                    hist[your_idx].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+                        if my_prizes > 0 or prev_prizes[your_idx] is not None:
+                            prev_prizes[your_idx] = (my_prizes, opp_prizes)
 
                     mc = cfg.model
                     N_samples = int(num_belief_samples)
@@ -644,8 +708,8 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         else:
                             fallback_idx = next((i for i, opt in enumerate(options) if opt is not None), 0)
                             logger.warning(
-                                f"[worker-{worker_id}] Action choisie invalide ({idx}) pour options {options}. "
-                                f"Fallback vers {fallback_idx}."
+                                f"[worker-{worker_id}] Invalid chosen action ({idx}) for options {options}. "
+                                f"Fallback to {fallback_idx}."
                             )
                             valid_action_indices.append(fallback_idx)
                     action_indices = valid_action_indices
@@ -658,7 +722,7 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                             extract_probe_targets(obs_dict, your_idx)
                         )
                     except Exception as _pe:
-                        logger.debug("[worker-%s] extract_probe_targets a échoué : %s", worker_id, _pe)
+                        logger.debug("[worker-%s] extract_probe_targets failed: %s", worker_id, _pe)
                         hist[your_idx].probe_targets.append(np.full(11, -1, dtype=np.int32))
 
                     # AUDIT §3.6 — relever le type RÉEL de chaque option jouée.
@@ -680,7 +744,9 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                         _log_int(log, "type", -1) == 23 for log in new_logs
                     )
 
-                    reward = extract_step_reward(new_logs, your_idx)
+                    win_r = float(getattr(cfg.train, "win_reward", 1.0))
+                    loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+                    reward = extract_step_reward(new_logs, your_idx, win_reward=win_r, loss_penalty=loss_p)
 
                     action_vec = np.zeros(mc.max_actions, dtype=np.float32)
                     for idx in action_indices:
@@ -697,23 +763,37 @@ def self_play_worker_fn(pipe, worker_id, cfg):
                     obs_dict, done = env.step(action_indices)
 
                 result = env.result
+                final_obs = _as_dict(obs_dict)
+                shaping_enabled = getattr(cfg.train, "enable_reward_shaping", True)
+                win_r = float(getattr(cfg.train, "win_reward", 1.0))
+                loss_p = float(getattr(cfg.train, "loss_penalty", 1.0))
+                deck_pen = float(getattr(cfg.train, "deck_out_penalty", 0.1))
+                prize_rew = float(getattr(cfg.train, "prize_reward", 1.0 / 12.0))
+                prize_pen = float(getattr(cfg.train, "prize_penalty", 1.0 / 12.0))
+
                 for p in range(2):
                     if hist[p].rewards:
-                        # AUDIT §2.3 — la garde `terminal_seen` était calculée
-                        # mais jamais utilisée ici (contrairement à
-                        # `run_self_play_game`).  Si le log RESULT (type 23)
-                        # était déjà visible à la dernière décision,
-                        # `extract_step_reward` avait rendu ±1 et on ajoutait
-                        # encore ±1 → récompense ±2, écrêtée à ±1.2 par les bins
-                        # de valeur → saturation de la tête de valeur et retours
-                        # n-step faussés.
+                        # Écart final de prizes sur la transition menant au résultat
+                        if shaping_enabled and prev_prizes[p] is not None:
+                            prev_my, prev_opp = prev_prizes[p]
+                            curr_my, curr_opp = extract_prizes_left(final_obs, p)
+                            if prev_my > 0:
+                                delta_my = max(0, prev_my - curr_my)
+                                delta_opp = max(0, prev_opp - curr_opp)
+                                if delta_my > 0 or delta_opp > 0:
+                                    hist[p].rewards[-1] += delta_my * prize_rew - delta_opp * prize_pen
+
+                        is_deck_out = (extract_deck_count(final_obs, p) <= 0)
+
                         if result == p:
                             if not terminal_seen[p]:
-                                hist[p].rewards[-1] += 1.0
+                                hist[p].rewards[-1] += win_r if shaping_enabled else 1.0
                             hist[p].game_won = True
                         elif result == 1 - p:
                             if not terminal_seen[p]:
-                                hist[p].rewards[-1] -= 1.0
+                                hist[p].rewards[-1] -= loss_p if shaping_enabled else 1.0
+                            if shaping_enabled and is_deck_out:
+                                hist[p].rewards[-1] -= deck_pen
                             hist[p].game_won = False
                         else:
                             hist[p].game_won = None
@@ -733,11 +813,11 @@ def self_play_worker_fn(pipe, worker_id, cfg):
         except Exception as e:
             import traceback
             err_msg = f"{e}\n{traceback.format_exc()}"
-            logger.error(f"[worker-{worker_id}] Exception fatale rencontree : {err_msg}")
+            logger.error(f"[worker-{worker_id}] Fatal exception encountered: {err_msg}")
             try:
                 pipe.send({"status": "error", "error": err_msg})
             except Exception as pipe_err:
-                logger.error(f"[worker-{worker_id}] Impossible d'envoyer l'erreur via le pipe : {pipe_err}")
+                logger.error(f"[worker-{worker_id}] Unable to send error via pipe: {pipe_err}")
             break
 
     env.close()

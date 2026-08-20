@@ -343,8 +343,8 @@ class PredictionNetwork(nn.Module):
         del option_feat  # volontairement inutilisé — cf. docstring
         D = self.cfg.latent_dim
         num_bins = getattr(self.cfg, "num_value_bins", 51)
-        v_min = getattr(self.cfg, "value_min", -2.5)
-        v_max = getattr(self.cfg, "value_max", 2.5)
+        v_min = getattr(self.cfg, "value_min", -1.8)
+        v_max = getattr(self.cfg, "value_max", 1.8)
 
         # Policy head
         pi_hid = MLP(hidden_dim=D, out_dim=D, use_residual=False)(z)
@@ -414,8 +414,8 @@ class DynamicsNetwork(nn.Module):
         del action_feat  # volontairement inutilisé — cf. docstring
         D = self.cfg.latent_dim
         num_bins = getattr(self.cfg, "num_value_bins", 51)
-        v_min = getattr(self.cfg, "value_min", -2.5)
-        v_max = getattr(self.cfg, "value_max", 2.5)
+        v_min = getattr(self.cfg, "value_min", -1.8)
+        v_max = getattr(self.cfg, "value_max", 1.8)
 
         a_emb = nn.Dense(D, name="a_emb")(action_onehot)
         a_emb = nn.gelu(a_emb)

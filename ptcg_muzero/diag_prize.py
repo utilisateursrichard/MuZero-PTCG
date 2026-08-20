@@ -104,9 +104,9 @@ def _log_type(log) -> int:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Diagnostic de la représentation des prizes.")
+    ap = argparse.ArgumentParser(description="Prize representation diagnostics.")
     ap.add_argument("--max-steps", type=int, default=600)
-    ap.add_argument("--every", type=int, default=25, help="Fréquence des relevés.")
+    ap.add_argument("--every", type=int, default=25, help="Snapshot frequency.")
     args = ap.parse_args()
 
     from config import Config
@@ -120,11 +120,11 @@ def main() -> None:
     try:
         obs, done = env.reset(deck, deck)
     except DeckError as e:
-        print(f"ERREUR : le moteur a refusé le deck — {e}")
+        print(f"ERROR: engine rejected deck — {e}")
         sys.exit(1)
 
     print("=" * 78)
-    print("DIAGNOSTIC PRIZES — une partie, première option légale à chaque décision")
+    print("PRIZE DIAGNOSTICS — 1 game, first legal option at each step")
     print("=" * 78)
 
     # Inventaire complet des clés du dict joueur, une seule fois.
@@ -133,7 +133,7 @@ def main() -> None:
         p0 = players[0]
         keys = sorted(p0.keys()) if isinstance(p0, dict) else \
             sorted(k for k in dir(p0) if not k.startswith("_"))
-        print("\nClés disponibles sur un joueur :")
+        print("\nAvailable keys on a player:")
         print("  " + ", ".join(str(k) for k in keys))
 
     from collections import Counter
@@ -174,7 +174,7 @@ def main() -> None:
         except Exception as exc:
             # Un select refusé ne doit pas interrompre le diagnostic : on trace
             # le contexte exact et on tente des repositionnements simples.
-            print(f"\n[avertissement] étape {step} : le moteur a refusé {picks} "
+            print(f"\n[warning] step {step}: engine rejected {picks} "
                   f"({type(exc).__name__}: {exc})")
             print(f"    select = minCount={select.get('minCount')} "
                   f"maxCount={select.get('maxCount')} type={select.get('type')} "
@@ -183,13 +183,13 @@ def main() -> None:
             for alt in ([], [0], picks[:1]):
                 try:
                     obs, done = env.step(alt)
-                    print(f"    → replié sur {alt}")
+                    print(f"    → fallback to {alt}")
                     recovered = True
                     break
                 except Exception:
                     continue
             if not recovered:
-                print("    → impossible de poursuivre, arrêt de la partie.")
+                print("    → unable to proceed, stopping game.")
                 break
 
     # Relevé final
@@ -201,9 +201,9 @@ def main() -> None:
     snaps.append(rec)
     env.close()
 
-    print(f"\nPartie terminée en {step} étapes moteur — résultat = {cur.get('result')}\n")
+    print(f"\nGame completed in {step} engine steps — result = {cur.get('result')}\n")
     for s in snaps:
-        print(f"— étape {s['step']:4d} (turn={s['turn']})")
+        print(f"— step {s['step']:4d} (turn={s['turn']})")
         for side in ("p0", "p1"):
             if side in s:
                 fields = ", ".join(f"{k}={v}" for k, v in s[side].items())
@@ -219,32 +219,31 @@ def main() -> None:
         nn = [s[side].get("prize_non_none") for s in snaps if side in s]
         nn = [v for v in nn if v is not None]
         if vals:
-            verdict = "CONSTANT → inutilisable" if len(set(vals)) == 1 else "VARIE → exploitable"
+            verdict = "CONSTANT → unusable" if len(set(vals)) == 1 else "VARIES → usable"
             print(f"  {side} len(prize)      : {vals}  → {verdict}")
         if nn:
-            verdict = "CONSTANT → inutilisable" if len(set(nn)) == 1 else "VARIE → exploitable"
+            verdict = "CONSTANT → unusable" if len(set(nn)) == 1 else "VARIES → usable"
             print(f"  {side} non-None        : {nn}  → {verdict}")
         for key in sorted({k for s in snaps if side in s for k in s[side]
                            if k.startswith(("key:", "cand:"))}):
             seq = [s[side].get(key) for s in snaps if side in s]
-            verdict = "constant" if len(set(map(str, seq))) == 1 else "VARIE → CANDIDAT"
+            verdict = "constant" if len(set(map(str, seq))) == 1 else "VARIES → CANDIDATE"
             print(f"  {side} {key:22s}: {seq[0]} … {seq[-1]}  → {verdict}")
-    print("\nCherchez une ligne « VARIE » : c'est le champ à utiliser dans")
-    print("env/encoding.py (global_feat[6]/[7]) et interpretability/probes.py (prize_lead).")
+    print("\nLook for a 'VARIES' line: this is the field to use in")
+    print("env/encoding.py (global_feat[6]/[7]) and interpretability/probes.py (prize_lead).")
 
     # ── Logs : la piste de repli si aucun champ ne varie ──────────────────────
     print("\n" + "=" * 78)
-    print("TYPES DE LOG RENCONTRÉS  (chercher l'événement « prize prise »)")
+    print("LOG TYPES ENCOUNTERED  (look for 'prize taken' event)")
     print("=" * 78)
     if not log_types:
-        print("  Aucun log capté.")
+        print("  No logs captured.")
     for t, count in sorted(log_types.items(), key=lambda kv: -kv[1]):
-        note = "  ← RESULT (fin de partie)" if t == 23 else ""
+        note = "  ← RESULT (game over)" if t == 23 else ""
         print(f"  type={t:3d}  ×{count:<5d}{note}")
-        print(f"      exemple : {log_samples.get(t)}")
-    print("\nSi len(prize) est constant, le compteur de prizes doit être reconstruit")
-    print("en comptant les occurrences du log correspondant à une prize prise.")
-    print("Communiquez ce tableau : j'en déduirai le type à utiliser.")
+        print(f"      example : {log_samples.get(t)}")
+    print("\nIf len(prize) is constant, the prize counter must be reconstructed")
+    print("by counting occurrences of the log corresponding to a prize taken.")
 
 
 if __name__ == "__main__":

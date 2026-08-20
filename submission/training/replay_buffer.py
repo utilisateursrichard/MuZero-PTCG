@@ -214,7 +214,14 @@ class PrioritizedReplayBuffer:
                 b = segment * (i + 1)
                 s = rng.uniform(a, b)
                 idx = self._sum_tree.find_prefixsum_idx(s)
-                idx = np.clip(idx, 0, self._size - 1)
+                idx = int(np.clip(idx, 0, self._size - 1))
+                # Sécurité : ne jamais renvoyer un emplacement vide (peut arriver
+                # sur un buffer restauré dont le curseur dépasse les entrées).
+                if self._entries[idx] is None:
+                    idx = next(
+                        (j for j in range(self._size) if self._entries[j] is not None),
+                        idx,
+                    )
                 indices.append(idx)
                 entries.append(self._entries[idx])
 
@@ -242,10 +249,25 @@ class PrioritizedReplayBuffer:
                 if not np.isfinite(prio):
                     continue
                 prio = float(max(prio, 1e-6)) ** self._alpha
-                self._max_prio = max(self._max_prio, prio)
                 self._sum_tree.set(int(idx), prio)
                 self._min_tree.set(int(idx), prio)
                 self._max_tree.set(int(idx), prio)
+
+            # AUDIT §3.3 — `_max_prio` était un maximum HISTORIQUE monotone : après
+            # un seul pic de TD-error, toutes les nouvelles entrées héritaient
+            # d'une priorité écrasante et identique, et le PER dégénérait en
+            # « échantillonner uniquement les entrées récentes ».  On le resynchronise
+            # sur le maximum COURANT de l'arbre.
+            self._refresh_max_prio()
+
+    def _refresh_max_prio(self) -> None:
+        """Recale `_max_prio` sur le maximum courant du segment tree."""
+        if self._size == 0:
+            self._max_prio = 1.0
+            return
+        current = float(self._max_tree.query_all())
+        if np.isfinite(current) and current > 0.0:
+            self._max_prio = current
 
     # ── Internal ──────────────────────────────────────────────────────────
 
@@ -344,5 +366,11 @@ class PrioritizedReplayBuffer:
                 buf._sum_tree.set(i, prio)
                 buf._min_tree.set(i, prio)
                 buf._max_tree.set(i, prio)
+
+        # AUDIT §3.3 — recaler `_max_prio` sur le contenu réellement restauré
+        # plutôt que sur la valeur historique sérialisée.
+        buf._size = min(buf._size, len(entries))
+        buf._cursor = buf._cursor % max(buf._max_size, 1)
+        buf._refresh_max_prio()
 
         return buf

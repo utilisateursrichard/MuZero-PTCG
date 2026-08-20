@@ -50,16 +50,17 @@ class ModelConfig:
 
     # ── Value & Reward Categorical Bins ────────────────────────────────────
     num_value_bins: int = 51
-    value_min: float = -1.2
-    value_max: float = 1.2
+    value_min: float = -1.8
+    value_max: float = 1.8
 
 
 
 @dataclass
 class SearchConfig:
-    num_simulations: int = 25           # réduit de 50 → 25 : Gumbel MuZero reste efficace
+    num_simulations: int = 50           # 50 simulations ISMCTS
     # ISMCTS: number of determinizations sampled at each root
     num_belief_samples: int = 4
+
     # Gumbel MuZero: number of considered actions at each node
     max_num_considered_actions: int = 8  # réduit de 16 → 8 : sélectionne les meilleures actions
     # Dirichlet noise at root (self-play exploration)
@@ -84,7 +85,7 @@ class TrainConfig:
     # ── MuZero unrolling ──────────────────────────────────────────────────
     num_unroll_steps: int = 5
     td_steps: int = 20
-    gamma: float = 0.997
+    gamma: float = 1.0
     target_network_tau: float = 0.995   # EMA decay factor for Target Network Polyak averaging
 
     # ── Optimiser ─────────────────────────────────────────────────────────
@@ -107,10 +108,11 @@ class TrainConfig:
     plateau_threshold: float = 0.005
 
     # ── Training schedule ─────────────────────────────────────────────────
-
+    num_workers: int = 0             # 0 = auto-scale basé sur os.cpu_count() (jusqu'à 64)
     num_total_steps: int = 500_000
     self_play_interval: int = 100    # global steps between self-play batches
     games_per_self_play: int = 8
+
     # Safety bound for a single engine episode.  A normal game is far shorter;
     # this prevents a non-progressing engine/action loop from stalling training.
     max_game_steps: int = 2_000
@@ -138,13 +140,24 @@ class TrainConfig:
     deck_loss_weight: float = 0.1
     consistency_loss_weight: float = 2.0
 
+    # ── Reward Shaping ────────────────────────────────────────────────────
+    enable_reward_shaping: bool = True
+    prize_reward: float = 1.0 / 12.0     # ~ +0.0833 par prize prise (+0.50 pour 6 prizes)
+    prize_penalty: float = 1.0 / 12.0    # ~ -0.0833 par prize concédée (-0.50 pour 6 prizes)
+    win_reward: float = 1.0              # Récompense terminale en cas de victoire
+    loss_penalty: float = 1.0            # Pénalité terminale en cas de défaite
+    deck_out_penalty: float = 0.1        # Malus additionnel si défaite par épuisement du deck
+
     # ── Hot-fix Reset & Dégel Progressif de h(s) ──────────────────────────
     hot_fix: bool = False                 # Active le reset chirurgical complet (f, g, Adam, fresh buffer)
     reset_policy_head: bool = False       # Réinitialise uniquement la tête de prédiction f (policy + value)
-    reset_dynamics_head: bool = False     # Réinitialise la tête de dynamique g (transitions + 50D action emb)
+    reset_value_head: bool = False        # Réinit. chirurgicale de v_dense + rdet_fc2 UNIQUEMENT
+    reset_dynamics_head: bool = False    # Réinitialise la tête de dynamique g (transitions + 50D action emb)
     fresh_buffer: bool = False            # Démarre avec un buffer vide (ignore les anciennes parties passives)
     freeze_representation_steps: int = 2000  # Nombre de steps avec h(s) gelé à 100% (gradient scale 0.0)
     unfreeze_ramp_steps: int = 5000          # Steps de transition pour dégel progressif (gradient scale 0.0 -> 1.0)
+    resume_step: Optional[int] = None        # Étape précise à charger (HF ou local)
+    resume_ckpt: Optional[str] = None        # Chemin précis d'un checkpoint à charger
 
     # ── Deck builder ──────────────────────────────────────────────────────
     # AUDIT §2.4 — tant que la self-play utilise DEFAULT_COMPETITIVE_DECK (deck
@@ -183,7 +196,9 @@ class WandBConfig:
 @dataclass
 class InfraConfig:
     num_devices: int = 2         # dual-GPU via jax.pmap
+    num_learner_devices: int = 0 # 0 = auto 50/50 (ex: 4 learners / 4 actors sur 8 TPUs)
     seed: int = 42
+
     card_csv: str = "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv"
     # Deck de référence du sample_submission (garanti valide par le moteur)
     # Utilisé pour détecter les cartes Ace Spec et amorcer le replay buffer.

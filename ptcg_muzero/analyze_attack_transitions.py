@@ -93,7 +93,7 @@ def download_buffer_from_hf(repo_id: str, token: str | None = None, local_dir: s
     from huggingface_hub import hf_hub_download
     
     os.makedirs(local_dir, exist_ok=True)
-    print(f"[*] Téléchargement du buffer depuis HuggingFace Hub ({repo_id})...")
+    print(f"[*] Downloading buffer from HuggingFace Hub ({repo_id})...")
     
     try:
         meta_path = hf_hub_download(
@@ -105,9 +105,9 @@ def download_buffer_from_hf(repo_id: str, token: str | None = None, local_dir: s
         )
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        print(f"    ✓ Métadonnées trouvées : Étape {meta.get('step', '?')} | {meta.get('size', '?')}/{meta.get('max_size', '?')} entrées ({meta.get('fill_percentage', '?')}%) | Date: {meta.get('iso_date', '?')}")
+        print(f"    ✓ Metadata found: Step {meta.get('step', '?')} | {meta.get('size', '?')}/{meta.get('max_size', '?')} entries ({meta.get('fill_percentage', '?')}%) | Date: {meta.get('iso_date', '?')}")
     except Exception as e:
-        print(f"    (i) buffer_meta.json non trouvé ou inaccessible : {e}")
+        print(f"    (i) buffer_meta.json not found or inaccessible: {e}")
 
     pkl_path = hf_hub_download(
         repo_id=repo_id,
@@ -116,7 +116,7 @@ def download_buffer_from_hf(repo_id: str, token: str | None = None, local_dir: s
         local_dir=local_dir,
         local_dir_use_symlinks=False,
     )
-    print(f"    ✓ Replay buffer téléchargé avec succès : {pkl_path} ({os.path.getsize(pkl_path) / (1024*1024):.1f} MB)")
+    print(f"    ✓ Replay buffer downloaded successfully: {pkl_path} ({os.path.getsize(pkl_path) / (1024*1024):.1f} MB)")
     return Path(pkl_path)
 
 
@@ -129,7 +129,7 @@ def load_card_database():
             if Path(path_cand).exists():
                 csf = CardStaticFeatures(path_cand)
                 cards_info = csf._cards
-                print(f"[*] Base de cartes chargée ({len(cards_info)} cartes via CardStaticFeatures)")
+                print(f"[*] Card database loaded ({len(cards_info)} cards via CardStaticFeatures)")
                 return cards_info
     except Exception:
         pass
@@ -159,7 +159,7 @@ def load_card_database():
                                     "stage": stage,
                                     "is_ace": "ace spec" in row.get("Rule", "").lower() or stage.lower() == "ace spec",
                                 }
-                print(f"[*] Base de cartes chargée ({len(cards_info)} cartes depuis {p})")
+                print(f"[*] Card database loaded ({len(cards_info)} cards from {p})")
                 return cards_info
             except Exception:
                 pass
@@ -274,11 +274,11 @@ def reconstruct_episodes(entries):
 
 def analyze_buffer(pkl_path: Path, cards_info: dict):
     print(f"\n" + "="*80)
-    print(f" DIAGNOSTIC DES TRANSITIONS DANS LE REPLAY BUFFER")
-    print(f" Fichier : {pkl_path}")
+    print(f" REPLAY BUFFER TRANSITIONS DIAGNOSTIC")
+    print(f" File: {pkl_path}")
     print(f"="*80)
 
-    print("[*] Désérialisation du buffer...")
+    print("[*] Deserializing buffer...")
     with open(pkl_path, "rb") as f:
         data = pickle.load(f)
 
@@ -287,15 +287,15 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
     buf_size = data.get("size", total_entries)
     step = data.get("step", 0)
 
-    print(f"[*] Total entrées dans le snapshot : {total_entries} (taille déclarée: {buf_size}, step: {step})")
+    print(f"[*] Total entries in snapshot: {total_entries} (declared size: {buf_size}, step: {step})")
 
     if total_entries == 0:
-        print("[!] Le buffer est vide. Aucune transition à analyser.")
+        print("[!] Buffer is empty. No transitions to analyze.")
         return
 
-    print("[*] Reconstitution des trajectoires complètes d'épisodes...")
+    print("[*] Reconstructing full episode trajectories...")
     episodes = reconstruct_episodes(entries)
-    print(f"[*] {len(episodes)} épisodes identifiés (longueur moyenne : {total_entries/max(1, len(episodes)):.1f} transitions/partie)\n")
+    print(f"[*] {len(episodes)} episodes identified (mean length: {total_entries/max(1, len(episodes)):.1f} transitions/game)\n")
 
     # Conteneurs globaux
     action_type_counts = Counter()
@@ -489,14 +489,14 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
     # 1. VUE D'ENSEMBLE DES ACTIONS
     # =========================================================================
     print("┌" + "─"*78 + "┐")
-    print("│ 1. DISTRIBUTION GLOBALE DES ACTIONS DANS LE BUFFER                          │")
+    print("│ 1. GLOBAL ACTION DISTRIBUTION IN BUFFER                              │")
     print("├" + "─"*78 + "┤")
     print(f"│ {'Action Type':<16} │ {'Count':>8} │ {'Pct (%)':>8} │ {'Mean Reward':>12} │ {'Mean Target Val (z0)':>22} │")
     print("├" + "─"*78 + "┤")
     for act_name, count in action_type_counts.most_common():
-        pct = 100.0 * count / total_entries
-        mean_r = np.mean(action_type_rewards[act_name])
-        mean_z = np.mean(action_type_values[act_name])
+        pct = 100.0 * count / max(1, total_entries)
+        mean_r = np.mean(action_type_rewards[act_name]) if action_type_rewards[act_name] else 0.0
+        mean_z = np.mean(action_type_values_z0[act_name]) if action_type_values_z0[act_name] else 0.0
         print(f"│ {act_name:<16} │ {count:>8d} │ {pct:>7.2f}% │ {mean_r:>12.4f} │ {mean_z:>22.4f} │")
     print("└" + "─"*78 + "┘\n")
 
@@ -505,22 +505,22 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
     # =========================================================================
     n_attacks = len(attack_rewards)
     print("┌" + "─"*78 + "┐")
-    print(f"│ 2. ANALYSE DÉTAILLÉE DES TRANSITIONS 'ATTACK' (N = {n_attacks:<6d})                │")
+    print(f"│ 2. DETAILED ANALYSIS OF 'ATTACK' TRANSITIONS (N = {n_attacks:<6d})                │")
     print("├" + "─"*78 + "┤")
 
     if n_attacks == 0:
-        print("│ [!] AUCUNE transition 'ATTACK' trouvée dans ce buffer.                      │")
+        print("│ [!] NO 'ATTACK' transitions found in this buffer.                   │")
         print("└" + "─"*78 + "┘\n")
     else:
         win_count = sum(1 for r in attack_rewards if r > 0.5)
         loss_count = sum(1 for r in attack_rewards if r < -0.5)
-        zero_count = sum(1 for r in attack_rewards if abs(r) <= 0.5)
+        zero_count = n_attacks - win_count - loss_count
         
-        print(f"│ -- Récompenses Immédiates (r_t lors de l'attaque) :                         │")
-        print(f"│    • Victoires immédiates (+1.0) : {win_count:>6d} ({100.0 * win_count / n_attacks:5.1f}%)                                  │")
-        print(f"│    • Non-terminal / neutre ( 0.0) : {zero_count:>6d} ({100.0 * zero_count / n_attacks:5.1f}%)                                  │")
-        print(f"│    • Défaites immédiates  (-1.0) : {loss_count:>6d} ({100.0 * loss_count / n_attacks:5.1f}%)                                  │")
-        print(f"│    • Moyenne de r_t               : {np.mean(attack_rewards):>+7.4f} (min: {np.min(attack_rewards):+0.2f}, max: {np.max(attack_rewards):+0.2f})                 │")
+        print(f"│ -- Immediate Rewards (r_t during attack):                           │")
+        print(f"│    • Immediate Wins (+1.0) : {win_count:>6d} ({100.0 * win_count / n_attacks:5.1f}%)                                  │")
+        print(f"│    • Non-terminal / neutral ( 0.0) : {zero_count:>6d} ({100.0 * zero_count / n_attacks:5.1f}%)                                  │")
+        print(f"│    • Immediate Losses (-1.0) : {loss_count:>6d} ({100.0 * loss_count / n_attacks:5.1f}%)                                  │")
+        print(f"│    • Mean r_t               : {np.mean(attack_rewards):>+7.4f} (min: {np.min(attack_rewards):+0.2f}, max: {np.max(attack_rewards):+0.2f})                 │")
         print("├" + "─"*78 + "┤")
 
         z0_stats = format_stats(attack_values_z0)
@@ -528,29 +528,29 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
         dz_stats = format_stats(attack_delta_z)
         pol_stats = format_stats(attack_mcts_pols)
 
-        print(f"│ -- Estimations de Valeur Cible (Target Return z) :                          │")
-        print(f"│    • z_0 (Return à l'état racine avant attaque) :                           │")
+        print(f"│ -- Target Value Estimations (Target Return z):                      │")
+        print(f"│    • z_0 (Return at root state before attack):                              │")
         print(f"│        Mean: {z0_stats['mean']:>+6.3f} | Std: {z0_stats['std']:>5.3f} | Median: {z0_stats['median']:>+6.3f} | [P25: {z0_stats['p25']:>+6.3f}, P75: {z0_stats['p75']:>+6.3f}] │")
         print(f"│        Min:  {z0_stats['min']:>+6.3f} | Max: {z0_stats['max']:>+6.3f}                                           │")
-        print(f"│    • z_1 (Return à l'état suivant après attaque) :                          │")
+        print(f"│    • z_1 (Return at next state after attack):                               │")
         print(f"│        Mean: {z1_stats['mean']:>+6.3f} | Std: {z1_stats['std']:>5.3f} | Median: {z1_stats['median']:>+6.3f} | [P25: {z1_stats['p25']:>+6.3f}, P75: {z1_stats['p75']:>+6.3f}] │")
-        print(f"│    • Δz = (z_1 - z_0) (Évolution de valeur post-attaque) :                  │")
+        print(f"│    • Δz = (z_1 - z_0) (Value evolution post-attack):                        │")
         print(f"│        Mean: {dz_stats['mean']:>+6.3f} | Std: {dz_stats['std']:>5.3f} | Median: {dz_stats['median']:>+6.3f}                        │")
-        print(f"│    • % d'attaques menant à une valeur positive (z_0 > 0) : {100.0 * sum(1 for z in attack_values_z0 if z > 0) / n_attacks:5.1f}%             │")
+        print(f"│    • % attacks leading to positive value (z_0 > 0): {100.0 * sum(1 for z in attack_values_z0 if z > 0) / n_attacks:5.1f}%             │")
         print("├" + "─"*78 + "┤")
-        print(f"│ -- Confiance MCTS sur les Attaques Jouées (π(a)) :                          │")
-        print(f"│    • Proba MCTS moyenne : {pol_stats['mean']:>6.3f} (Median: {pol_stats['median']:>6.3f}, Min: {pol_stats['min']:>6.3f}, Max: {pol_stats['max']:>6.3f}) │")
+        print(f"│ -- MCTS Confidence on Attacks Played (π(a)):                               │")
+        print(f"│    • Mean MCTS Proba: {pol_stats['mean']:>6.3f} (Median: {pol_stats['median']:>6.3f}, Min: {pol_stats['min']:>6.3f}, Max: {pol_stats['max']:>6.3f}) │")
         print("├" + "─"*78 + "┤")
-        print(f"│ -- Opportunités d'Attaque (États où l'attaque était possible) :             │")
-        print(f"│    • Total états avec attaque légale : {states_with_attack_legal:>6d} ({100.0*states_with_attack_legal/max(1, total_entries):5.1f}% du buffer)                │")
+        print(f"│ -- Attack Opportunities (States where attack was legal):                 │")
+        print(f"│    • Total states with legal attack: {states_with_attack_legal:>6d} ({100.0*states_with_attack_legal/max(1, total_entries):5.1f}% of buffer)                │")
         for act_name, count in actions_chosen_when_attack_legal.most_common():
             pct = 100.0 * count / max(1, states_with_attack_legal)
-            print(f"│      - {act_name:<14} : {count:>6d} fois ({pct:5.1f}%)                                    │")
+            print(f"│      - {act_name:<14} : {count:>6d} times ({pct:5.1f}%)                                    │")
         if len(values_when_attack_chosen) > 0 and len(values_when_attack_skipped) > 0:
-            print(f"│    • Return moyen z_0 quand attaque CHOISIE : {np.mean(values_when_attack_chosen):>+6.3f} (Median: {np.median(values_when_attack_chosen):>+6.3f})      │")
-            print(f"│    • Return moyen z_0 quand attaque IGNORÉE : {np.mean(values_when_attack_skipped):>+6.3f} (Median: {np.median(values_when_attack_skipped):>+6.3f})      │")
+            print(f"│    • Mean Return z_0 when attack CHOSEN: {np.mean(values_when_attack_chosen):>+6.3f} (Median: {np.median(values_when_attack_chosen):>+6.3f})      │")
+            print(f"│    • Mean Return z_0 when attack SKIPPED: {np.mean(values_when_attack_skipped):>+6.3f} (Median: {np.median(values_when_attack_skipped):>+6.3f})      │")
             if len(mcts_prob_on_attack_when_skipped) > 0:
-                print(f"│    • Proba MCTS mise sur l'attaque quand ignorée : {np.mean(mcts_prob_on_attack_when_skipped):>6.3f}                   │")
+                print(f"│    • MCTS Proba placed on attack when skipped: {np.mean(mcts_prob_on_attack_when_skipped):>6.3f}                   │")
         print("└" + "─"*78 + "┘\n")
 
     # =========================================================================
@@ -560,15 +560,15 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
     total_raw_attaches = action_type_counts.get("ATTACH", 0)
     
     print("┌" + "─"*78 + "┐")
-    print(f"│ 3. ANALYSE DES ATTACHEMENTS DE VRAIES ÉNERGIES (N = {n_true_attaches:<6d})                │")
+    print(f"│ 3. ANALYSIS OF TRUE ENERGY ATTACHMENTS (N = {n_true_attaches:<6d})                │")
     print("├" + "─"*78 + "┤")
-    print(f"│ • Total actions ATTACH brutes dans le buffer : {total_raw_attaches:>6d}                               │")
-    print(f"│   - Vraies cartes Énergie (Basic / Special)  : {n_true_attaches:>6d} ({100.0 * n_true_attaches / max(1, total_raw_attaches):5.1f}%)                            │")
-    print(f"│   - Outils / TMs attachés (exclus)           : {tool_attach_count:>6d} ({100.0 * tool_attach_count / max(1, total_raw_attaches):5.1f}%)                            │")
+    print(f"│ • Total raw ATTACH actions in buffer: {total_raw_attaches:>6d}                               │")
+    print(f"│   - True Energy cards (Basic / Special) : {n_true_attaches:>6d} ({100.0 * n_true_attaches / max(1, total_raw_attaches):5.1f}%)                            │")
+    print(f"│   - Tools / TMs attached (excluded)     : {tool_attach_count:>6d} ({100.0 * tool_attach_count / max(1, total_raw_attaches):5.1f}%)                            │")
     print("├" + "─"*78 + "┤")
 
     if n_true_attaches == 0:
-        print("│ [!] AUCUN attachement de vraie énergie trouvé dans ce buffer.               │")
+        print("│ [!] NO true energy attachment found in this buffer.                 │")
         print("└" + "─"*78 + "┘\n")
     else:
         # Taux de conversion en attaque sur tout l'épisode vs unroll
@@ -576,13 +576,13 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
         pct_episode = 100.0 * true_energy_attack_in_episode_count / n_true_attaches
         delay_stats = format_stats(true_energy_steps_to_first_attack)
 
-        print(f"│ -- Synergie Énergie → Attaque (HORIZON COURT VS ÉPISODE ENTIER) :           │")
-        print(f"│    • Attachements suivis d'une Attaque dans la fenêtre unroll (5 steps) :   │")
+        print(f"│ -- Energy → Attack Synergy (SHORT HORIZON VS ENTIRE EPISODE):              │")
+        print(f"│    • Attachments followed by Attack in unroll window (5 steps):             │")
         print(f"│        → {true_energy_attack_in_unroll_count:>6d} / {n_true_attaches:>6d} ({pct_unroll:5.1f}%)                                          │")
-        print(f"│    • Attachements suivis d'une Attaque sur TOUT L'ÉPISODE (Jusqu'à la fin) :│")
+        print(f"│    • Attachments followed by Attack over ENTIRE EPISODE (until game end):   │")
         print(f"│        → {true_energy_attack_in_episode_count:>6d} / {n_true_attaches:>6d} ({pct_episode:5.1f}%)                                          │")
         if len(true_energy_steps_to_first_attack) > 0:
-            print(f"│    • Délai moyen avant la première attaque : {delay_stats['mean']:>5.2f} steps (Median: {delay_stats['median']:>4.1f}, Min: {delay_stats['min']:>2.0f}, Max: {delay_stats['max']:>2.0f})│")
+            print(f"│    • Mean delay before first attack: {delay_stats['mean']:>5.2f} steps (Median: {delay_stats['median']:>4.1f}, Min: {delay_stats['min']:>2.0f}, Max: {delay_stats['max']:>2.0f})│")
         print("├" + "─"*78 + "┤")
 
         # Estimations de Valeur Cible
@@ -591,30 +591,30 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
         dz_att = format_stats(true_energy_attach_delta_z)
         pol_att = format_stats(true_energy_attach_mcts_pols)
 
-        print(f"│ -- Estimations de Valeur Cible (Target Return z) :                          │")
-        print(f"│    • z_0 (Return avant attachement) :                                       │")
+        print(f"│ -- Target Value Estimations (Target Return z):                          │")
+        print(f"│    • z_0 (Return before attachment):                                        │")
         print(f"│        Mean: {z0_att['mean']:>+6.3f} | Std: {z0_att['std']:>5.3f} | Median: {z0_att['median']:>+6.3f} | [P25: {z0_att['p25']:>+6.3f}, P75: {z0_att['p75']:>+6.3f}] │")
-        print(f"│    • z_1 (Return après attachement) :                                       │")
+        print(f"│    • z_1 (Return after attachment):                                         │")
         print(f"│        Mean: {z1_att['mean']:>+6.3f} | Std: {z1_att['std']:>5.3f} | Median: {z1_att['median']:>+6.3f} | [P25: {z1_att['p25']:>+6.3f}, P75: {z1_att['p75']:>+6.3f}] │")
-        print(f"│    • Δz = (z_1 - z_0) (Évolution de valeur post-attachement) :              │")
+        print(f"│    • Δz = (z_1 - z_0) (Value evolution post-attachment):                   │")
         print(f"│        Mean: {dz_att['mean']:>+6.3f} | Std: {dz_att['std']:>5.3f} | Median: {dz_att['median']:>+6.3f}                        │")
-        print(f"│    • % d'attachements avec z_0 > 0 : {100.0 * sum(1 for z in true_energy_attach_values_z0 if z > 0) / n_true_attaches:5.1f}%                                     │")
-        print(f"│    • Issue finale des parties avec attachement d'énergie :                  │")
-        print(f"│        Victoires: {true_energy_final_outcome_wins:>5d} ({100.0*true_energy_final_outcome_wins/n_true_attaches:5.1f}%) | Défaites: {true_energy_final_outcome_losses:>5d} ({100.0*true_energy_final_outcome_losses/n_true_attaches:5.1f}%)                 │")
+        print(f"│    • % attachments with z_0 > 0: {100.0 * sum(1 for z in true_energy_attach_values_z0 if z > 0) / n_true_attaches:5.1f}%                                     │")
+        print(f"│    • Final outcome of games with energy attachment:                         │")
+        print(f"│        Wins: {true_energy_final_outcome_wins:>5d} ({100.0*true_energy_final_outcome_wins/n_true_attaches:5.1f}%) | Losses: {true_energy_final_outcome_losses:>5d} ({100.0*true_energy_final_outcome_losses/n_true_attaches:5.1f}%)                 │")
         print("├" + "─"*78 + "┤")
-        print(f"│ -- Confiance MCTS sur les Énergies Attachées (π(a)) :                       │")
-        print(f"│    • Proba MCTS moyenne : {pol_att['mean']:>6.3f} (Median: {pol_att['median']:>6.3f}, Min: {pol_att['min']:>6.3f}, Max: {pol_att['max']:>6.3f}) │")
+        print(f"│ -- MCTS Confidence on Attached Energies (π(a)):                           │")
+        print(f"│    • Mean MCTS Proba: {pol_att['mean']:>6.3f} (Median: {pol_att['median']:>6.3f}, Min: {pol_att['min']:>6.3f}, Max: {pol_att['max']:>6.3f}) │")
         print("├" + "─"*78 + "┤")
-        print(f"│ -- Opportunités d'Attachement de Vraie Énergie :                            │")
-        print(f"│    • Total états avec énergie légale : {states_with_true_energy_legal:>6d} ({100.0*states_with_true_energy_legal/max(1, total_entries):5.1f}% du buffer)             │")
+        print(f"│ -- True Energy Attachment Opportunities:                                   │")
+        print(f"│    • Total states with legal energy: {states_with_true_energy_legal:>6d} ({100.0*states_with_true_energy_legal/max(1, total_entries):5.1f}% of buffer)             │")
         for act_name, count in actions_chosen_when_true_energy_legal.most_common():
             pct = 100.0 * count / max(1, states_with_true_energy_legal)
-            print(f"│      - {act_name:<14} : {count:>6d} fois ({pct:5.1f}%)                                    │")
+            print(f"│      - {act_name:<14} : {count:>6d} times ({pct:5.1f}%)                                    │")
         if len(values_when_true_energy_chosen) > 0 and len(values_when_true_energy_skipped) > 0:
-            print(f"│    • Return moyen z_0 quand énergie ATTACHÉE : {np.mean(values_when_true_energy_chosen):>+6.3f} (Median: {np.median(values_when_true_energy_chosen):>+6.3f})    │")
-            print(f"│    • Return moyen z_0 quand énergie IGNORÉE  : {np.mean(values_when_true_energy_skipped):>+6.3f} (Median: {np.median(values_when_true_energy_skipped):>+6.3f})    │")
+            print(f"│    • Mean Return z_0 when energy ATTACHED: {np.mean(values_when_true_energy_chosen):>+6.3f} (Median: {np.median(values_when_true_energy_chosen):>+6.3f})    │")
+            print(f"│    • Mean Return z_0 when energy SKIPPED : {np.mean(values_when_true_energy_skipped):>+6.3f} (Median: {np.median(values_when_true_energy_skipped):>+6.3f})    │")
             if len(mcts_prob_on_true_energy_when_skipped) > 0:
-                print(f"│    • Proba MCTS mise sur l'énergie quand ignorée : {np.mean(mcts_prob_on_true_energy_when_skipped):>6.3f}                   │")
+                print(f"│    • MCTS Proba placed on energy when skipped: {np.mean(mcts_prob_on_true_energy_when_skipped):>6.3f}                   │")
         print("└" + "─"*78 + "┘\n")
 
     # =========================================================================
@@ -622,9 +622,9 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
     # =========================================================================
     if attack_transitions:
         print("┌" + "─"*78 + "┐")
-        print("│ 4. ÉCHANTILLONS DE TRANSITIONS 'ATTACK' ENREGISTRÉES                        │")
+        print("│ 4. RECORDED 'ATTACK' TRANSITION SAMPLES                                     │")
         print("├" + "─"*78 + "┤")
-        print(f"│ {'Idx':>6} │ {'Carte / Pokémon':<20} │ {'Reward r0':>9} │ {'z0 (Val)':>8} │ {'z1 (Next)':>9} │ {'π(MCTS)':>7} │")
+        print(f"│ {'Idx':>6} │ {'Card / Pokémon':<20} │ {'Reward r0':>9} │ {'z0 (Val)':>8} │ {'z1 (Next)':>9} │ {'π(MCTS)':>7} │")
         print("├" + "─"*78 + "┤")
         sample_indices = np.linspace(0, len(attack_transitions) - 1, min(10, len(attack_transitions)), dtype=int)
         for s_i in sample_indices:
@@ -635,29 +635,29 @@ def analyze_buffer(pkl_path: Path, cards_info: dict):
 
     if true_energy_attach_transitions:
         print("┌" + "─"*78 + "┐")
-        print("│ 5. ÉCHANTILLONS D'ATTACHEMENTS D'ÉNERGIE (SUIVI ÉPISODE ENTIER)            │")
+        print("│ 5. ENERGY ATTACHMENT SAMPLES (FULL EPISODE TRACKING)                        │")
         print("├" + "─"*78 + "┤")
-        print(f"│ {'Idx':>6} │ {'Énergie':<16} │ {'Attaque Épisode':<18} │ {'z0 (Val)':>8} │ {'z1 (Next)':>9} │ {'π(MCTS)':>7} │")
+        print(f"│ {'Idx':>6} │ {'Energy':<16} │ {'Episode Attack':<18} │ {'z0 (Val)':>8} │ {'z1 (Next)':>9} │ {'π(MCTS)':>7} │")
         print("├" + "─"*78 + "┤")
         sample_indices = np.linspace(0, len(true_energy_attach_transitions) - 1, min(10, len(true_energy_attach_transitions)), dtype=int)
         for s_i in sample_indices:
             t = true_energy_attach_transitions[s_i]
             e_name = str(t['card_name'])[:16]
             if t['attack_in_episode']:
-                att_status = f"OUI (+{t['steps_to_att']} steps)"
+                att_status = f"YES (+{t['steps_to_att']} steps)"
             else:
-                att_status = "NON (0 att.)"
+                att_status = "NO (0 att.)"
             print(f"│ {t['entry_idx']:>6d} │ {e_name:<16} │ {att_status:<18} │ {t['z0']:>+8.3f} │ {t['z1']:>+9.3f} │ {t['mcts_prob']:>7.3f} │")
         print("└" + "─"*78 + "┘\n")
 
-    print("[✓] Diagnostic complet terminé.")
+    print("[✓] Full diagnostic completed.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyse des transitions Attack et Attach dans le Replay Buffer MuZero")
-    parser.add_argument("--repo-id", type=str, default="richard151111/muzero-V2", help="Repo HuggingFace (ex: richard151111/muzero-V2)")
-    parser.add_argument("--local-path", type=str, default="", help="Chemin vers un replay_buffer.pkl local (si déjà téléchargé)")
-    parser.add_argument("--token", type=str, default="", help="Token HuggingFace (ou via export HF_TOKEN=...)")
+    parser = argparse.ArgumentParser(description="Analyze Attack and Attach transitions in the MuZero Replay Buffer")
+    parser.add_argument("--repo-id", type=str, default="richard151111/muzero-V2", help="HuggingFace repository (e.g. richard151111/muzero-V2)")
+    parser.add_argument("--local-path", type=str, default="", help="Path to a local replay_buffer.pkl (if already downloaded)")
+    parser.add_argument("--token", type=str, default="", help="HuggingFace token (or via export HF_TOKEN=...)")
     args = parser.parse_args()
 
     token = args.token or os.environ.get("HF_TOKEN") or None

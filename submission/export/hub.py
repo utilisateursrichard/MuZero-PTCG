@@ -109,9 +109,9 @@ def verify_hf_token(token: str | None) -> bool:
     except Exception as e:
         err_str = str(e).lower()
         if "401" in err_str or "unauthorized" in err_str or "invalid" in err_str or "token" in err_str:
-            logger.error("Token HF invalide ou rejeté par l'API Hugging Face : %s", e)
+            logger.error("Invalid HF token or rejected by Hugging Face API: %s", e)
             return False
-        logger.warning("Validation du token HF impossible auprès du serveur (erreur réseau ou serveur) : %s", e)
+        logger.warning("Could not validate HF token with server (network or server error): %s", e)
         return True
 
 
@@ -143,14 +143,14 @@ def get_hf_token(
             if not token and env_var != "HF_TOKEN":
                 token = user_secrets.get_secret("HF_TOKEN")
             if token:
-                logger.info("Token HF récupéré depuis Kaggle Secrets.")
+                logger.info("HF token retrieved from Kaggle Secrets.")
         except Exception:
             pass
 
     if not token or not token.strip():
         if should_require:
             logger.error(
-                "ERREUR FATALE : Token Hugging Face inconnu (variable '%s', HF_TOKEN ou Secret Kaggle absent). Interruption du script.",
+                "FATAL ERROR: Unknown Hugging Face token (variable '%s', HF_TOKEN, or Kaggle Secret missing). Aborting script.",
                 env_var,
             )
             sys.exit(1)
@@ -160,7 +160,7 @@ def get_hf_token(
     if not verify_hf_token(token):
         if should_require:
             logger.error(
-                "ERREUR FATALE : Token Hugging Face invalide/inconnu (variable '%s' ou HF_TOKEN rejeté). Interruption du script.",
+                "FATAL ERROR: Invalid/unknown Hugging Face token (variable '%s' or HF_TOKEN rejected). Aborting script.",
                 env_var,
             )
             sys.exit(1)
@@ -191,15 +191,15 @@ def push_to_hub(
         from huggingface_hub import HfApi, create_repo
     except ImportError:
         logger.warning(
-            "huggingface_hub non installé — push désactivé. "
-            "Lancez : pip install huggingface_hub"
+            "huggingface_hub not installed — push disabled. "
+            "Run: pip install huggingface_hub"
         )
         return False
 
     token = get_hf_token(cfg)
     if not token:
         logger.warning(
-            "HF_TOKEN absent (variable '%s' ou Secret Kaggle absent) — push ignoré.",
+            "HF_TOKEN missing (variable '%s' or Kaggle Secret missing) — push skipped.",
             cfg.hf.token_env_var,
         )
         return False
@@ -285,14 +285,14 @@ def load_from_hub(
         from huggingface_hub import hf_hub_download
         from safetensors.numpy import load_file
     except ImportError:
-        logger.warning("Installez huggingface_hub et safetensors pour le téléchargement Hub.")
+        logger.warning("Install huggingface_hub and safetensors for Hub downloads.")
         return None, None, cfg or Config(), 0
 
     if not token:
         token = get_hf_token(cfg, required=cfg.hf.enabled if cfg else True)
     else:
         if not verify_hf_token(token):
-            logger.error("ERREUR FATALE : Le token Hugging Face fourni est invalide/inconnu. Interruption du script.")
+            logger.error("FATAL ERROR: Provided Hugging Face token is invalid/unknown. Aborting script.")
             sys.exit(1)
 
     try:
@@ -338,14 +338,17 @@ def load_from_hub(
             step_val,
         )
     except Exception as exc:
-        logger.warning("[hf-hub] Impossible de télécharger le checkpoint depuis HF Hub (%s): %s", repo_id, exc)
+        logger.warning("[hf-hub] Failed to download checkpoint from HF Hub (%s): %s", repo_id, exc)
         return None, None, cfg or Config(), 0
 
 
 def _unflatten_params(flat: Dict[str, np.ndarray]) -> dict:
-    """Inverse de _flatten_params : dict plat → pytree."""
+    """Inverse de _flatten_params : dict plat → pytree avec adaptation rétro-compatible."""
     nested: dict = {}
     for key, val in flat.items():
+        if "option_proj" in key and key.endswith("kernel") and getattr(val, "ndim", 0) == 2 and val.shape[0] < 162:
+            pad_rows = 162 - val.shape[0]
+            val = np.pad(val, ((0, pad_rows), (0, 0)), mode="constant", constant_values=0.0)
         parts = key.split("/")
         d = nested
         for p in parts[:-1]:
@@ -455,7 +458,7 @@ def push_buffer_to_hub_async(
 
             token = get_hf_token(cfg)
             if not token:
-                logger.warning("[hf-buffer] Pas de token HF — upload buffer ignoré.")
+                logger.warning("[hf-buffer] No HF token — buffer upload skipped.")
                 return
 
             api = HfApi(token=token)
@@ -487,7 +490,7 @@ def push_buffer_to_hub_async(
                 token=token,
             )
             logger.info(
-                "✓ Replay buffer pushed to HF Hub  repo=%s  step=%d  entries=%d/%d (%.1f%% rempli)",
+                "✓ Replay buffer pushed to HF Hub  repo=%s  step=%d  entries=%d/%d (%.1f%% full)",
                 cfg.hf.repo_id, step, buf_size, max_size, fill_pct,
             )
         except Exception as exc:
@@ -515,14 +518,14 @@ def load_buffer_from_hub(
         from huggingface_hub import hf_hub_download
         from training.replay_buffer import PrioritizedReplayBuffer
     except ImportError:
-        logger.warning("[hf-buffer] huggingface_hub / PrioritizedReplayBuffer non disponible.")
+        logger.warning("[hf-buffer] huggingface_hub / PrioritizedReplayBuffer not available.")
         return None, {}
 
     if not token:
         token = get_hf_token(cfg, required=cfg.hf.enabled if cfg else True)
     else:
         if not verify_hf_token(token):
-            logger.error("ERREUR FATALE : Le token Hugging Face fourni est invalide/inconnu. Interruption du script.")
+            logger.error("FATAL ERROR: Provided Hugging Face token is invalid/unknown. Aborting script.")
             sys.exit(1)
 
     meta = {}
@@ -531,11 +534,11 @@ def load_buffer_from_hub(
         meta_file = hf_hub_download(repo_id=repo_id, filename="buffer_meta.json", token=token)
         meta = json.loads(Path(meta_file).read_text(encoding="utf-8"))
         logger.info(
-            "[hf-buffer] Métadonnées buffer trouvées sur HF Hub : étape %s, %s/%s entrées (%s%% rempli)",
+            "[hf-buffer] Buffer metadata found on HF Hub: step %s, %s/%s entries (%s%% full)",
             meta.get("step", "?"), meta.get("size", "?"), meta.get("max_size", "?"), meta.get("fill_percentage", "?")
         )
     except Exception as e:
-        logger.debug("[hf-buffer] buffer_meta.json absent sur HF Hub : %s", e)
+        logger.debug("[hf-buffer] buffer_meta.json not found on HF Hub: %s", e)
 
     # Télécharger le fichier pickle replay_buffer.pkl
     try:
@@ -552,11 +555,11 @@ def load_buffer_from_hub(
         meta.setdefault("fill_percentage", fill_pct)
 
         logger.info(
-            "=== Replay Buffer restauré depuis HF Hub (%s) : %d/%d entrées (%.1f%% rempli, étape %d) ===",
+            "=== Replay Buffer restored from HF Hub (%s): %d/%d entries (%.1f%% full, step %d) ===",
             repo_id, size_val, max_size_val, fill_pct, step_val
         )
         return buf, meta
     except Exception as e:
-        logger.info("[hf-buffer] Échec du chargement du buffer depuis HF Hub (%s) : %s", repo_id, e)
+        logger.info("[hf-buffer] Failed to load buffer from HF Hub (%s): %s", repo_id, e)
         return None, meta
 

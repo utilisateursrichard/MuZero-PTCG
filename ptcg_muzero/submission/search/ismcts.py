@@ -666,7 +666,19 @@ def ismcts_action_batched(
     sc = cfg.search
     mc = cfg.model
 
-    option_masks_jnp = jnp.array(option_masks_np)
+    # Aligner tous les tenseurs sur le même device matériel que `params`
+    target_dev = None
+    if isinstance(params, dict):
+        first_val = next((v for v in params.values() if hasattr(v, "devices")), None)
+        if first_val and hasattr(first_val, "devices") and first_val.devices():
+            target_dev = list(first_val.devices())[0]
+
+    if target_dev:
+        option_masks_jnp = jax.device_put(option_masks_np, target_dev)
+        rng = jax.device_put(rng, target_dev)
+    else:
+        option_masks_jnp = jnp.array(option_masks_np)
+
     eps = float(sc.dirichlet_epsilon if dirichlet_epsilon is None else dirichlet_epsilon)
     alp = float(sc.dirichlet_alpha if dirichlet_alpha is None else dirichlet_alpha)
 
@@ -687,4 +699,5 @@ def ismcts_action_batched(
     )
 
     return np.array(best_actions), np.array(avg_policies), np.array(avg_values)
+
 

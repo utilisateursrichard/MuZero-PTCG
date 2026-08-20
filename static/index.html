@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PTCG vs MuZero AI Battle Arena</title>
+<meta name="description" content="Pokémon TCG visualizer and battle arena vs MuZero AI with IREE Vulkan / CPU inference.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>⚔️ PTCG MuZero Arena</h1>
+    <span class="engine-badge" id="engineBadge"><span class="pulse-dot"></span><span id="engineName">IREE Vulkan</span></span>
+  </div>
+
+  <div class="header-meta">
+    <span class="meta"><span data-i18n="turn">Turn</span> <b id="turn">0</b></span>
+    <span class="meta"><span data-i18n="active">Active</span> <b id="active">-</b></span>
+    <span class="meta"><span data-i18n="ctx">Phase</span> <b id="ctx">Setup</b></span>
+  </div>
+
+  <div class="header-actions">
+    <button id="langbtn" title="Toggle card language (EN / JP)">JP</button>
+    <button id="deckbtn" class="btn-primary" title="Choose or generate a deck">🎴 Select Deck</button>
+    <button id="resetbtn" class="btn-danger" title="Reset match">🔄 Restart</button>
+  </div>
+</header>
+
+<div id="wrap">
+  <!-- THE BOARD (LEFT) -->
+  <div class="board">
+    <!-- OPPONENT (P1 - AI) -->
+    <div class="player p1" id="panel1"></div>
+
+    <!-- CENTER ZONE (STADIUM & MUZERO HUD) -->
+    <div class="center-zone">
+      <div class="stadium" id="stadium">
+        <span class="zone-label" data-i18n="stadium">Stadium:</span> <b id="stadiumName">(none)</b>
+      </div>
+
+      <!-- MUZERO HUD -->
+      <div class="ai-hud" id="aiHud">
+        <div class="ai-hud-row">
+          <span class="ai-hud-title">🧠 MuZero Engine</span>
+          <span class="ai-winrate" id="aiWinrate">AI Win Estimate: <strong>50.0%</strong></span>
+        </div>
+        <div class="ai-bar-track">
+          <div class="ai-bar-fill" id="aiBarFill" style="width: 50%;"></div>
+        </div>
+        <div class="ai-intent-row" id="aiIntentRow">
+          <span>Waiting for engine...</span>
+        </div>
+      </div>
+
+      <!-- CONTEXT BANNER -->
+      <div class="context-banner" id="contextBanner">
+        <span class="context-icon">🎯</span>
+        <span class="context-text" id="contextPrompt">Initializing battle...</span>
+      </div>
+    </div>
+
+    <!-- PLAYER (P0 - HUMAN) -->
+    <div class="player p0" id="panel0"></div>
+  </div>
+
+  <!-- SIDEBAR (RIGHT) -->
+  <div class="side">
+    <!-- ACTION CHOICES -->
+    <div class="selbox" id="selboxContainer">
+      <div class="selbox-header">
+        <h3 data-i18n="selectedTitle">⚡ Available Actions</h3>
+        <span class="action-count" id="actionCountBadge">0</span>
+      </div>
+      <div class="actions-list" id="actionsList">
+        <div class="hint">No action required. AI turn or waiting.</div>
+      </div>
+      <div class="multi-select-controls" id="multiSelectControls" style="display: none;">
+        <button id="btnConfirmMulti" class="btn-primary" style="width: 100%; margin-top: 8px;">✅ Confirm Selection</button>
+      </div>
+
+      <!-- STYLIZED THINKING OVERLAY -->
+      <div class="thinking-overlay" id="thinkingOverlay" style="display: none;">
+        <div class="thinking-scan-beam"></div>
+        <div class="thinking-content">
+          <div class="thinking-brain-ring">
+            <span class="thinking-brain-icon">🧠</span>
+          </div>
+          <div class="thinking-text-main">AI is thinking...</div>
+          <div class="thinking-sub-text" id="thinkingSubText">ISMCTS Simulation (50 iterations)</div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- COMBAT LOG -->
+    <div class="logbox">
+      <div class="logbox-header">
+        <h3 data-i18n="logTitle">📜 Battle Log</h3>
+        <button id="btnClearLog" title="Clear log" style="padding: 2px 6px; font-size: 11px;">🗑️</button>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+<!-- HOVER PREVIEW (LARGE FLOATING CARD) -->
+<div id="preview">
+  <div class="pvrow">
+    <div class="pvmain">
+      <img id="pvimg" alt="">
+      <div class="cap" id="pvcap"></div>
+      <div class="pvenergy" id="pvenergy"></div>
+    </div>
+    <div class="pvtools" id="pvtools"></div>
+  </div>
+</div>
+
+<!-- TRASH / DISCARD GRID MODAL -->
+<div id="zoom" class="zoom hide">
+  <div class="zoom-box">
+    <div class="zoom-head">
+      <span id="zoom-title">Discard Pile</span>
+      <button id="zoom-close" data-i18n="close">✕ Close</button>
+    </div>
+    <div class="zoom-grid" id="zoom-grid"></div>
+  </div>
+</div>
+
+<!-- DECK SELECTION MODAL -->
+<div id="deckModal" class="zoom" style="display: none;">
+  <div class="zoom-box deck-modal-box">
+    <div class="zoom-head">
+      <h2>🎴 Match Configuration & Deck Selection</h2>
+      <button id="btnCloseDeckModal">✕</button>
+    </div>
+    <div class="deck-modal-content">
+      <div class="deck-options">
+        <div class="deck-option-card selected" data-deck-id="model_deck">
+          <div class="deck-opt-header">
+            <h4>⚡ Official MuZero Deck</h4>
+            <span class="badge-tag meta-badge">Recommended</span>
+          </div>
+          <p>The standard optimized 60-card deck for the MuZero model.</p>
+        </div>
+
+        <div class="deck-option-card" data-deck-id="ai_generated">
+          <div class="deck-opt-header">
+            <h4>✨ AI Generator (REINFORCE)</h4>
+            <span class="badge-tag ai-badge">Neural Network</span>
+          </div>
+          <p>Directly samples a 60-card deck via <code>DeckBuilderNetwork</code>.</p>
+          <button id="btnTriggerGenerate" class="btn-sm" style="margin-top: 6px;">🎲 Generate New AI Deck</button>
+        </div>
+
+        <div class="deck-option-card" data-deck-id="charizard_pidgeot">
+          <div class="deck-opt-header">
+            <h4>🔥 Charizard ex / Pidgeot</h4>
+            <span class="badge-tag tier1-badge">Tier 1</span>
+          </div>
+          <p>Powerful competitive archetype focused on Fire energy acceleration.</p>
+        </div>
+      </div>
+
+      <!-- Preview -->
+      <div class="deck-preview-area">
+        <div class="deck-prev-header">
+          <strong id="previewTitle">Deck Composition (60 cards)</strong>
+          <div class="deck-stats-pill">
+            <span>Pokémon: <b id="prevPokeCount">0</b></span>
+            <span>Trainers: <b id="prevTrainCount">0</b></span>
+            <span>Energies: <b id="prevNrgCount">0</b></span>
+          </div>
+        </div>
+        <div class="deck-preview-grid" id="deckPreviewGrid"></div>
+      </div>
+
+      <!-- AI Mode & Device Select -->
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 4px;">
+        <div>
+          <label for="aiModeSelect" style="display: block; margin-bottom: 4px; font-weight: 700;">
+            🧠 AI Algorithm / Level:
+          </label>
+          <select id="aiModeSelect" class="styled-select" style="width: 100%;">
+            <option value="basic" selected>⚡ Basic (Direct IREE Policy - Fast)</option>
+            <option value="advanced">🧠 Advanced (ISMCTS Search - Competition)</option>
+          </select>
+        </div>
+        <div>
+          <label for="deviceSelect" style="display: block; margin-bottom: 4px; font-weight: 700;">
+            ⚙️ Hardware Acceleration:
+          </label>
+          <select id="deviceSelect" class="styled-select" style="width: 100%;">
+            <option value="vulkan" selected>⚡ Vulkan GPU (SPIR-V)</option>
+            <option value="cpu">🖥️ Multithreaded CPU (Fallback)</option>
+          </select>
+        </div>
+      </div>
+
+    </div>
+    <div class="deck-modal-foot">
+      <button id="btnCancelDeck" class="btn-secondary">Cancel</button>
+      <button id="btnStartGame" class="btn-primary" style="font-size: 14px; font-weight: 700; padding: 8px 20px;">⚔️ Start Battle!</button>
+    </div>
+  </div>
+</div>
+
+<!-- GAME OVER BANNER MODAL -->
+<div id="gameOverModal" class="zoom" style="display: none;">
+  <div class="zoom-box game-over-box">
+    <div class="game-over-icon" id="gameOverIcon">🏆</div>
+    <h2 id="gameOverTitle" style="font-size: 26px; margin: 8px 0;">VICTORY!</h2>
+    <p id="gameOverDesc" style="color: var(--dim); margin-bottom: 20px;">You defeated the MuZero AI.</p>
+    <div style="display: flex; gap: 12px; justify-content: center;">
+      <button id="btnRematch" class="btn-primary" style="padding: 8px 20px;">🔄 Rematch</button>
+      <button id="btnNewDeck" class="btn-secondary" style="padding: 8px 20px;">🎴 Change Deck</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

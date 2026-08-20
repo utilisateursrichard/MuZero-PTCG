@@ -83,7 +83,7 @@ def run_training(extra_args: str = ""):
     # Vérification et garantie d'initialisation du GPU par JAX
     import jax
     if jax.devices()[0].platform == "cpu":
-        print("⚠️ CUDA GPU non actif. Installation/activation immédiate de JAX CUDA 12 (jax-cuda12-plugin)...")
+        print("⚠️ CUDA GPU inactive. Immediately installing/activating JAX CUDA 12 (jax-cuda12-plugin)...")
         subprocess.run([
             sys.executable, "-m", "pip", "install", "-U",
             "jax[cuda12]", "jax-cuda12-plugin", "jax-cuda12-pjrt",
@@ -96,7 +96,7 @@ def run_training(extra_args: str = ""):
 
     devices = jax.devices()
     print("=========================================================")
-    print(f"⚡ Modal Cloud GPU détecté : {devices}")
+    print(f"⚡ Modal Cloud GPU detected: {devices}")
     print(f"⚡ Device Platform: {devices[0].platform}")
     print("=========================================================")
 
@@ -105,7 +105,7 @@ def run_training(extra_args: str = ""):
     if extra_args:
         cmd.extend(extra_args.split())
 
-    print(f"🚀 Lancement de la commande : {' '.join(cmd)}")
+    print(f"🚀 Launching command: {' '.join(cmd)}")
     sys.stdout.flush()
 
     # Force unbuffered output pour un streaming instantané des logs Modal
@@ -120,15 +120,15 @@ def run_training(extra_args: str = ""):
     checkpoint_volume.commit()
 
     if retcode != 0:
-        raise RuntimeError(f"L'entraînement s'est terminé avec l'erreur : {retcode}")
+        raise RuntimeError(f"Training exited with error code: {retcode}")
 
-    print("✅ Entraînement terminé avec succès sur Modal Cloud (1 GPU L4) !")
+    print("✅ Training completed successfully on Modal Cloud (1 L4 GPU)!")
 
 
 @app.local_entrypoint()
 def main(extra_args: str = ""):
     """Point d'entrée local appelé par `modal run modal_train.py`."""
     print("=========================================================")
-    print("🚀 Envoi du code et construction du conteneur Modal Cloud...")
+    print("🚀 Uploading code and building Modal Cloud container...")
     print("=========================================================")
     run_training.remote(extra_args=extra_args)

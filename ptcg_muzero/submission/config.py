@@ -57,9 +57,10 @@ class ModelConfig:
 
 @dataclass
 class SearchConfig:
-    num_simulations: int = 25           # réduit de 50 → 25 : Gumbel MuZero reste efficace
+    num_simulations: int = 50           # 50 simulations ISMCTS
     # ISMCTS: number of determinizations sampled at each root
     num_belief_samples: int = 4
+
     # Gumbel MuZero: number of considered actions at each node
     max_num_considered_actions: int = 8  # réduit de 16 → 8 : sélectionne les meilleures actions
     # Dirichlet noise at root (self-play exploration)
@@ -107,10 +108,11 @@ class TrainConfig:
     plateau_threshold: float = 0.005
 
     # ── Training schedule ─────────────────────────────────────────────────
-
+    num_workers: int = 0             # 0 = auto-scale basé sur os.cpu_count() (jusqu'à 64)
     num_total_steps: int = 500_000
     self_play_interval: int = 100    # global steps between self-play batches
     games_per_self_play: int = 8
+
     # Safety bound for a single engine episode.  A normal game is far shorter;
     # this prevents a non-progressing engine/action loop from stalling training.
     max_game_steps: int = 2_000
@@ -194,7 +196,9 @@ class WandBConfig:
 @dataclass
 class InfraConfig:
     num_devices: int = 2         # dual-GPU via jax.pmap
+    num_learner_devices: int = 0 # 0 = auto 50/50 (ex: 4 learners / 4 actors sur 8 TPUs)
     seed: int = 42
+
     card_csv: str = "/kaggle/input/competitions/pokemon-tcg-ai-battle/EN_Card_Data.csv"
     # Deck de référence du sample_submission (garanti valide par le moteur)
     # Utilisé pour détecter les cartes Ace Spec et amorcer le replay buffer.

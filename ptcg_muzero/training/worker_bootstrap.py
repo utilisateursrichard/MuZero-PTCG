@@ -39,6 +39,10 @@ def run(child_conn, worker_id, cfg):
 
 
 
+    import logging
+    logging.getLogger("probes").setLevel(logging.WARNING)
+    logging.getLogger("cards").setLevel(logging.WARNING)
+
     # ── Maintenant on peut importer sans déclencher CUDA ─────────────────────
     from env.wrapper import self_play_worker_fn
     self_play_worker_fn(child_conn, worker_id, cfg)
