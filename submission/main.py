@@ -97,8 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--no-swap", action="store_true",
                    help="Do not alternate sides. Default alternates to neutralize "
                         "first-player advantage.")
-    t.add_argument("--deck", default=None, help="deck.csv to use (default: DEFAULT_COMPETITIVE_DECK).")
     t.add_argument("--json-out", default=None, help="Write JSON report to this path.")
+    t.add_argument("--policy-only", action="store_true",
+                   help="Run evaluation with raw policy network (0 MCTS simulations). Fast and tests intuitive prior.")
+    t.add_argument("--iree", action="store_true", help="Use IREE acceleration (Vulkan GPU / CPU VMFB) for ultra-fast testing.")
+    t.add_argument("--device", "--device-uri", default="vulkan", choices=["vulkan", "cpu"], help="Hardware device for IREE acceleration ('vulkan' or 'cpu').")
+    t.add_argument("--vmfb", default=None, help="Path to compiled .vmfb module (compiled automatically from HF if missing).")
     p.add_argument("--config",   default=None,  help="Path to config.json")
 
     p.add_argument("--hf-repo",  default=None,  help="Override HFConfig.repo_id")
@@ -578,15 +582,15 @@ def cmd_test(args) -> None:
     import numpy as np
 
     cfg = load_config(args)
-    # HF n'est activé que si l'utilisateur demande explicitement des poids du Hub
-    # (-s hf ...) : un test doit rester hors-ligne par défaut.
     uses_hf = (_parse_hf_spec(args.safetensors) is not None
                or _parse_hf_spec(args.opponent_weights) is not None)
     if not uses_hf:
         cfg.hf.enabled = False
-    if args.sims:
+    if getattr(args, "policy_only", False):
+        cfg.search.num_simulations = 0
+    elif args.sims is not None:
         cfg.search.num_simulations = args.sims
-    if args.belief:
+    if args.belief is not None:
         cfg.search.num_belief_samples = args.belief
 
     from cards.encoder import CardStaticFeatures
@@ -640,48 +644,144 @@ def cmd_test(args) -> None:
     rng = jax.random.PRNGKey(cfg.infra.seed)
     rng, r_w, r_o, r_a = jax.random.split(rng, 4)
 
+    use_iree = bool(getattr(args, "iree", False) or getattr(args, "vmfb", None) or (weights_path and str(weights_path).endswith(".vmfb")))
+    device_uri = getattr(args, "device", "vulkan") or "vulkan"
     my_step = None
-    hf_my = _fetch_hf_weights(weights_path, cfg) if weights_path else None
-    if hf_my is not None:
-        my_step = hf_my[2]
-    mz = _load_muzero_weights(weights_path, network, cfg, r_w)
-    params = {"muzero": mz}
+
+    if use_iree:
+        from models.iree_agent import IREEMuZeroAgent
+        from env.encoding import encode_observation
+
+        vmfb_path = Path(args.vmfb) if args.vmfb else (Path(weights_path) if weights_path and str(weights_path).endswith(".vmfb") else Path(f"muzero_{device_uri}.vmfb"))
+        if not vmfb_path.exists():
+            for cand in [Path.cwd() / vmfb_path.name, Path(__file__).resolve().parent.parent / vmfb_path.name]:
+                if cand.exists():
+                    vmfb_path = cand
+                    break
+
+        if not vmfb_path.exists():
+            logger.info("IREE VMFB bytecode not found (%s). Compiling online from HuggingFace Hub...", vmfb_path.name)
+            import subprocess, sys
+            export_script = Path(__file__).resolve().parent.parent / "export_iree.py"
+            if not export_script.exists():
+                export_script = Path("export_iree.py")
+            spec = str(weights_path) if weights_path and not str(weights_path).endswith(".vmfb") else "HF"
+            cmd = [
+                sys.executable, str(export_script),
+                "-m", spec,
+                "-o", str(vmfb_path),
+                "--target", device_uri,
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                logger.error("IREE compilation failed:\n%s", res.stderr)
+                raise RuntimeError(f"Failed to compile IREE module: {res.stderr}")
+            logger.info("✓ IREE module compiled successfully to %s", vmfb_path)
+
+        my_iree_agent = IREEMuZeroAgent(vmfb_path=vmfb_path, device_uri=device_uri, cfg=cfg)
+
+        def make_iree_test_agent_fn(agent, _cfg):
+            def agent_fn(obs_dict, player_idx, __cfg):
+                select = obs_dict.get("select") or {}
+                options = select.get("option", [])
+                if not options:
+                    return [0], np.zeros(_cfg.model.max_actions, dtype=np.float32), 0.0
+                probs, val, _ = agent.evaluate(obs_dict, player_idx)
+                max_count = int(select.get("maxCount", 1))
+                enc_obs = encode_observation(obs_dict, player_idx, _cfg.model)
+                option_mask = enc_obs["option_mask"]
+                masked = np.where(option_mask, probs, -1e9)
+                if max_count > 1:
+                    sel_indices = np.argsort(masked)[::-1][:max_count].tolist()
+                else:
+                    sel_indices = [int(np.argmax(masked))]
+                return sel_indices, probs, float(val)
+            return agent_fn
+
+        my_sims = 0
+        my_title = f"IREE ({device_uri.upper()})"
+    else:
+        hf_my = _fetch_hf_weights(weights_path, cfg) if weights_path else None
+        if hf_my is not None:
+            my_step = hf_my[2]
+        mz = _load_muzero_weights(weights_path, network, cfg, r_w)
+        params = {"muzero": mz}
+        my_sims = cfg.search.num_simulations
+        my_title = f"step {my_step}" if my_step is not None else "Model"
 
     # ── Adversaire ───────────────────────────────────────────────────────────
+    opp_sims = 0
     if args.opponent in ("greedy", "random"):
         opp_agent = make_baseline_agent(args.opponent, cfg, epsilon=args.epsilon,
                                         seed=cfg.infra.seed)
         opp_label = (f"greedy(ε={args.epsilon:.2f})" if args.opponent == "greedy" else "random")
     elif args.opponent == "self":
-        opp_agent = make_agent_fn(network, params, cfg, r_o, train_mode=False)
-        opp_label = "self (mirror)"
+        if use_iree:
+            opp_agent = make_iree_test_agent_fn(my_iree_agent, cfg)
+            opp_label = f"self (IREE {device_uri.upper()})"
+            opp_sims = 0
+        else:
+            opp_agent = make_agent_fn(network, params, cfg, r_o, train_mode=False)
+            opp_label = "self (mirror)"
+            opp_sims = cfg.search.num_simulations
     else:
         if not args.opponent_weights:
             raise ValueError("--opponent=checkpoint requires --opponent-weights.")
         opp_step = None
-        hf_opp = _fetch_hf_weights(args.opponent_weights, cfg)
-        if hf_opp is not None:
-            opp_step = hf_opp[2]
-        opp_mz = _load_muzero_weights(args.opponent_weights, network, cfg, r_o)
-        opp_agent = make_agent_fn(network, {"muzero": opp_mz}, cfg, r_o, train_mode=False)
-        if opp_step is not None:
-            opp_label = f"checkpoint(HF@{opp_step})"
+        if str(args.opponent_weights).endswith(".vmfb"):
+            from models.iree_agent import IREEMuZeroAgent
+            opp_iree_agent = IREEMuZeroAgent(vmfb_path=args.opponent_weights, device_uri=device_uri, cfg=cfg)
+            opp_agent = make_iree_test_agent_fn(opp_iree_agent, cfg)
+            opp_label = f"checkpoint(IREE {Path(args.opponent_weights).name})"
+            opp_sims = 0
         else:
-            opp_label = f"checkpoint({Path(args.opponent_weights).name})"
+            hf_opp = _fetch_hf_weights(args.opponent_weights, cfg)
+            if hf_opp is not None:
+                opp_step = hf_opp[2]
+            opp_mz = _load_muzero_weights(args.opponent_weights, network, cfg, r_o)
+            
+            # Si le modèle testé est en Policy-Only (ex: IREE à 0-sim) et que l'utilisateur n'a pas fixé --sims,
+            # on aligne l'adversaire checkpoint en Policy-Only (0-sim) pour une comparaison équitable.
+            if use_iree and args.sims is None:
+                logger.info(
+                    "[test] Modèle testé en Policy-Only (IREE 0-sim). Alignement de l'adversaire checkpoint "
+                    "en Policy-Only (0-sim) pour une comparaison équitable. (Passez --sims N pour forcer MCTS)."
+                )
+                from copy import deepcopy
+                opp_cfg = deepcopy(cfg)
+                opp_cfg.search.num_simulations = 0
+                opp_agent = make_agent_fn(network, {"muzero": opp_mz}, opp_cfg, r_o, train_mode=False)
+                opp_sims = 0
+            else:
+                opp_agent = make_agent_fn(network, {"muzero": opp_mz}, cfg, r_o, train_mode=False)
+                opp_sims = cfg.search.num_simulations
 
-    my_title = f"step {my_step}" if my_step is not None else "Model"
+            if opp_step is not None:
+                opp_label = f"checkpoint(HF@{opp_step})"
+            else:
+                opp_label = f"checkpoint({Path(args.opponent_weights).name})"
+
+    if my_sims != opp_sims:
+        logger.warning(
+            "⚠️ ASYMÉTRIE DÉTECTÉE : %s joue avec %d sims MCTS vs %s avec %d sims MCTS.",
+            my_title, my_sims, opp_label, opp_sims
+        )
 
     logger.info(
-        "=== TEST : %d games | opponent=%s | sims=%d | belief=%d | swap=%s ===",
-        args.games, opp_label, cfg.search.num_simulations,
-        cfg.search.num_belief_samples, not args.no_swap,
+        "=== TEST : %d games | model=%s [sims=%d] | opponent=%s [sims=%d] | belief=%d | swap=%s ===",
+        args.games, my_title, my_sims, opp_label, opp_sims,
+        cfg.search.num_belief_samples if (my_sims > 0 or opp_sims > 0) else 0, not args.no_swap,
     )
 
     # ── Parties ──────────────────────────────────────────────────────────────
     stats, errors = [], 0
+    rng_test = jax.random.PRNGKey(cfg.infra.seed if not use_iree else 42)
     for g in range(args.games):
-        rng, r_g = jax.random.split(rng)
-        me = make_agent_fn(network, params, cfg, r_g, train_mode=False)
+        if use_iree:
+            me = make_iree_test_agent_fn(my_iree_agent, cfg)
+        else:
+            rng_test, r_g = jax.random.split(rng_test)
+            me = make_agent_fn(network, params, cfg, r_g, train_mode=False)
         # Alterner les côtés : sans ça, tout l'écart mesuré peut n'être que
         # l'avantage (ou le désavantage) structurel du premier joueur.
         my_idx = 0 if (args.no_swap or g % 2 == 0) else 1

@@ -306,13 +306,13 @@ def create_muzero_train_state(
 
 
 def _merge_params(defaults, loaded):
-    """Conserve les poids/états restaurés et réinitialise les parties absentes ou incompatibles (forme / structure).
+    """Keeps restored weights/states and resets absent or incompatible parts (shape / structure).
 
-    AUDIT §1.1/§3.5 — les clés présentes dans le checkpoint mais ABSENTES de
-    l'architecture courante sont désormais écartées (ex. `pi_q`, `pi_k`,
-    `a_feat_emb` supprimés).  Auparavant elles étaient réinjectées dans l'arbre
-    de paramètres : Adam maintenait des moments pour des poids morts et le
-    checkpoint suivant les propageait indéfiniment.
+    AUDIT §1.1/§3.5 — keys present in the checkpoint but ABSENT from the
+    current architecture are now discarded (e.g., `pi_q`, `pi_k`,
+    `a_feat_emb` removed). Previously they were re-injected into the parameter tree:
+    Adam maintained moments for dead weights and the next checkpoint propagated them
+    indefinitely.
     """
     is_defaults_map = isinstance(defaults, Mapping)
     is_loaded_map = isinstance(loaded, Mapping)
@@ -327,13 +327,13 @@ def _merge_params(defaults, loaded):
         dropped = [k for k in loaded if k not in defaults]
         if dropped:
             logger.info(
-                "[checkpoint] Clés obsolètes ignorées (absentes de l'architecture courante) : %s",
+                "[checkpoint] Obsolete keys ignored (missing in current architecture): %s",
                 ", ".join(str(k) for k in dropped),
             )
         return res
     elif is_defaults_map != is_loaded_map:
         logger.warning(
-            "Structure de couche/état incompatible détectée entre modèle et checkpoint ; réinitialisation de cette partie."
+            "Incompatible layer/state structure detected between model and checkpoint; resetting this part."
         )
         return defaults
 
@@ -364,15 +364,14 @@ def _merge_params(defaults, loaded):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reset chirurgical de la tête de valeur / récompense
+# Surgical reset of value/reward head
 # ─────────────────────────────────────────────────────────────────────────────
-# NOTE : cette fonction avait été classée « code mort » en §3.5 puis supprimée.
-# C'était une erreur d'appréciation : elle est exactement l'outil nécessaire pour
-# repartir après les correctifs §1.3 / §2.2 / §2.3, qui n'ont abîmé QUE la tête
-# de valeur (cible auto-référentielle + padding tiré vers 0 + saturation ±2) et
-# la couche de sortie de la tête de récompense.  Le tronc Transformer h, la tête
-# de politique et la fonction de transition de g restent valides et coûtent
-# beaucoup plus cher à réapprendre.
+# NOTE: this function was previously classified as "dead code" in §3.5 and deleted.
+# It was a misjudgment: it is exactly the tool needed to resume after the
+# §1.3 / §2.2 / §2.3 fixes, which only damaged the value head (self-referential
+# target + padding pulled to 0 + ±2 saturation) and the output layer of the
+# reward head. The Transformer backbone h, the policy head, and the transition
+# function g remain valid and are much more expensive to relearn.
 DEFAULT_VALUE_HEAD_FRAGMENTS = ("v_dense", "rdet_fc2")
 
 
@@ -406,12 +405,12 @@ def _reset_value_head_params(params: dict, fresh_params: dict, fragments=None) -
     out = jax.tree_util.tree_map_with_path(_reset_leaf, params)
     if reset_paths:
         logger.info(
-            "[reset-value-head] %d couche(s) réinitialisée(s) : %s",
+            "[reset-value-head] %d layer(s) reset: %s",
             len(reset_paths), ", ".join(reset_paths),
         )
     else:
         logger.warning(
-            "[reset-value-head] Aucune couche ne correspond à %s — rien réinitialisé !", frags
+            "[reset-value-head] No layer matches %s — nothing was reset!", frags
         )
     return out
 

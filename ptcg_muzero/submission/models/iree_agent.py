@@ -29,7 +29,7 @@ class IREEMuZeroAgent:
         device_uri: str = "vulkan",
     ):
         self.cfg = cfg or Config()
-        self.vmfb_path = Path(vmfb_path).resolve()
+        self.vmfb_path = Path(vmfb_path)
         
         # Expected input keys and dtypes in the compiled VMFB
         self.input_schema = {
@@ -179,12 +179,13 @@ class ISMCTSMuZeroAgent:
         cfg: Optional[Config] = None,
         cards_csv: str = "competiton/EN_Card_Data.csv",
         repo_id: str = "richard151111/muzero-V2",
-        step_prefix: str = "step_0198000",
+        step_prefix: Optional[str] = None,
         num_simulations: int = 50,
         num_belief_samples: int = 2,
     ):
         import jax
         import jax.numpy as jnp
+        import json
         from huggingface_hub import hf_hub_download
         from safetensors.numpy import load_file
         from cards.encoder import CardStaticFeatures
@@ -195,6 +196,24 @@ class ISMCTSMuZeroAgent:
         self.cfg.search.num_simulations = num_simulations
         self.cfg.search.num_belief_samples = num_belief_samples
 
+        if not step_prefix or step_prefix.lower() in ("latest", "hf", "none"):
+            try:
+                latest_file = hf_hub_download(repo_id=repo_id, filename="latest.json")
+                with open(latest_file, "r") as f:
+                    meta = json.load(f)
+                if "step" in meta:
+                    step_prefix = f"step_{int(meta['step']):07d}"
+                elif "latest_step" in meta:
+                    step_prefix = f"step_{int(meta['latest_step']):07d}"
+                elif "path" in meta and meta["path"].startswith("step_"):
+                    step_prefix = meta["path"]
+                else:
+                    step_prefix = "step_0205000"
+            except Exception as e:
+                logger.warning("Could not fetch latest.json from Hugging Face (%s): %s", repo_id, e)
+                step_prefix = "step_0205000"
+
+        logger.info("ISMCTSMuZeroAgent loading checkpoint from Hub: %s (%s)...", repo_id, step_prefix)
         sf_path = hf_hub_download(repo_id=repo_id, filename=f"{step_prefix}/muzero.safetensors")
         card_data = CardStaticFeatures(cards_csv)
         n_cards = max(card_data.max_card_id + 1, self.cfg.model.num_card_ids)
@@ -206,7 +225,7 @@ class ISMCTSMuZeroAgent:
         self.mz_params = loaded_raw.get("muzero", loaded_raw)
         self.rng = jax.random.PRNGKey(42)
 
-        logger.info("ISMCTSMuZeroAgent ready (sims=%d, beliefs=%d)", num_simulations, num_belief_samples)
+        logger.info("ISMCTSMuZeroAgent ready on %s (sims=%d, beliefs=%d)", step_prefix, num_simulations, num_belief_samples)
 
     def set_opponent_deck(self, deck_cards: List[int]) -> None:
         try:

@@ -27,6 +27,9 @@ variance :
 
     ∇J = (R - b) · ∇ log π(deck)
     b  ← β·b + (1-β)·R            (EMA de baseline)
+
+
+    OUTDATED DO NOT USE
 """
 from __future__ import annotations
 

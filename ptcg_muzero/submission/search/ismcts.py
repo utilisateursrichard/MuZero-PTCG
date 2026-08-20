@@ -421,28 +421,34 @@ def ismcts_action(
     option_mask_jnp = jnp.array(option_mask_np)
     mask_jax_batched = jnp.stack([option_mask_jnp] * N_samples, axis=0)
 
-    # 3. Exécution MCTS JIT-compilée sur le batch de N_samples
-    invalid_mask = ~mask_jax_batched
-    cfg_tuple = tuple(mc.__dict__.items())
+    # 3. Exécution MCTS JIT-compilée sur le batch de N_samples (ou direct si num_simulations <= 1)
+    if int(sc.num_simulations) <= 1:
+        masked_pi = jnp.where(mask_jax_batched, pi_logits, -1e9)
+        probs_batched = jax.nn.softmax(masked_pi, axis=-1)
+        avg_policy = jnp.mean(probs_batched, axis=0)
+        avg_value = float(jnp.mean(v))
+    else:
+        invalid_mask = ~mask_jax_batched
+        cfg_tuple = tuple(mc.__dict__.items())
 
-    action_weights, node_values = _run_batched_mcts_jit(
-        mz_params,
-        z,
-        pi_logits,
-        v,
-        invalid_mask,
-        rng,
-        network.static_features,
-        cfg_tuple=cfg_tuple,
-        num_simulations=int(sc.num_simulations),
-        max_num_considered_actions=int(sc.max_num_considered_actions),
-        dirichlet_epsilon=float(dirichlet_epsilon),
-        dirichlet_alpha=float(dirichlet_alpha),
-    )
+        action_weights, node_values = _run_batched_mcts_jit(
+            mz_params,
+            z,
+            pi_logits,
+            v,
+            invalid_mask,
+            rng,
+            network.static_features,
+            cfg_tuple=cfg_tuple,
+            num_simulations=int(sc.num_simulations),
+            max_num_considered_actions=int(sc.max_num_considered_actions),
+            dirichlet_epsilon=float(dirichlet_epsilon),
+            dirichlet_alpha=float(dirichlet_alpha),
+        )
 
-    # 4. Moyenne sur l'axe des belief samples
-    avg_policy = jnp.mean(action_weights, axis=0)  # [A]
-    avg_value  = float(jnp.mean(node_values))
+        # 4. Moyenne sur l'axe des belief samples
+        avg_policy = jnp.mean(action_weights, axis=0)  # [A]
+        avg_value  = float(jnp.mean(node_values))
 
     # Appliquer le masque d'options légales
     avg_policy_masked = jnp.where(

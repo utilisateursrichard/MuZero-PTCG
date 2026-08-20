@@ -30,10 +30,24 @@ class IREEMuZeroEngine:
     ):
         import iree.runtime as ireert
 
-        self.vmfb_path = Path(vmfb_path).resolve()
-        if not self.vmfb_path.exists():
-            raise FileNotFoundError(f"VMFB module not found: {self.vmfb_path}")
+        p = Path(vmfb_path)
+        if not p.exists():
+            # Search in common workspace locations
+            for cand in [
+                Path.cwd() / p.name,
+                Path(__file__).resolve().parent.parent.parent / p.name,
+                Path(__file__).resolve().parent.parent / p.name,
+            ]:
+                if cand.exists():
+                    p = cand
+                    break
 
+        if not p.exists():
+            # Display relative path for clarity
+            display_name = p.name if not Path(vmfb_path).is_absolute() else str(vmfb_path)
+            raise FileNotFoundError(f"VMFB module not found: {display_name}")
+
+        self.vmfb_path = p.resolve()
         self.device_uri = device_uri
         try:
             self.config = ireert.Config(driver_name=driver_name or device_uri)

@@ -225,8 +225,8 @@ class DeckManager:
         return [
             {
                 "id": "model_deck",
-                "name": "⚡ Deck IA MuZero (Officiel)",
-                "description": "Le deck standard optimisé du modèle MuZero avec moteur de pioche et Pokémon polyvalents.",
+                "name": "⚡ Official MuZero AI Deck",
+                "description": "Standard optimized 60-card deck for MuZero with consistent draw engine and versatile Pokémon.",
                 "archetype": "Meta / MuZero Standard",
                 "cards": model_deck,
                 "summary": self.get_deck_summary(model_deck),
@@ -234,7 +234,7 @@ class DeckManager:
             {
                 "id": "charizard_pidgeot",
                 "name": "🔥 Charizard ex / Pidgeot ex",
-                "description": "Deck puissant axé sur l'accélération d'énergie Feu et la recherche de cartes par Pidgeot ex.",
+                "description": "Powerful archetype focused on Fire energy acceleration and deck searching via Pidgeot ex.",
                 "archetype": "Tier 1 Fire / Dark",
                 "cards": model_deck, # Fallback safe deck with full engine compatibility
                 "summary": self.get_deck_summary(model_deck),
@@ -242,7 +242,7 @@ class DeckManager:
             {
                 "id": "miraidon_turbo",
                 "name": "⚡ Turbo Miraidon ex / Iron Hands",
-                "description": "Deck agressif foudroyant capable d'attaquer dès le tour 1 et de voler des cartes Prizes additionnelles.",
+                "description": "Lightning aggro deck capable of turn 1 attacks and extra Prize card takes.",
                 "archetype": "Aggro Lightning",
                 "cards": model_deck,
                 "summary": self.get_deck_summary(model_deck),
@@ -258,55 +258,62 @@ class DeckManager:
         from config import Config
         from models.deck_builder import (
             DeckBuilderNetwork,
-            sample_deck,
-            set_energy_ids,
-            set_basic_pokemon_ids,
+            DEFAULT_COMPETITIVE_DECK,
             set_ace_spec_ids,
+            set_basic_pokemon_ids,
+            set_card_names,
+            set_energy_ids,
         )
-        from export.hub import _unflatten_params
 
-        csv_p = find_card_csv()
-        card_data = CardStaticFeatures(str(csv_p))
-        cfg = Config()
-        num_card_ids = max(card_data.max_card_id + 1, cfg.model.num_card_ids)
-        cfg.model.num_card_ids = num_card_ids
-        static_jax = jnp.array(card_data.feature_matrix(num_card_ids))
+        card_data = CardStaticFeatures(self.db.csv_path)
+        basic_ids = [
+            c for c in card_data.card_ids
+            if card_data._cards[c].get("stage", "").strip().lower() in ("basic pokémon", "basic pokemon")
+        ]
+        energy_ids = [
+            c for c in card_data.card_ids
+            if card_data._cards[c].get("stage", "").strip().lower() == "basic energy"
+        ]
+        card_names = {c: card_data.card_name(c) for c in card_data.card_ids}
 
-        energy_ids = [cid for cid in card_data.card_ids if "Energy" in card_data._cards[cid].get("stage", "")]
-        basic_ids = [cid for cid in card_data.card_ids if card_data._cards[cid].get("stage", "").strip().lower() in ("basic pokémon", "basic pokemon")]
-
-        set_energy_ids(energy_ids)
         set_basic_pokemon_ids(basic_ids)
+        set_energy_ids(energy_ids)
+        set_card_names(card_names)
         set_ace_spec_ids(card_data.ace_spec_ids)
 
-        deck_net = DeckBuilderNetwork(cfg=cfg.model, static_features=static_jax)
-        
-        # Look for deck_builder.safetensors
-        st_candidates = [
-            WORKSPACE_DIR / "deck_builder.safetensors",
-            WORKSPACE_DIR / "submission" / "deck_builder.safetensors",
-            WORKSPACE_DIR / "checkpoints" / "deck_builder.safetensors",
-        ]
-        st_path = next((p for p in st_candidates if p.exists()), None)
-        
-        rng = jax.random.PRNGKey(seed or int(np.random.randint(1, 1000000)))
+        cfg = Config()
+        static_jax = jnp.array(card_data.feature_matrix(card_data.max_card_id + 1))
+        network = DeckBuilderNetwork(cfg=cfg.model, static_features=static_jax)
 
-        if st_path:
-            flat = load_file(str(st_path))
-            deck_params = _unflatten_params(flat)
-            if "deck" in deck_params:
-                deck_params = deck_params["deck"]
+        # Load weights
+        weights_path = Path(__file__).parent.parent / "deck_builder.safetensors"
+        if not weights_path.exists():
+            weights_path = Path(__file__).parent.parent.parent / "deck_builder.safetensors"
+
+        if weights_path.exists():
+            flat_params = load_file(str(weights_path))
+            nested_params = {}
+            for key, val in flat_params.items():
+                parts = key.split("/")
+                d = nested_params
+                for p in parts[:-1]:
+                    d = d.setdefault(p, {})
+                d[parts[-1]] = val
+            params = nested_params.get("deck_builder", nested_params)
         else:
-            rng, rng_init = jax.random.split(rng)
-            dummy_ctx = jnp.zeros((1, cfg.model.latent_dim))
-            deck_params = deck_net.init(rng_init, context=dummy_ctx)
+            rng = jax.random.PRNGKey(seed or 42)
+            dummy_ctx = jnp.zeros((1, cfg.model.context_dim), dtype=jnp.float32)
+            params = network.init(rng, dummy_ctx)
 
-        logits, _ = deck_net.apply(deck_params)
-        deck_60, _ = sample_deck(
-            logits[0],
+        rng = jax.random.PRNGKey(seed or np.random.randint(0, 100000))
+        dummy_ctx = jnp.zeros((1, cfg.model.context_dim), dtype=jnp.float32)
+        deck_60 = network.sample_deck(
+            params,
+            dummy_ctx,
             rng,
-            num_card_ids,
-            energy_ids,
+            temperature=1.0,
+            card_names=card_names,
+            energy_ids=energy_ids,
             ace_spec_ids=card_data.ace_spec_ids,
             basic_pokemon_ids=basic_ids,
         )
@@ -315,7 +322,7 @@ class DeckManager:
     def validate_deck(self, deck: List[int]) -> Tuple[bool, str]:
         """Validates a 60-card list against official Pokemon TCG rules."""
         if len(deck) != 60:
-            return False, f"Le deck doit contenir exactement 60 cartes (reçu: {len(deck)})."
+            return False, f"Deck must contain exactly 60 cards (received: {len(deck)})."
         
         counts = Counter(deck)
         has_basic = False
@@ -324,13 +331,13 @@ class DeckManager:
         for cid, count in counts.items():
             card = self.db.get_card(cid)
             if card.get("category") == "Unknown" and cid not in self.db.cards:
-                return False, f"ID de carte #{cid} inconnu dans la base de données."
+                return False, f"Unknown card ID #{cid} in database."
 
             stage = card.get("stage", "").lower()
             is_basic_energy = "basic energy" in stage
             
             if not is_basic_energy and count > 4:
-                return False, f"Plus de 4 exemplaires de '{card.get('name')}' ({count} cartes)."
+                return False, f"More than 4 copies of '{card.get('name')}' ({count} cards)."
 
             if card.get("is_basic_pokemon"):
                 has_basic = True
@@ -338,12 +345,12 @@ class DeckManager:
             if card.get("is_ace_spec"):
                 ace_spec_count += count
                 if ace_spec_count > 1:
-                    return False, "Un seul exemplaire de carte Ace Spec est autorisé."
+                    return False, "Only 1 Ace Spec card is allowed per deck."
 
         if not has_basic:
-            return False, "Le deck doit contenir au moins 1 Pokémon de base."
+            return False, "Deck must contain at least 1 Basic Pokémon."
 
-        return True, "Deck valide !"
+        return True, "Valid deck!"
 
     def get_deck_summary(self, deck: List[int]) -> Dict[str, Any]:
         """Generates detailed card breakdown for the UI."""

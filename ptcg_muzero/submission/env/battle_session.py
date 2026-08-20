@@ -27,10 +27,11 @@ class BattleSession:
         self,
         player_deck: Optional[List[int]] = None,
         ai_deck: Optional[List[int]] = None,
-        vmfb_path: str = "muzero_vulkan.vmfb",
+        vmfb_path: Optional[str] = None,
         device_uri: str = "vulkan",
         ai_mode: str = "basic",
     ):
+        from pathlib import Path
         from models.iree_agent import create_agent
         self.deck_mgr = DeckManager()
         self.card_db = CardDatabase.get()
@@ -39,6 +40,14 @@ class BattleSession:
         self.player_deck = player_deck or self.deck_mgr.get_model_deck()
         self.ai_deck = ai_deck or self.deck_mgr.get_model_deck()
         self.ai_mode = ai_mode
+
+        if vmfb_path is None:
+            if device_uri == "cpu":
+                candidates = ["muzero_cpu.vmfb", "muzero_CPU.vmfb", "muzero_vulkan.vmfb"]
+                vmfb_path = next((c for c in candidates if Path(c).exists()), "muzero_cpu.vmfb")
+            else:
+                candidates = ["muzero_vulkan.vmfb", "muzero_cpu.vmfb", "muzero_CPU.vmfb"]
+                vmfb_path = next((c for c in candidates if Path(c).exists()), "muzero_vulkan.vmfb")
 
         self.env = CabtEnv()
         self.ai_agent = create_agent(
@@ -67,8 +76,8 @@ class BattleSession:
         self.is_done = False
         self.result = -1
 
-        self._add_log("game", "🎮 Début du combat Pokémon TCG contre MuZero !", level="info")
-        self._add_log("game", f"Deck Joueur : {len(self.player_deck)} cartes | Deck IA : {len(self.ai_deck)} cartes", level="info")
+        self._add_log("game", "🎮 Pokémon TCG battle vs MuZero started!", level="info")
+        self._add_log("game", f"Player Deck: {len(self.player_deck)} cards | AI Deck: {len(self.ai_deck)} cards", level="info")
 
         obs_dict, done = self.env.reset(self.player_deck, self.ai_deck)
         self.current_obs = obs_dict
@@ -99,7 +108,7 @@ class BattleSession:
                     chosen_labels.append(label["title"])
             
             if chosen_labels:
-                self._add_log("player", f"👤 Vous avez choisi : {', '.join(chosen_labels)}", level="action")
+                self._add_log("player", f"👤 You chose: {', '.join(chosen_labels)}", level="action")
 
             self.current_obs, self.is_done = self.env.step([int(x) for x in selected_indices])
 
@@ -159,7 +168,7 @@ class BattleSession:
                     if ai_labels:
                         self._add_log(
                             "ai",
-                            f"🤖 MuZero ({metadata.get('winrate', 50)}% winrate) : {', '.join(ai_labels)}",
+                            f"🤖 MuZero ({metadata.get('winrate', 50)}% winrate): {', '.join(ai_labels)}",
                             level="ai",
                         )
 
@@ -186,27 +195,27 @@ class BattleSession:
         
         if self.result == 0:
             if p0_prizes == 0:
-                self.game_over_reason = "Vous avez récupéré vos 6 cartes Récompense !"
+                self.game_over_reason = "You took all 6 Prize cards!"
             elif p1_mons == 0 and cur.get("turn", 0) > 0:
-                self.game_over_reason = "L'adversaire n'a plus aucun Pokémon en jeu (K.O. total)."
+                self.game_over_reason = "Opponent has no Pokémon left in play (total Knockout)."
             elif p1_deck == 0:
-                self.game_over_reason = "L'adversaire n'a plus de cartes à piocher (Deck Out)."
+                self.game_over_reason = "Opponent has no cards left in deck (Deck Out)."
             else:
-                self.game_over_reason = "Victoire par condition de victoire de jeu."
-            self._add_log("game", f"🏆 VICTOIRE ! {self.game_over_reason}", level="victory")
+                self.game_over_reason = "Victory by game condition."
+            self._add_log("game", f"🏆 VICTORY! {self.game_over_reason}", level="victory")
         elif self.result == 1:
             if p1_prizes == 0:
-                self.game_over_reason = "L'IA MuZero a récupéré ses 6 cartes Récompense."
+                self.game_over_reason = "MuZero AI took all 6 Prize cards."
             elif p0_mons == 0 and cur.get("turn", 0) > 0:
-                self.game_over_reason = "Vous n'avez plus aucun Pokémon en jeu sur votre terrain."
+                self.game_over_reason = "You have no Pokémon left in play on your field."
             elif p0_deck == 0:
-                self.game_over_reason = "Vous n'avez plus de cartes dans votre deck (Deck Out)."
+                self.game_over_reason = "You have no cards left in your deck (Deck Out)."
             else:
-                self.game_over_reason = "L'IA MuZero a remporté la partie."
-            self._add_log("game", f"💀 DÉFAITE ! {self.game_over_reason}", level="defeat")
+                self.game_over_reason = "MuZero AI won the match."
+            self._add_log("game", f"💀 DEFEAT! {self.game_over_reason}", level="defeat")
         else:
-            self.game_over_reason = "Partie conclue sur une égalité."
-            self._add_log("game", "🤝 MATCH NUL !", level="draw")
+            self.game_over_reason = "Match concluded in a draw."
+            self._add_log("game", "🤝 DRAW MATCH!", level="draw")
 
     def _add_log(self, sender: str, message: str, level: str = "info") -> None:
         self.logs.append({
@@ -231,17 +240,17 @@ class BattleSession:
         target_info = None
 
         if opt_type == 1: # YES
-            title = "Oui / Confirmer"
-            badge = "Confirmation"
+            title = "Yes / Confirm"
+            badge = "Confirm"
             badge_color = "#10b981"
         elif opt_type == 2: # NO
-            title = "Non / Passer"
-            badge = "Annuler"
+            title = "No / Pass"
+            badge = "Cancel"
             badge_color = "#ef4444"
         elif opt_type == 0: # NUMBER
             num = opt.get("number", opt.get("count", 0))
-            title = f"Choisir le nombre : {num}"
-            badge = "Nombre"
+            title = f"Choose number: {num}"
+            badge = "Number"
         elif opt_type == 3: # CARD
             area = opt.get("area", 0)
             idx = opt.get("index", 0)
@@ -281,19 +290,18 @@ class BattleSession:
                 if 0 <= idx < len(look) and look[idx]:
                     card_id = look[idx].get("id")
 
-            area_names = {1: "Deck", 2: "Main", 3: "Défausse", 4: "Actif", 5: "Banc", 6: "Prize", 12: "Cartes Révélées"}
+            area_names = {1: "Deck", 2: "Hand", 3: "Discard", 4: "Active", 5: "Bench", 6: "Prize", 12: "Revealed Cards"}
             area_str = area_names.get(area, f"Zone {area}")
 
             if card_id:
                 card_data = self.card_db.get_card(card_id)
-                title = f"{card_data.get('name', 'Carte')} ({area_str})"
+                title = f"{card_data.get('name', 'Card')} ({area_str})"
                 subtitle = f"{card_data.get('stage', '')} | HP: {card_data.get('hp', 0)}"
                 badge = area_str
                 badge_color = card_data.get("type_color", "#38bdf8")
             else:
-                title = f"Sélectionner carte #{idx + 1} ({area_str})"
+                title = f"Select card #{idx + 1} ({area_str})"
                 badge = area_str
-
 
         elif opt_type == 7: # PLAY
             hand_idx = opt.get("index", 0)
@@ -303,12 +311,12 @@ class BattleSession:
             if 0 <= hand_idx < len(my_hand) and my_hand[hand_idx]:
                 card_id = my_hand[hand_idx].get("id")
                 card_data = self.card_db.get_card(card_id)
-                title = f"Jouer {card_data.get('name')}"
+                title = f"Play {card_data.get('name')}"
                 subtitle = card_data.get("description", "")
-                badge = "Jouer"
+                badge = "Play"
                 badge_color = card_data.get("type_color", "#3b82f6")
             else:
-                title = f"Jouer la carte de la main #{hand_idx}"
+                title = f"Play card from hand #{hand_idx}"
 
         elif opt_type == 8: # ATTACH
             hand_idx = opt.get("index", 0)
@@ -319,26 +327,26 @@ class BattleSession:
             if 0 <= hand_idx < len(my_hand) and my_hand[hand_idx]:
                 card_id = my_hand[hand_idx].get("id")
                 card_data = self.card_db.get_card(card_id)
-                target_str = "Actif" if in_play_idx == 0 else f"Banc #{in_play_idx}"
-                title = f"Attacher {card_data.get('name')} à {target_str}"
-                badge = "Attacher"
+                target_str = "Active" if in_play_idx == 0 else f"Bench #{in_play_idx}"
+                title = f"Attach {card_data.get('name')} to {target_str}"
+                badge = "Attach"
                 badge_color = "#f59e0b"
             else:
-                title = f"Attacher carte à {in_play_idx}"
+                title = f"Attach card to {in_play_idx}"
 
         elif opt_type == 9: # EVOLVE
-            title = "Faire évoluer un Pokémon"
-            badge = "Évolution"
+            title = "Evolve a Pokémon"
+            badge = "Evolution"
             badge_color = "#8b5cf6"
 
         elif opt_type == 10: # ABILITY
-            title = "Activer un Talent"
-            badge = "Talent"
+            title = "Activate Ability"
+            badge = "Ability"
             badge_color = "#ec4899"
 
         elif opt_type == 12: # RETREAT
-            title = "Battre en retraite vers le banc"
-            badge = "Retraite"
+            title = "Retreat to Bench"
+            badge = "Retreat"
             badge_color = "#64748b"
 
         elif opt_type == 13: # ATTACK
@@ -352,19 +360,19 @@ class BattleSession:
                 attacks = card_data.get("attacks", [])
                 if 0 <= atk_idx < len(attacks):
                     atk = attacks[atk_idx]
-                    dmg_str = f" ({atk.get('damage')} dégâts)" if atk.get('damage') and atk.get('damage') != '0' else ""
-                    title = f"⚔️ Attaquer : {atk.get('name')}{dmg_str}"
+                    dmg_str = f" ({atk.get('damage')} damage)" if atk.get('damage') and atk.get('damage') != '0' else ""
+                    title = f"⚔️ Attack: {atk.get('name')}{dmg_str}"
                     subtitle = atk.get("effect", "")
-                    badge = "Attaque"
+                    badge = "Attack"
                     badge_color = "#ef4444"
                 else:
-                    title = f"⚔️ Attaquer (Attaque #{atk_idx})"
+                    title = f"⚔️ Attack (Attack #{atk_idx})"
             else:
-                title = f"⚔️ Attaquer (Attaque #{atk_idx})"
+                title = f"⚔️ Attack (Attack #{atk_idx})"
 
         elif opt_type == 14: # END_TURN
-            title = "🛑 Terminer le tour"
-            badge = "Fin de tour"
+            title = "🛑 End Turn"
+            badge = "End Turn"
             badge_color = "#475569"
 
         return {
@@ -543,15 +551,15 @@ class BattleSession:
 
     def _get_context_prompt(self, context_id: int) -> str:
         prompts = {
-            0: "Phase principale : choisissez une action ou terminez votre tour.",
-            1: "Configuration de départ : choisissez votre Pokémon Actif.",
-            2: "Configuration de départ : choisissez les Pokémon pour votre Banc.",
-            3: "Échange de Pokémon : choisissez le Pokémon à mettre en Actif.",
-            4: "Mettre un Pokémon en Actif.",
-            5: "Mettre un Pokémon sur le Banc.",
-            8: "Sélectionnez la carte ou le Pokémon cible.",
-            13: "Choisissez l'Attaque à exécuter.",
-            41: "Tirage au sort : Souhaitez-vous jouer en premier ?",
-            42: "Mulligan : Souhaitez-vous repiocher votre main ?",
+            0: "Main phase: choose an action or end your turn.",
+            1: "Initial setup: choose your Active Pokémon.",
+            2: "Initial setup: choose Pokémon for your Bench.",
+            3: "Switch Pokémon: choose a Pokémon to put in Active Spot.",
+            4: "Put a Pokémon into Active Spot.",
+            5: "Put a Pokémon onto the Bench.",
+            8: "Select target card or Pokémon.",
+            13: "Choose an Attack to execute.",
+            41: "Coin toss: Do you want to go first?",
+            42: "Mulligan: Do you want to redraw your hand?",
         }
-        return prompts.get(context_id, "Faites votre choix parmi les options ci-dessous :")
+        return prompts.get(context_id, "Make your choice from the options below:")

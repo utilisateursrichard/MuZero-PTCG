@@ -135,12 +135,12 @@ def _get_card_db() -> dict:
                                 break
                     _card_db = db
                     _probe_logger.debug(
-                        "[probes] card_db chargé : %d cartes", len(_card_db)
+                        "[probes] card_db loaded: %d cards", len(_card_db)
                     )
                 except Exception as exc:
                     _probe_logger.warning(
-                        "[probes] Impossible de charger card_db (%s). "
-                        "Les targets type_advantage seront ignorées (target=-1).",
+                        "[probes] Unable to load card_db (%s). "
+                        "type_advantage targets will be ignored (target=-1).",
                         exc,
                     )
                     _card_db = {}
@@ -351,11 +351,11 @@ def _get_attack_db() -> dict:
                             table[cid] = max_dmg
 
                     _probe_logger.debug(
-                        "[probes] attack_db chargée : %d cartes avec dégâts connus", len(table)
+                        "[probes] attack_db loaded: %d cards with known damage", len(table)
                     )
                 except Exception as exc:
                     _probe_logger.warning(
-                        "[probes] all_attack() indisponible (%s) — repli sur l'heuristique de dégâts.",
+                        "[probes] all_attack() unavailable (%s) — falling back to damage heuristic.",
                         exc,
                     )
                 _attack_db = table

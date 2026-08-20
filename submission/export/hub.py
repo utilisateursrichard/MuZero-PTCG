@@ -289,7 +289,7 @@ def load_from_hub(
         return None, None, cfg or Config(), 0
 
     if not token:
-        token = get_hf_token(cfg, required=cfg.hf.enabled if cfg else True)
+        token = get_hf_token(cfg, required=False)
     else:
         if not verify_hf_token(token):
             logger.error("FATAL ERROR: Provided Hugging Face token is invalid/unknown. Aborting script.")

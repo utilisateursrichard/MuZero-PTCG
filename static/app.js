@@ -30,6 +30,7 @@ function cardImgUrl(id) {
 
 class BattleVisualizerApp {
   constructor() {
+    this.sessionId = this.getOrCreateSessionId();
     this.state = null;
     this.allDecks = [];
     this.selectedDeckId = 'model_deck';
@@ -42,6 +43,37 @@ class BattleVisualizerApp {
     this.initEvents();
     this.loadDecks();
     this.checkActiveBattle();
+  }
+
+  getOrCreateSessionId() {
+    let sid = null;
+    try {
+      sid = localStorage.getItem('ptcg_muzero_session_id');
+    } catch (e) {}
+    if (!sid || sid.length < 8) {
+      sid = 'sess_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now().toString(36);
+      try {
+        localStorage.setItem('ptcg_muzero_session_id', sid);
+      } catch (e) {}
+    }
+    return sid;
+  }
+
+  async apiFetch(url, options = {}) {
+    const headers = Object.assign({
+      'Content-Type': 'application/json',
+      'X-Session-ID': this.sessionId,
+    }, options.headers || {});
+
+    const res = await fetch(url, Object.assign({}, options, { headers }));
+    try {
+      const respSid = res.headers.get('X-Session-ID');
+      if (respSid && respSid.trim() && respSid !== this.sessionId) {
+        this.sessionId = respSid.trim();
+        try { localStorage.setItem('ptcg_muzero_session_id', this.sessionId); } catch (e) {}
+      }
+    } catch (e) {}
+    return res;
   }
 
   initDOM() {
@@ -107,6 +139,18 @@ class BattleVisualizerApp {
     this.thinkingOverlay = document.getElementById('thinkingOverlay');
     this.thinkingSubText = document.getElementById('thinkingSubText');
 
+    // Compile Model Modal
+    this.compileModelModal = document.getElementById('compileModelModal');
+    this.btnCloseCompileModal = document.getElementById('btnCloseCompileModal');
+    this.btnCancelCompile = document.getElementById('btnCancelCompile');
+    this.btnStartCompile = document.getElementById('btnStartCompile');
+    this.missingModelNameText = document.getElementById('missingModelNameText');
+    this.compileProgressArea = document.getElementById('compileProgressArea');
+    this.compileStatusText = document.getElementById('compileStatusText');
+    this.compileErrorArea = document.getElementById('compileErrorArea');
+    this.compileErrorMsg = document.getElementById('compileErrorMsg');
+    this.selectedCompileTarget = 'vulkan';
+
     // Game Over
     this.gameOverModal = document.getElementById('gameOverModal');
     this.gameOverIcon = document.getElementById('gameOverIcon');
@@ -135,6 +179,25 @@ class BattleVisualizerApp {
     this.btnCloseDeckModal.addEventListener('click', () => this.closeDeckModal());
     this.btnCancelDeck.addEventListener('click', () => this.closeDeckModal());
     this.btnStartGame.addEventListener('click', () => this.startNewBattle());
+
+    if (this.btnCloseCompileModal) {
+      this.btnCloseCompileModal.addEventListener('click', () => this.closeCompileModal());
+    }
+    if (this.btnCancelCompile) {
+      this.btnCancelCompile.addEventListener('click', () => this.closeCompileModal());
+    }
+    if (this.btnStartCompile) {
+      this.btnStartCompile.addEventListener('click', () => this.compileModel());
+    }
+
+    // Target options selection in compile modal
+    document.querySelectorAll('#compileTargetOptions .target-option-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        document.querySelectorAll('#compileTargetOptions .target-option-card').forEach((c) => c.classList.remove('selected'));
+        card.classList.add('selected');
+        this.selectedCompileTarget = card.getAttribute('data-target') || 'vulkan';
+      });
+    });
 
     this.btnTriggerGenerate.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -405,7 +468,7 @@ class BattleVisualizerApp {
   // ── DECK MANAGEMENT & API ──────────────────────────────────────────────────
   async loadDecks() {
     try {
-      const res = await fetch('/api/decks');
+      const res = await this.apiFetch('/api/decks');
       const data = await res.json();
       if (data.status === 'success' && data.decks) {
         this.allDecks = data.decks;
@@ -421,7 +484,7 @@ class BattleVisualizerApp {
     this.btnTriggerGenerate.textContent = '⏳ REINFORCE Sampling...';
     this.btnTriggerGenerate.disabled = true;
     try {
-      const res = await fetch('/api/generate_deck', { method: 'POST' });
+      const res = await this.apiFetch('/api/generate_deck', { method: 'POST' });
       const data = await res.json();
       if (data.status === 'success') {
         this.selectedDeckCards = data.deck;
@@ -478,7 +541,7 @@ class BattleVisualizerApp {
 
   async checkActiveBattle() {
     try {
-      const res = await fetch('/api/battle/state');
+      const res = await this.apiFetch('/api/battle/state');
       const data = await res.json();
       if (data.status === 'success' && data.state && data.state.is_started) {
         this.state = data.state;
@@ -506,6 +569,79 @@ class BattleVisualizerApp {
     }
   }
 
+  openCompileModal(missingFile = 'muzero_vulkan.vmfb', preferredTarget = 'vulkan') {
+    this.selectedCompileTarget = preferredTarget;
+    if (this.missingModelNameText) {
+      this.missingModelNameText.textContent = `Model bytecode (${missingFile}) not found.`;
+    }
+    document.querySelectorAll('#compileTargetOptions .target-option-card').forEach((c) => {
+      if (c.getAttribute('data-target') === preferredTarget) {
+        c.classList.add('selected');
+      } else {
+        c.classList.remove('selected');
+      }
+    });
+
+    if (this.compileProgressArea) this.compileProgressArea.style.display = 'none';
+    if (this.compileErrorArea) this.compileErrorArea.style.display = 'none';
+    if (this.btnStartCompile) this.btnStartCompile.disabled = false;
+    if (this.btnCancelCompile) this.btnCancelCompile.disabled = false;
+
+    if (this.compileModelModal) {
+      this.compileModelModal.style.display = 'flex';
+    }
+  }
+
+  closeCompileModal() {
+    if (this.compileModelModal) {
+      this.compileModelModal.style.display = 'none';
+    }
+  }
+
+  async compileModel() {
+    const target = this.selectedCompileTarget || 'vulkan';
+    if (this.btnStartCompile) this.btnStartCompile.disabled = true;
+    if (this.btnCancelCompile) this.btnCancelCompile.disabled = true;
+    if (this.compileProgressArea) this.compileProgressArea.style.display = 'block';
+    if (this.compileErrorArea) this.compileErrorArea.style.display = 'none';
+    if (this.compileStatusText) {
+      this.compileStatusText.textContent = `Downloading latest checkpoint from HuggingFace Hub & compiling for ${target.toUpperCase()}...`;
+    }
+
+    try {
+      const res = await this.apiFetch('/api/models/compile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
+        if (this.compileStatusText) {
+          this.compileStatusText.textContent = `✅ ${data.message} (${data.size_kb} KB)`;
+        }
+        if (this.deviceSelect) {
+          this.deviceSelect.value = target;
+        }
+        setTimeout(() => {
+          this.closeCompileModal();
+          this.startNewBattle();
+        }, 1000);
+      } else {
+        if (this.compileErrorArea) this.compileErrorArea.style.display = 'block';
+        if (this.compileErrorMsg) this.compileErrorMsg.textContent = data.message || 'Compilation failed.';
+        if (this.btnStartCompile) this.btnStartCompile.disabled = false;
+        if (this.btnCancelCompile) this.btnCancelCompile.disabled = false;
+        if (this.compileProgressArea) this.compileProgressArea.style.display = 'none';
+      }
+    } catch (e) {
+      if (this.compileErrorArea) this.compileErrorArea.style.display = 'block';
+      if (this.compileErrorMsg) this.compileErrorMsg.textContent = `Error reaching server: ${e.message}`;
+      if (this.btnStartCompile) this.btnStartCompile.disabled = false;
+      if (this.btnCancelCompile) this.btnCancelCompile.disabled = false;
+      if (this.compileProgressArea) this.compileProgressArea.style.display = 'none';
+    }
+  }
+
   async startNewBattle() {
     this.closeDeckModal();
     const device = this.deviceSelect ? this.deviceSelect.value : 'vulkan';
@@ -514,7 +650,7 @@ class BattleVisualizerApp {
 
     this.setThinking(true);
     try {
-      const res = await fetch('/api/battle/start', {
+      const res = await this.apiFetch('/api/battle/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -522,15 +658,25 @@ class BattleVisualizerApp {
           ai_deck: deck,
           device: device,
           ai_mode: ai_mode,
+          session_id: this.sessionId,
         }),
       });
       const data = await res.json();
       if (data.status === 'success') {
+        if (data.session_id) {
+          this.sessionId = data.session_id;
+          try { localStorage.setItem('ptcg_muzero_session_id', this.sessionId); } catch(e) {}
+        }
         this.state = data.state;
         this.render();
       } else {
         this.setThinking(false);
-        alert(data.message || 'Error launching battle.');
+        if (data.error_code === 'VMFB_NOT_FOUND' || (data.message && data.message.includes('VMFB module not found'))) {
+          const missing = data.missing_file || (device === 'cpu' ? 'muzero_cpu.vmfb' : 'muzero_vulkan.vmfb');
+          this.openCompileModal(missing, device);
+        } else {
+          alert(data.message || 'Error launching battle.');
+        }
       }
     } catch (e) {
       this.setThinking(false);
@@ -544,10 +690,10 @@ class BattleVisualizerApp {
     this.isSubmitting = true;
     this.setThinking(true);
     try {
-      const res = await fetch('/api/battle/step', {
+      const res = await this.apiFetch('/api/battle/step', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ selected_indices: indices }),
+        body: JSON.stringify({ selected_indices: indices, session_id: this.sessionId }),
       });
       const data = await res.json();
       if (data.status === 'success') {

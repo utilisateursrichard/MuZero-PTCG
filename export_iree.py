@@ -101,7 +101,14 @@ def _fetch_hf_checkpoint(hf_spec: str) -> Tuple[Path, Path]:
         latest_file = hf_hub_download(repo_id=repo_id, filename="latest.json")
         with open(latest_file, "r") as f:
             meta = json.load(f)
-        step = meta.get("latest_step", 198000)
+        if "step" in meta:
+            step = int(meta["step"])
+        elif "latest_step" in meta:
+            step = int(meta["latest_step"])
+        elif "path" in meta and meta["path"].startswith("step_"):
+            step = int(meta["path"].replace("step_", ""))
+        else:
+            step = 198000
 
     step_prefix = f"step_{step:07d}"
     logger.info("Fetching weights from HuggingFace Hub: %s (%s)...", repo_id, step_prefix)

@@ -22,6 +22,8 @@ Python/C++ binary that cannot be JIT-compiled.
 """
 from __future__ import annotations
 
+import json
+import ctypes
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -133,6 +135,7 @@ class CabtEnv:
     """
 
     def __init__(self) -> None:
+        self._battle_ptr = None
         self._battle_started = False
         self._last_obs: Optional[dict] = None
         self.result: int = -1
@@ -146,45 +149,66 @@ class CabtEnv:
         """
         Start a new battle.
 
-        Calls ``battle_start(deck0, deck1)`` exactly as the reference notebook.
-        Validates the ``start_data`` error flags and raises on deck errors.
-
-        Returns:
-            obs_dict, done
+        Calls ``battle_start(deck0, deck1)`` with direct C++ battle_ptr
+        for full multi-user thread safety.
         """
         if self._battle_started:
             self.close()
 
-        obs_raw, start_data = battle_start(deck0, deck1)
+        if len(deck0) != 60 or len(deck1) != 60:
+            raise ValueError("The deck must contain 60 cards.")
 
-        # ── Deck validation (copied verbatim from reference notebook) ──────
-        if start_data.errorPlayer >= 0:
-            error = "Deck error."
-            if start_data.errorType == 1:
-                error = "The deck contains invalid card ID."
-            elif start_data.errorType == 2:
-                error = (
-                    "You can include up to four cards with the same name in the "
-                    "deck, excluding basic Energy cards."
-                )
-            elif start_data.errorType == 3:
-                error = "There are no Basic Pokémon in the deck."
-            elif start_data.errorType == 4:
-                error = "You can include only one Ace Spec card in the deck."
-            # AUDIT §2.6 — `battle_start()` a déjà été exécuté : sans
-            # `battle_finish()`, le singleton moteur (cg.game) reste dans un état
-            # sale jusqu'au prochain démarrage réussi.  `_battle_started` valant
-            # False, `close()` ne l'aurait jamais libéré.
-            try:
-                battle_finish()
-            except Exception:
-                pass
-            raise DeckError(error)
+        try:
+            from cg.sim import lib
+            cards = deck0 + deck1
+            arg = (ctypes.c_int * len(cards))(*cards)
+            start_data = lib.BattleStart(arg)
+            ptr = start_data.battlePtr
+
+            if start_data.errorPlayer >= 0 or ptr is None or ptr == 0:
+                error = "Deck error."
+                if start_data.errorType == 1:
+                    error = "The deck contains invalid card ID."
+                elif start_data.errorType == 2:
+                    error = "You can include up to four cards with the same name in the deck, excluding basic Energy cards."
+                elif start_data.errorType == 3:
+                    error = "There are no Basic Pokémon in the deck."
+                elif start_data.errorType == 4:
+                    error = "You can include only one Ace Spec card in the deck."
+                if ptr and ptr != 0:
+                    try:
+                        lib.BattleFinish(ptr)
+                    except Exception:
+                        pass
+                raise DeckError(error)
+
+            self._battle_ptr = ptr
+            sd = lib.GetBattleData(ptr)
+            obs_raw = json.loads(sd.json.decode())
+            obs_raw["search_begin_input"] = ctypes.string_at(sd.data, sd.count).decode("ascii")
+        except (ImportError, AttributeError):
+            # Fallback to cg.game API
+            obs_raw, start_data = battle_start(deck0, deck1)
+            if start_data.errorPlayer >= 0:
+                error = "Deck error."
+                if start_data.errorType == 1:
+                    error = "The deck contains invalid card ID."
+                elif start_data.errorType == 2:
+                    error = "You can include up to four cards with the same name in the deck, excluding basic Energy cards."
+                elif start_data.errorType == 3:
+                    error = "There are no Basic Pokémon in the deck."
+                elif start_data.errorType == 4:
+                    error = "You can include only one Ace Spec card in the deck."
+                try:
+                    battle_finish()
+                except Exception:
+                    pass
+                raise DeckError(error)
+            self._battle_ptr = None
 
         self._battle_started = True
         self.result = -1
 
-        # obs_raw is already a plain dict (the cg.game API returns a dict)
         obs_dict = obs_raw if isinstance(obs_raw, dict) else _obs_to_dict(obs_raw)
         done = _is_done(obs_dict)
         self._last_obs = obs_dict
@@ -194,31 +218,43 @@ class CabtEnv:
     def step(self, select_list: List[int]) -> Tuple[Optional[dict], bool]:
         """
         Advance the game by submitting the current player's selection.
-
-        Calls ``battle_select(select_list)`` exactly as the reference notebook::
-
-            obs = battle_select(selected)
-
-        Returns:
-            obs_dict, done
         """
-        obs_raw = battle_select(select_list)
+        if self._battle_ptr is not None:
+            from cg.sim import lib
+            arg = (ctypes.c_int * len(select_list))(*select_list)
+            res = lib.Select(self._battle_ptr, arg, len(select_list))
+            if res != 0:
+                obs_raw = None
+            else:
+                sd = lib.GetBattleData(self._battle_ptr)
+                obs_raw = json.loads(sd.json.decode())
+                obs_raw["search_begin_input"] = ctypes.string_at(sd.data, sd.count).decode("ascii")
+        else:
+            obs_raw = battle_select(select_list)
 
         obs_dict = obs_raw if isinstance(obs_raw, dict) else _obs_to_dict(obs_raw)
         done = _is_done(obs_dict)
-        if done:
+        if done and obs_dict:
             self.result = obs_dict.get("current", {}).get("result", 2)
         self._last_obs = obs_dict
         return obs_dict, done
 
     # ------------------------------------------------------------------
     def close(self) -> None:
-        """Call ``battle_finish()`` to release engine resources."""
+        """Call ``battle_finish()`` or ``lib.BattleFinish(ptr)`` to release engine resources."""
         if self._battle_started:
-            try:
-                battle_finish()
-            except Exception:
-                pass
+            if self._battle_ptr is not None:
+                try:
+                    from cg.sim import lib
+                    lib.BattleFinish(self._battle_ptr)
+                except Exception:
+                    pass
+                self._battle_ptr = None
+            else:
+                try:
+                    battle_finish()
+                except Exception:
+                    pass
             self._battle_started = False
 
 

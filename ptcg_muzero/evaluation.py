@@ -231,41 +231,41 @@ def _games_needed(p: float, z: float = 1.96) -> int:
 
 
 def format_report(title: str, agg: dict) -> str:
-    """Rapport texte lisible."""
+    """Formatted human-readable test report."""
     if agg.get("games", 0) == 0:
-        return f"── {title} ──\n  aucune partie jouée."
+        return f"── {title} ──\n  no games played."
     L = [f"── {title} ──"]
-    L.append(f"  Parties            : {agg['games']}  "
-             f"(V {agg['wins']} / N {agg['draws']} / D {agg['losses']})")
+    L.append(f"  Games              : {agg['games']}  "
+             f"(W {agg['wins']} / D {agg['draws']} / L {agg['losses']})")
     ci = agg["win_rate_ci95_pct"]
-    L.append(f"  Taux de victoire   : {agg['win_rate_pct']:.1f} %   "
-             f"IC95 [{ci[0]:.0f} %, {ci[1]:.0f} %]   score {agg['score_pct']:.1f} %")
+    L.append(f"  Win Rate           : {agg['win_rate_pct']:.1f} %   "
+             f"95% CI [{ci[0]:.0f} %, {ci[1]:.0f} %]   Score {agg['score_pct']:.1f} %")
     if not agg["conclusive"]:
-        L.append(f"  ⚠ NON CONCLUSIF — l'intervalle contient 50 %. "
-                 f"Il faut ~{_games_needed(agg['win_rate_pct'] / 100.0)} parties pour trancher.")
-    L.append(f"  Décisions/partie   : {agg['avg_decisions_per_game']}")
+        L.append(f"  ⚠ INCONCLUSIVE — CI contains 50%. "
+                 f"Requires ~{_games_needed(agg['win_rate_pct'] / 100.0)} games to establish significance.")
+    L.append(f"  Decisions/game     : {agg['avg_decisions_per_game']}")
     L.append("")
-    L.append("  ── Compétence (indépendant de l'adversaire) ──")
-    L.append(f"  Prizes prises      : {agg['avg_prizes_taken']:.2f} / 6")
-    L.append(f"  Prizes concédées   : {agg['avg_prizes_conceded']:.2f} / 6")
+    L.append("  ── Competence (Opponent-Independent) ──")
+    L.append(f"  Prizes taken       : {agg['avg_prizes_taken']:.2f} / 6")
+    L.append(f"  Prizes conceded    : {agg['avg_prizes_conceded']:.2f} / 6")
     if agg["avg_prizes_taken"] == 0.0 and agg["avg_prizes_conceded"] == 0.0:
-        L.append("    ⚠ 0 prize des DEUX côtés : compteur probablement constant "
-                 "(cf. diag_prize.py).")
+        L.append("    ⚠ 0 prizes on BOTH sides: prize counter likely constant "
+                 "(see diag_prize.py).")
     atk = agg["attack_taken_when_available_pct"]
-    L.append(f"  Tours finis par une attaque : {'n/a' if atk is None else f'{atk:.1f} %'}"
-             "   (sur les tours où attaquer était possible)")
+    L.append(f"  Turns ended by atk : {'n/a' if atk is None else f'{atk:.1f} %'}"
+             "   (on turns where attacking was legal)")
     L.append(f"  Deck-out           : {agg['decked_out_pct']:.1f} %")
     if agg["action_dist_pct"]:
         top = ", ".join(f"{k}={v}%" for k, v in list(agg["action_dist_pct"].items())[:8])
         L.append(f"  Distribution       : {top}")
     L.append("")
-    L.append("  ── Calibration de la valeur (aucun adversaire requis) ──")
+    L.append("  ── Value Head Calibration (Ground Truth) ──")
     r = agg["value_outcome_pearson_r"]
-    L.append(f"  corr(v(s), issue)  : {'n/a' if r is None else f'{r:+.4f}'}"
-             "    (0 = la valeur n'anticipe rien)")
+    L.append(f"  corr(v(s), outcome): {'n/a' if r is None else f'{r:+.4f}'}"
+             "    (0 = value predicts nothing)")
     sa = agg.get("value_sign_accuracy_pct")
-    L.append(f"  signe correct      : {'n/a' if sa is None else f'{sa:.1f} %'}"
-             "    (50 % = hasard)")
-    L.append(f"  v moyen / |v| moyen: {agg.get('value_mean')} / {agg.get('value_abs_mean')}"
-             "   (v moyen doit tendre vers 0 en jeu symétrique)")
+    L.append(f"  Sign accuracy      : {'n/a' if sa is None else f'{sa:.1f} %'}"
+             "    (50% = chance)")
+    L.append(f"  Mean v / Mean |v|  : {agg.get('value_mean')} / {agg.get('value_abs_mean')}"
+             "   (mean v should gravitate towards 0 in symmetric games)")
     return "\n".join(L)
