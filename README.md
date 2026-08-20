@@ -120,6 +120,7 @@ note : be sure that you use the default config file
 ```bash
 python battle_server.py --port 8000
 ```
+please note that the vizualizer haven't made by me, check the original repository : https://github.com/hiro094/PTCG_ABCS_Visualizer
 
 ### 5. to use it go to http://localhost:8000 and you should find the server
 
