@@ -97,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--no-swap", action="store_true",
                    help="Do not alternate sides. Default alternates to neutralize "
                         "first-player advantage.")
+    t.add_argument("--deck", default=None, help="deck.csv to use (default: DEFAULT_COMPETITIVE_DECK).")
     t.add_argument("--json-out", default=None, help="Write JSON report to this path.")
     t.add_argument("--policy-only", action="store_true",
                    help="Run evaluation with raw policy network (0 MCTS simulations). Fast and tests intuitive prior.")
