@@ -213,3 +213,10 @@ my original language is French, some feature might be in french and some of my c
   - *Policy improvement by planning with Gumbel* (Danihelka et al., ICLR 2022)
   - *Mastering Diverse Domains through World Models - EfficientZero V2* (Ye et al., 2024)
 - Pokémon TCG game engine licensed under Kaggle Competition rules.
+
+## AI usage
+
+AI (LLMs) was used for :
+1. optimization, it can have a second look of what I am writing (even if AI cannot do all the job alone, the full project isn't fully made by AI)
+2. in some parts of the Readme.md, for example for the graphic in the System Architecture secion.
+3. To help my research and to guide me in some problems I have encouterd but I have learned and all the work wasn't AI.
