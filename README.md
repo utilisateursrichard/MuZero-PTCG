@@ -139,7 +139,7 @@ python ptcg_muzero/main.py test -s HF -o greedy -n 40 --sims 25
 ```
 in that command, -s HF is the model you wnat to test (in that case the latest model in the HF repository), -o the opponent (here greedy) -n is the number of games and the --sims is the number of MCTS node that you want (the more you add, the more the model will think)
 
-# IMPORTANT : hugging face isn't required, you can use the preview &t https://ptcg.dino.icu/ of (for an unknown reason) you hate HF
+> **Note:** Hugging Face is completely optional. You can play the live demo directly at https://ptcg.dino.icu/ without downloading anything, or supply your own local weights. 
 ### 2. Against a random agent
 
 it is the same command as before but with the random arg (in -o) instead of greedy
