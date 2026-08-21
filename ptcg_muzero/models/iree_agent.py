@@ -302,21 +302,59 @@ class ISMCTSMuZeroAgent:
         }
 
 
+class GreedyBaselineAgent:
+    """Greedy heuristic baseline agent prioritizing attacks, evolutions, and attachments."""
+
+    def __init__(self, cfg: Optional[Config] = None, epsilon: float = 0.0):
+        from env.baselines import make_greedy_agent
+        self.cfg = cfg or Config()
+        self.agent_fn = make_greedy_agent(self.cfg, epsilon=epsilon)
+
+    def choose_action(self, obs_dict: dict, player_idx: int) -> Tuple[List[int], Dict[str, Any]]:
+        chosen, pol, val = self.agent_fn(obs_dict, player_idx, self.cfg)
+        select = obs_dict.get("select") if isinstance(obs_dict, dict) else getattr(obs_dict, "select", None)
+        raw_options = select.get("option", []) if isinstance(select, dict) else (getattr(select, "option", []) or [])
+
+        top_actions = []
+        for idx in chosen:
+            if 0 <= idx < len(raw_options):
+                top_actions.append({
+                    "option_index": idx,
+                    "score": 100.0,
+                    "raw_option": raw_options[idx],
+                })
+
+        return chosen, {
+            "value": round(float(val), 3),
+            "winrate": 50.0,
+            "top_actions": top_actions,
+            "chosen_indices": chosen,
+            "mode": "greedy_heuristic",
+        }
+
+
 def create_agent(
-    mode: str = "basic",
+    mode: str = "advanced",
     vmfb_path: str = "muzero_vulkan.vmfb",
     device_uri: str = "vulkan",
     num_simulations: int = 50,
     num_belief_samples: int = 2,
     cfg: Optional[Config] = None,
 ):
-    """Factory creating either an IREE fast agent (basic) or an ISMCTS search agent (advanced)."""
-    if mode.lower() == "advanced" or mode.lower() == "ismcts":
+    """Factory creating an agent:
+    - 'advanced' / 'ismcts' / 'competition': ISMCTS search agent with Gumbel search & belief (Priority default)
+    - 'greedy' / 'heuristic' / 'baseline': Greedy heuristic rule-based baseline
+    - 'basic' / 'iree': Fast direct IREE policy / value evaluation
+    """
+    mode_lower = (mode or "advanced").lower().strip()
+    if mode_lower in ("advanced", "ismcts", "competition"):
         return ISMCTSMuZeroAgent(
             cfg=cfg,
             num_simulations=num_simulations,
             num_belief_samples=num_belief_samples,
         )
+    elif mode_lower in ("greedy", "heuristic", "baseline"):
+        return GreedyBaselineAgent(cfg=cfg)
     return IREEMuZeroAgent(vmfb_path=vmfb_path, device_uri=device_uri, cfg=cfg)
 
 

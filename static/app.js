@@ -38,9 +38,11 @@ class BattleVisualizerApp {
     this.multiSelectedIndices = new Set();
     this.isSubmitting = false;
     this.zoomPi = null;
+    this.onlyCpu = false;
 
     this.initDOM();
     this.initEvents();
+    this.checkServerStatus();
     this.loadDecks();
     this.checkActiveBattle();
   }
@@ -539,6 +541,47 @@ class BattleVisualizerApp {
     this.deckModal.style.display = 'none';
   }
 
+  async checkServerStatus() {
+    try {
+      const res = await this.apiFetch('/api/models/status');
+      const data = await res.json();
+      if (data.status === 'success' && data.only_cpu) {
+        this.onlyCpu = true;
+        this.applyOnlyCpuMode();
+      }
+    } catch (e) {
+      console.warn('Could not fetch model/server status:', e);
+    }
+  }
+
+  applyOnlyCpuMode() {
+    const optVulkan = document.getElementById('optVulkan');
+    if (optVulkan) {
+      optVulkan.remove();
+    }
+    if (this.deviceSelect) {
+      this.deviceSelect.value = 'cpu';
+    }
+
+    const vulkanCard = document.querySelector('#compileTargetOptions .target-option-card[data-target="vulkan"]');
+    if (vulkanCard) {
+      vulkanCard.style.display = 'none';
+    }
+    const cpuCard = document.querySelector('#compileTargetOptions .target-option-card[data-target="cpu"]');
+    if (cpuCard) {
+      document.querySelectorAll('#compileTargetOptions .target-option-card').forEach((c) => c.classList.remove('selected'));
+      cpuCard.classList.add('selected');
+    }
+    this.selectedCompileTarget = 'cpu';
+
+    if (!this.state) {
+      const engineNameEl = document.getElementById('engineName');
+      if (engineNameEl) {
+        engineNameEl.textContent = 'MuZero ISMCTS (Competition)';
+      }
+    }
+  }
+
   async checkActiveBattle() {
     try {
       const res = await this.apiFetch('/api/battle/state');
@@ -557,11 +600,17 @@ class BattleVisualizerApp {
   setThinking(isThinking) {
     if (!this.thinkingOverlay) return;
     if (isThinking) {
-      const isAdvanced = this.state?.ai_mode === 'advanced' || this.state?.ai_mode === 'ismcts' || (this.aiModeSelect && this.aiModeSelect.value === 'advanced');
+      const mode = this.state?.ai_mode || (this.aiModeSelect ? this.aiModeSelect.value : 'advanced');
       if (this.thinkingSubText) {
-        this.thinkingSubText.textContent = isAdvanced
-          ? 'ISMCTS Simulation (50 iterations & belief)'
-          : 'IREE GPU Policy Inference';
+        if (mode === 'advanced' || mode === 'ismcts' || mode === 'competition') {
+          this.thinkingSubText.textContent = 'ISMCTS Simulation (50 iterations & belief)';
+        } else if (mode === 'greedy' || mode === 'heuristic') {
+          this.thinkingSubText.textContent = 'Greedy Heuristic Decision (Rule Priority)';
+        } else {
+          this.thinkingSubText.textContent = (this.state?.device_uri === 'cpu' || this.onlyCpu)
+            ? 'IREE CPU Policy Inference'
+            : 'IREE GPU Policy Inference';
+        }
       }
       this.thinkingOverlay.style.display = 'flex';
     } else {
@@ -569,7 +618,17 @@ class BattleVisualizerApp {
     }
   }
 
-  openCompileModal(missingFile = 'muzero_vulkan.vmfb', preferredTarget = 'vulkan') {
+  openCompileModal(missingFile = null, preferredTarget = null) {
+    if (this.onlyCpu) {
+      preferredTarget = 'cpu';
+      if (!missingFile || missingFile.includes('vulkan')) {
+        missingFile = 'muzero_cpu.vmfb';
+      }
+    } else {
+      preferredTarget = preferredTarget || 'vulkan';
+      missingFile = missingFile || 'muzero_vulkan.vmfb';
+    }
+
     this.selectedCompileTarget = preferredTarget;
     if (this.missingModelNameText) {
       this.missingModelNameText.textContent = `Model bytecode (${missingFile}) not found.`;
@@ -599,7 +658,7 @@ class BattleVisualizerApp {
   }
 
   async compileModel() {
-    const target = this.selectedCompileTarget || 'vulkan';
+    const target = this.onlyCpu ? 'cpu' : (this.selectedCompileTarget || 'vulkan');
     if (this.btnStartCompile) this.btnStartCompile.disabled = true;
     if (this.btnCancelCompile) this.btnCancelCompile.disabled = true;
     if (this.compileProgressArea) this.compileProgressArea.style.display = 'block';
@@ -644,8 +703,8 @@ class BattleVisualizerApp {
 
   async startNewBattle() {
     this.closeDeckModal();
-    const device = this.deviceSelect ? this.deviceSelect.value : 'vulkan';
-    const ai_mode = this.aiModeSelect ? this.aiModeSelect.value : 'basic';
+    const device = this.onlyCpu ? 'cpu' : (this.deviceSelect ? this.deviceSelect.value : 'vulkan');
+    const ai_mode = this.aiModeSelect ? this.aiModeSelect.value : 'advanced';
     const deck = this.selectedDeckCards;
 
     this.setThinking(true);
@@ -672,7 +731,7 @@ class BattleVisualizerApp {
       } else {
         this.setThinking(false);
         if (data.error_code === 'VMFB_NOT_FOUND' || (data.message && data.message.includes('VMFB module not found'))) {
-          const missing = data.missing_file || (device === 'cpu' ? 'muzero_cpu.vmfb' : 'muzero_vulkan.vmfb');
+          const missing = data.missing_file || (device === 'cpu' || this.onlyCpu ? 'muzero_cpu.vmfb' : 'muzero_vulkan.vmfb');
           this.openCompileModal(missing, device);
         } else {
           alert(data.message || 'Error launching battle.');
@@ -742,15 +801,29 @@ class BattleVisualizerApp {
     this.ctxEl.textContent = s.select_context?.prompt ? `Phase #${s.select_context.id}` : 'Play';
 
     // Engine & AI Mode Badge
-    const isAdvanced = s.ai_mode === 'advanced' || s.ai_mode === 'ismcts';
+    const mode = s.ai_mode || (this.aiModeSelect ? this.aiModeSelect.value : 'advanced');
+    const isAdvanced = mode === 'advanced' || mode === 'ismcts' || mode === 'competition';
+    const isGreedy = mode === 'greedy' || mode === 'heuristic';
     const engineNameEl = document.getElementById('engineName');
     if (engineNameEl) {
-      engineNameEl.textContent = isAdvanced ? 'MuZero ISMCTS (Advanced)' : 'IREE Vulkan (Basic)';
+      if (isAdvanced) {
+        engineNameEl.textContent = 'MuZero ISMCTS (Competition)';
+      } else if (isGreedy) {
+        engineNameEl.textContent = 'Greedy Heuristic Baseline';
+      } else {
+        engineNameEl.textContent = (s.device_uri === 'cpu' || this.onlyCpu) ? 'IREE CPU (Basic)' : 'IREE Vulkan (Basic)';
+      }
     }
 
     const hudTitleEl = document.querySelector('.ai-hud-title');
     if (hudTitleEl) {
-      hudTitleEl.textContent = isAdvanced ? '🧠 MuZero ISMCTS Search' : '⚡ MuZero IREE Fast Policy';
+      if (isAdvanced) {
+        hudTitleEl.textContent = '🧠 MuZero ISMCTS Search (Competition)';
+      } else if (isGreedy) {
+        hudTitleEl.textContent = '🎲 Greedy Heuristic Engine';
+      } else {
+        hudTitleEl.textContent = '⚡ MuZero IREE Fast Policy';
+      }
     }
 
 

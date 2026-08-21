@@ -29,7 +29,7 @@ class BattleSession:
         ai_deck: Optional[List[int]] = None,
         vmfb_path: Optional[str] = None,
         device_uri: str = "vulkan",
-        ai_mode: str = "basic",
+        ai_mode: str = "advanced",
     ):
         from pathlib import Path
         from models.iree_agent import create_agent
@@ -40,6 +40,7 @@ class BattleSession:
         self.player_deck = player_deck or self.deck_mgr.get_model_deck()
         self.ai_deck = ai_deck or self.deck_mgr.get_model_deck()
         self.ai_mode = ai_mode
+        self.device_uri = device_uri
 
         if vmfb_path is None:
             if device_uri == "cpu":
@@ -544,7 +545,8 @@ class BattleSession:
             "logs": self.logs[-40:],
             "ai_thoughts": self.ai_thoughts,
             "game_over_reason": getattr(self, "game_over_reason", ""),
-            "ai_mode": getattr(self, "ai_mode", "basic"),
+            "ai_mode": getattr(self, "ai_mode", "advanced"),
+            "device_uri": getattr(self, "device_uri", "vulkan"),
         }
 
 

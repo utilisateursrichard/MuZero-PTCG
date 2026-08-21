@@ -12,7 +12,7 @@
 <header>
   <div class="header-left">
     <h1>⚔️ PTCG MuZero Arena</h1>
-    <span class="engine-badge" id="engineBadge"><span class="pulse-dot"></span><span id="engineName">IREE Vulkan</span></span>
+    <span class="engine-badge" id="engineBadge"><span class="pulse-dot"></span><span id="engineName">MuZero ISMCTS (Competition)</span></span>
   </div>
 
   <div class="header-meta">
@@ -183,8 +183,9 @@
             🧠 AI Algorithm / Level:
           </label>
           <select id="aiModeSelect" class="styled-select" style="width: 100%;">
-            <option value="basic" selected>⚡ Basic (Direct IREE Policy - Fast)</option>
-            <option value="advanced">🧠 Advanced (ISMCTS Search - Competition)</option>
+            <option value="advanced" selected>🧠 Advanced (ISMCTS Search - Competition) ⭐ Recommended</option>
+            <option value="greedy">🎲 Greedy (Heuristic Baseline)</option>
+            <option value="basic">⚡ Basic (Direct IREE Policy - Fast)</option>
           </select>
         </div>
         <div>
@@ -192,8 +193,8 @@
             ⚙️ Hardware Acceleration:
           </label>
           <select id="deviceSelect" class="styled-select" style="width: 100%;">
-            <option value="vulkan" selected>⚡ Vulkan GPU (SPIR-V)</option>
-            <option value="cpu">🖥️ Multithreaded CPU (Fallback)</option>
+            <option id="optVulkan" value="vulkan" selected>⚡ Vulkan GPU (SPIR-V)</option>
+            <option id="optCpu" value="cpu">🖥️ Multithreaded CPU (Universal)</option>
           </select>
         </div>
       </div>

@@ -65,8 +65,9 @@ class SessionEntry:
 class SessionManager:
     """Thread-safe manager for multiple concurrent battle sessions with TTL cleanup."""
 
-    def __init__(self, ttl_seconds: int = 1800):
+    def __init__(self, ttl_seconds: int = 1800, only_cpu: bool = False):
         self.ttl_seconds = ttl_seconds
+        self.only_cpu = only_cpu
         self._sessions: Dict[str, SessionEntry] = {}
         self._lock = threading.Lock()
 
@@ -75,12 +76,15 @@ class SessionManager:
         session_id: Optional[str],
         player_deck: List[int],
         ai_deck: List[int],
-        device_uri: str = "vulkan",
-        ai_mode: str = "basic",
+        device_uri: str = "cpu",
+        ai_mode: str = "advanced",
         vmfb_path: Optional[str] = None,
     ) -> SessionEntry:
         if not session_id:
             session_id = str(uuid.uuid4())
+
+        if self.only_cpu:
+            device_uri = "cpu"
 
         with self._lock:
             # If an existing session with this ID is present, close it first
@@ -145,6 +149,7 @@ class SessionManager:
 # Global multi-user session manager
 _session_manager = SessionManager(ttl_seconds=1800)
 _deck_manager: Optional[DeckManager] = None
+_only_cpu: bool = False
 
 
 def _get_python_executable() -> str:
@@ -158,15 +163,18 @@ def _get_python_executable() -> str:
 
 
 def _get_models_status() -> Dict[str, Any]:
+    global _only_cpu
     vulkan_paths = [SCRIPT_DIR / "muzero_vulkan.vmfb", Path("muzero_vulkan.vmfb")]
     cpu_paths = [SCRIPT_DIR / "muzero_cpu.vmfb", SCRIPT_DIR / "muzero_CPU.vmfb", Path("muzero_cpu.vmfb"), Path("muzero_CPU.vmfb")]
 
-    vulkan_found = next((p for p in vulkan_paths if p.exists()), None)
+    vulkan_found = next((p for p in vulkan_paths if p.exists()), None) if not _only_cpu else None
     cpu_found = next((p for p in cpu_paths if p.exists()), None)
 
     return {
+        "only_cpu": _only_cpu,
         "vulkan": {
-            "exists": vulkan_found is not None,
+            "exists": vulkan_found is not None and not _only_cpu,
+            "disabled": _only_cpu,
             "filename": vulkan_found.name if vulkan_found else "muzero_vulkan.vmfb",
             "size_kb": (vulkan_found.stat().st_size // 1024) if vulkan_found else 0,
         },
@@ -264,6 +272,7 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
                 "service": "PTCG MuZero Battle Arena",
                 "active_sessions": _session_manager.active_count(),
                 "session_id": session_id,
+                "only_cpu": _only_cpu,
             }, session_id=session_id)
             return
 
@@ -275,7 +284,7 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/models/status":
             status_data = _get_models_status()
-            self._send_json({"status": "success", "models": status_data}, session_id=session_id)
+            self._send_json({"status": "success", "models": status_data, "only_cpu": _only_cpu}, session_id=session_id)
             return
 
         if path == "/api/battle/state":
@@ -314,9 +323,16 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
         session_id = self._get_session_id(req_data)
 
         if path == "/api/models/compile":
-            target = req_data.get("target", "vulkan").lower()
+            target = req_data.get("target", "cpu" if _only_cpu else "vulkan").lower()
+            if _only_cpu and target == "vulkan":
+                self._send_json({
+                    "status": "error",
+                    "message": "Vulkan is disabled because server was started with --only-cpu.",
+                }, 400, session_id=session_id)
+                return
+
             if target not in ("vulkan", "cpu"):
-                target = "vulkan"
+                target = "cpu" if _only_cpu else "vulkan"
 
             output_name = "muzero_vulkan.vmfb" if target == "vulkan" else "muzero_cpu.vmfb"
             output_path = SCRIPT_DIR / output_name
@@ -393,8 +409,8 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
             dm = get_deck_manager()
             player_deck = req_data.get("player_deck") or dm.get_model_deck()
             ai_deck = req_data.get("ai_deck") or dm.get_model_deck()
-            device_uri = req_data.get("device", "vulkan")
-            ai_mode = req_data.get("ai_mode", "basic")
+            device_uri = "cpu" if _only_cpu else req_data.get("device", "vulkan")
+            ai_mode = req_data.get("ai_mode", "advanced")
 
             # Validate decks
             ok_p, msg_p = dm.validate_deck(player_deck)
@@ -423,13 +439,13 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
                 logger.exception("Failed to start battle for session [%s]: %s", session_id, e)
                 err_str = str(e)
                 if "VMFB module not found" in err_str or isinstance(e, FileNotFoundError):
-                    missing = "muzero_vulkan.vmfb" if device_uri == "vulkan" else "muzero_cpu.vmfb"
+                    missing = "muzero_cpu.vmfb" if (_only_cpu or device_uri == "cpu") else "muzero_vulkan.vmfb"
                     if ":" in err_str:
                         missing = err_str.split(":", 1)[1].strip()
                     self._send_json({
                         "status": "error",
                         "error_code": "VMFB_NOT_FOUND",
-                        "target": device_uri,
+                        "target": "cpu" if _only_cpu else device_uri,
                         "missing_file": missing,
                         "message": f"Start error: VMFB module not found: {missing}",
                     }, 404, session_id=session_id)
@@ -462,13 +478,23 @@ class BattleAPIHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    global _only_cpu
     parser = argparse.ArgumentParser(description="Multi-User Web Battle Server against MuZero model (IREE)")
     parser.add_argument("--port", type=int, default=8000, help="HTTP server listening port (default: 8000)")
     parser.add_argument("--host", default="0.0.0.0", help="Listening host (default: 0.0.0.0)")
     parser.add_argument("--ttl", type=int, default=1800, help="Session TTL timeout in seconds (default: 1800 / 30 min)")
+    parser.add_argument(
+        "--only-cpu",
+        "--cpu-only",
+        dest="only_cpu",
+        action="store_true",
+        help="Force CPU inference only and remove/disable Vulkan GPU acceleration",
+    )
     args = parser.parse_args()
 
+    _only_cpu = args.only_cpu
     _session_manager.ttl_seconds = args.ttl
+    _session_manager.only_cpu = args.only_cpu
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     server_address = (args.host, args.port)
     httpd = ThreadingHTTPServer(server_address, BattleAPIHandler)
@@ -477,6 +503,11 @@ def main():
     logger.info("🔥 PTCG MuZero Multi-User Battle Arena started successfully!")
     logger.info("👉 Open your browser at: http://localhost:%d", args.port)
     logger.info("👥 Multi-User mode: Enabled (isolated sessions, TTL %ds)", args.ttl)
+    if _only_cpu:
+        logger.info("🖥️ Hardware Mode: ONLY CPU (Vulkan GPU option disabled)")
+    else:
+        logger.info("⚡ Hardware Mode: Vulkan GPU + CPU Fallback enabled")
+    logger.info("🧠 Default AI Mode: Advanced (Competition / ISMCTS)")
     logger.info("==============================================================")
 
     try:

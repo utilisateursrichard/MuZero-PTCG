@@ -29,7 +29,7 @@ class BattleSession:
         ai_deck: Optional[List[int]] = None,
         vmfb_path: Optional[str] = None,
         device_uri: str = "vulkan",
-        ai_mode: str = "basic",
+        ai_mode: str = "advanced",
     ):
         from pathlib import Path
         from models.iree_agent import create_agent
