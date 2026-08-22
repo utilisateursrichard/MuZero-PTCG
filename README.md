@@ -49,6 +49,8 @@ PTCG MuZero (or pokémon trading card game MuZero) is a deep Neural network (NN)
 └───────────────────────────────────────┘         └──────────────────────────────────────────────────────┘
 ```
 
+## for the AI usage and what have and have'nt made by me, please go to the end of the Readme 
+
 ##  How to use :
 
 ### Prerequisites
@@ -220,3 +222,6 @@ AI (LLMs) was used for :
 1. optimization, it can have a second look of what I am writing (even if AI cannot do all the job alone, the full project isn't fully made by AI)
 2. in some parts of the Readme.md, for example for the graphic in the System Architecture secion.
 3. To help my research and to guide me in some problems I have encouterd but I have learned and all the work wasn't AI.
+
+## what have and have'nt been made by me :
+The frontedn wasn't made by me as weell as the C++ engine, I have made the AI taht you play aignst in the demo server/ the local server, please nbote that the vizaualizer is still usefull (even if not made by me) to see the model and how it play (because just the safetensors is useless)
