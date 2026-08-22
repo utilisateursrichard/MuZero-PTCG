@@ -1,0 +1,7 @@
+Copyright (c) hiro094
+All rights reserved.
+
+This frontend visualizer is based on PTCG_ABCS_Visualizer, originally created by hiro094 (https://github.com/hiro094/PTCG_ABCS_Visualizer).
+It is included in this repository strictly for educational, non-commercial demonstration and visualization of the MuZero reinforcement learning engine.
+
+All visual assets and frontend UI source rights remain the exclusive property of the original author.
