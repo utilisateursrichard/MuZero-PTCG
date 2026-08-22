@@ -226,4 +226,4 @@ AI (LLMs) was used for :
 ## what have and have'nt been made by me :
 The frontedn wasn't made by me as weell as the C++ engine, I have made the AI taht you play aignst in the demo server/ the local server, please nbote that the vizaualizer is still usefull (even if not made by me) to see the model and how it play (because just the safetensors is useless)
 
-Directory I worked on : ptcg_muzero/
+# Directory I worked on : ptcg_muzero/
