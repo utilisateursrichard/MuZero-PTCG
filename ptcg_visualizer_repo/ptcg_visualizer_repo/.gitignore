@@ -1,0 +1,12 @@
+# Card art is generated locally from the official PDFs — never commit (Pokémon IP + size).
+# Regenerate with:  python _extract_card_images.py --lang en|jp
+assets/cards/
+assets/cards_jp/
+
+# Official source PDFs — provided by the user; not redistributed in this repo.
+Card_ID List_EN.pdf
+Card_ID List_JP.pdf
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
