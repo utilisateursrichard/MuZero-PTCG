@@ -4,6 +4,10 @@ battle_server.py
 ================
 Multi-user Web server for the Pokémon TCG MuZero Interactive Battle Arena.
 Provides a REST API to control isolated game sessions per user and serves static UI assets.
+
+NOTE to the reviewer: The frontend has been taken from another git repository and it
+probably has been made by AI, but please don't think that the whole project has been
+made by AI. All the backend was made by me.
 """
 from __future__ import annotations
 

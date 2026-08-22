@@ -1313,3 +1313,12 @@ button:disabled {
   line-height: 1.4;
 }
 
+
+.reviewer-note {
+  background: red;
+  color: #fff;
+  padding: 18px 14px;
+  font-size: 36px;
+  font-weight: bold;
+  text-align: center;
+}
